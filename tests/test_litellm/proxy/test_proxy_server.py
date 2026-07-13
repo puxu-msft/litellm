@@ -9101,3 +9101,41 @@ def test_update_config_redacts_all_environment_variable_values(
         assert "db.internal" not in data["updated_values"]
     finally:
         restore()
+
+
+@pytest.mark.asyncio
+async def test_load_config_rejects_invalid_global_http_client(tmp_path):
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    test_config = {
+        "model_list": [],
+        "litellm_settings": {"http_client": {"connect_timeout": "not-a-number"}},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(test_config))
+
+    proxy_config = ProxyConfig()
+    with pytest.raises(Exception, match="http_client"):
+        await proxy_config.load_config(router=MagicMock(), config_file_path=str(config_file))
+
+
+@pytest.mark.asyncio
+async def test_load_config_accepts_valid_global_http_client(tmp_path):
+    import litellm
+    from litellm.litellm_core_utils.http_client_config import HttpClientConfig
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    test_config = {
+        "model_list": [],
+        "litellm_settings": {"http_client": {"connect_timeout": 3.0}},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(test_config))
+
+    original_http_client = litellm.http_client
+    try:
+        proxy_config = ProxyConfig()
+        await proxy_config.load_config(router=MagicMock(), config_file_path=str(config_file))
+        assert litellm.http_client == HttpClientConfig(connect_timeout=3.0)
+    finally:
+        litellm.http_client = original_http_client

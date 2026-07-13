@@ -4308,6 +4308,17 @@ class ProxyConfig:
                         litellm.upperbound_key_generate_params = LiteLLM_UpperboundKeyGenerateParams(**value)
                     else:
                         raise Exception(f"Invalid value set for upperbound_key_generate_params - value={value}")
+                elif key == "http_client":
+                    from litellm.litellm_core_utils.http_client_config import (
+                        parse_http_client_config,
+                    )
+
+                    try:
+                        parsed_http_client = parse_http_client_config(cast("Optional[dict]", value))
+                    except Exception as e:
+                        raise ValueError(f"Invalid `http_client` setting in litellm_settings: {e}") from e
+                    verbose_proxy_logger.debug("setting litellm.http_client=%s", parsed_http_client)
+                    setattr(litellm, key, parsed_http_client)
                 elif key == "json_logs" and value is True:
                     litellm.json_logs = True
                     litellm._turn_on_json()

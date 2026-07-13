@@ -394,6 +394,9 @@ add_function_to_prompt: bool = (
 )
 client_session: Optional[httpx.Client] = None
 aclient_session: Optional[httpx.AsyncClient] = None
+if TYPE_CHECKING:
+    from litellm.litellm_core_utils.http_client_config import HttpClientConfig
+http_client: Optional["HttpClientConfig"] = None  # global upstream http client config (per-provider timeouts)
 model_fallbacks: Optional[List] = None  # Deprecated for 'litellm.fallbacks'
 model_cost_map_url: str = os.getenv(
     "LITELLM_MODEL_COST_MAP_URL",
