@@ -803,3 +803,19 @@ class TestGithubCopilotReasoningStreamItemIdNormalization:
             },
         )
         assert event.item_id == "stable_rs_id"
+
+
+def test_dynamic_cache_responses_only_model(monkeypatch):
+    import litellm.llms.github_copilot.model_capabilities as mc
+    from litellm.llms.github_copilot.responses.transformation import (
+        github_copilot_supports_responses_api,
+    )
+
+    mc._CAP_CACHE.flush_cache()
+    mc._CAP_CACHE.set_cache(
+        "https://api.enterprise.githubcopilot.com",
+        (("gpt-5.6-sol", frozenset({"responses"})),),
+        ttl=300,
+    )
+    monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: "https://api.enterprise.githubcopilot.com")
+    assert github_copilot_supports_responses_api("gpt-5.6-sol") is True
