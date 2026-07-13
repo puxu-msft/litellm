@@ -48,6 +48,20 @@ from litellm.proxy.common_utils.callback_utils import (
     get_logging_caching_headers,
     get_remaining_tokens_and_requests_from_request_data,
 )
+from litellm.proxy.common_utils.sse_frame_normalizer import (
+    normalize_anthropic_sse_frames,
+)
+from litellm.proxy.common_utils.sse_keepalive import (
+    DownstreamSSESurface,
+    StreamLease,
+    committed_error_frame,
+    needs_frame_normalizer,
+    sse_keepalive,
+    strategy_for,
+)
+from litellm.proxy.common_utils.stream_keepalive_config import (
+    ResolvedStreamKeepaliveConfig,
+)
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.utils import ProxyLogging
@@ -402,12 +416,172 @@ async def _buffer_first_chunk_honoring_disconnect(
     raise _ClientDisconnectedBeforeFirstChunk()
 
 
+def _error_obj_from_exception(exc: BaseException) -> dict:
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None) or 500
+    message = getattr(exc, "detail", None) or getattr(exc, "message", None) or str(exc)
+    return {
+        "message": str(message),
+        "type": str(getattr(exc, "type", None) or "None"),
+        "param": str(getattr(exc, "param", None) or "None"),
+        "code": str(code),
+    }
+
+
+async def _committed_error_guard(
+    inner: AsyncGenerator[str, None],
+    surface: DownstreamSSESurface,
+) -> AsyncGenerator[str, None]:
+    """Post-commit, an error can no longer become a JSON response — serialize it
+    as a client-recognizable SSE error frame instead of aborting the connection.
+
+    The producer already ran its failure hook before re-raising (e.g.
+    HTTPException), so this only serializes the wire frame — it does not re-run
+    the hook (failure-once). Client disconnects (CancelledError/GeneratorExit)
+    propagate untouched.
+    """
+    try:
+        async for frame in inner:
+            yield frame
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        yield committed_error_frame(surface, _error_obj_from_exception(exc))
+
+
+async def _create_response_with_keepalive(
+    generator: AsyncGenerator[str, None],
+    media_type: str,
+    streaming_headers: dict,
+    default_status_code: int,
+    request: Optional[Request],
+    keepalive: ResolvedStreamKeepaliveConfig,
+    surface: DownstreamSSESurface,
+) -> Union[StreamingResponse, JSONResponse]:
+    """create_response variant that injects downstream SSE keepalive.
+
+    Races the first frame against ``keepalive.interval`` and a client
+    disconnect. Priority: disconnect > first frame > timer. On a fast first
+    frame it preserves the existing error->JSON behaviour then wraps the rest in
+    ``sse_keepalive`` (face 2). On timer (slow upstream) it commits a 200 and
+    streams keepalive frames while awaiting the still-pending first frame (face
+    1). A single idempotent ``StreamLease`` owns the pending task and the
+    upstream generator; it stands in as the response's ``upstream_generator`` so
+    the existing cleanup path cancels the task and closes the upstream exactly
+    once.
+    """
+    strategy = strategy_for(surface)
+    framed: AsyncGenerator[str, None] = (
+        normalize_anthropic_sse_frames(generator)  # type: ignore[arg-type,assignment]
+        if needs_frame_normalizer(surface)
+        else generator
+    )
+    lease = StreamLease(inner=generator)
+
+    chunk_task: "asyncio.Task" = asyncio.ensure_future(framed.__anext__())
+    lease.set_pending_task(chunk_task)
+    disconnect_task: Optional["asyncio.Task"] = (
+        asyncio.ensure_future(_wait_for_http_disconnect(request)) if request is not None else None
+    )
+    wait_set = {chunk_task} | ({disconnect_task} if disconnect_task is not None else set())
+    await asyncio.wait(wait_set, timeout=keepalive.interval, return_when=asyncio.FIRST_COMPLETED)
+
+    # Priority: disconnect > completed first frame > timer.
+    disconnect_observed = disconnect_task is not None and disconnect_task.done()
+    if disconnect_task is not None:
+        disconnect_task.cancel()
+        try:
+            await disconnect_task
+        except BaseException:  # noqa: BLE001
+            pass
+
+    if disconnect_observed:
+        await lease.close()
+        return JSONResponse(
+            status_code=LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED,
+            content={
+                "error": {
+                    "message": _CLIENT_DISCONNECT_DETAIL,
+                    "type": "client_disconnect",
+                    "param": "None",
+                    "code": str(LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED),
+                }
+            },
+            headers={k: v for k, v in streaming_headers.items()},
+        )
+
+    if chunk_task.done():
+        try:
+            first_frame = chunk_task.result()
+        except StopAsyncIteration:
+            await lease.close()
+
+            async def _empty_gen() -> AsyncGenerator[str, None]:
+                if False:
+                    yield  # type: ignore[unreachable]
+
+            return StreamingResponse(
+                _empty_gen(),
+                media_type=media_type,
+                headers=streaming_headers,
+                status_code=default_status_code,
+            )
+
+        # Fast path: preserve today's first-frame error -> JSON conversion.
+        try:
+            error_code_from_chunk = await _parse_event_data_for_error(first_frame)
+        except Exception as exc:  # noqa: BLE001
+            verbose_proxy_logger.debug("keepalive: error parsing first frame: %s", exc)
+            error_code_from_chunk = None
+        if error_code_from_chunk is not None:
+            await lease.close()
+            return JSONResponse(
+                status_code=error_code_from_chunk,
+                content={"error": _extract_error_from_sse_chunk(first_frame)},
+                headers={k: v for k, v in streaming_headers.items()},
+            )
+
+        seen_message_start = strategy.observe_advances_to_phase2(first_frame)
+
+        async def _fast_body() -> AsyncGenerator[str, None]:
+            yield first_frame
+            async for frame in _committed_error_guard(
+                sse_keepalive(
+                    framed, strategy, keepalive.interval, lease, seen_message_start=seen_message_start
+                ),
+                surface,
+            ):
+                yield frame
+
+        return _UpstreamClosingStreamingResponse(
+            _fast_body(),
+            media_type=media_type,
+            headers=streaming_headers,
+            status_code=default_status_code,
+            upstream_generator=lease,  # type: ignore[arg-type]
+        )
+
+    # Timer fired first: slow upstream. Commit 200 and keepalive during the wait.
+    slow_body = _committed_error_guard(
+        sse_keepalive(framed, strategy, keepalive.interval, lease, initial_task=chunk_task),
+        surface,
+    )
+    return _UpstreamClosingStreamingResponse(
+        slow_body,
+        media_type=media_type,
+        headers=streaming_headers,
+        status_code=default_status_code,
+        upstream_generator=lease,  # type: ignore[arg-type]
+    )
+
+
 async def create_response(
     generator: AsyncGenerator[str, None],
     media_type: str,
     headers: dict,
     default_status_code: int = status.HTTP_200_OK,
     request: Optional[Request] = None,
+    keepalive: Optional[ResolvedStreamKeepaliveConfig] = None,
+    surface: Optional[DownstreamSSESurface] = None,
 ) -> Union[StreamingResponse, JSONResponse]:
     """
     Create streaming response, checking if the first chunk is an error.
@@ -421,6 +595,22 @@ async def create_response(
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     }
+
+    # Downstream SSE keepalive path (opt-in). When disabled/unset the original
+    # buffering path below runs unchanged, byte-for-byte.
+    if keepalive is not None and keepalive.enabled and surface is not None:
+        if asyncio.iscoroutine(generator):
+            generator = await generator
+        return await _create_response_with_keepalive(
+            generator=generator,
+            media_type=media_type,
+            streaming_headers=streaming_headers,
+            default_status_code=default_status_code,
+            request=request,
+            keepalive=keepalive,
+            surface=surface,
+        )
+
     first_chunk_value: Optional[str] = None
     final_status_code = default_status_code
 

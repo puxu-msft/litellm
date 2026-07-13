@@ -114,12 +114,19 @@ class StreamLease:
         except BaseException:  # noqa: BLE001
             pass
 
+    # Alias so a StreamLease can stand in as the ``upstream_generator`` of
+    # ``_UpstreamClosingStreamingResponse``, whose cleanup loop calls ``aclose``.
+    aclose = close
+
 
 async def sse_keepalive(
     real_frames: "AsyncGenerator[SSEFrame, None]",
     strategy: KeepaliveStrategy,
     interval: float,
     lease: StreamLease,
+    *,
+    initial_task: "Optional[asyncio.Task[SSEFrame]]" = None,
+    seen_message_start: bool = False,
 ) -> "AsyncGenerator[SSEFrame, None]":
     """Forward ``real_frames``, injecting keepalive frames during idle gaps.
 
@@ -132,24 +139,29 @@ async def sse_keepalive(
     when the task is already done we consume the real frame rather than inject a
     ping. Anthropic phase advances only after a ``message_start`` frame is
     forwarded (the frame itself carries no synchronous ping).
+
+    ``initial_task`` lets a slow-commit caller hand over the already-pending
+    first ``__anext__`` (so it is not fetched twice); ``seen_message_start``
+    seeds the phase when the caller already forwarded ``message_start``.
     """
-    seen_message_start = False
+    phase2 = seen_message_start
+    task = initial_task if initial_task is not None else asyncio.ensure_future(real_frames.__anext__())
     while True:
-        task: "asyncio.Task[SSEFrame]" = asyncio.ensure_future(real_frames.__anext__())
         lease.set_pending_task(task)
         while True:
             done, _pending = await asyncio.wait({task}, timeout=interval)
             if done:
                 break
-            for frame in strategy.idle_frames(seen_message_start):
+            for frame in strategy.idle_frames(phase2):
                 yield frame
         try:
             frame = task.result()
         except StopAsyncIteration:
             return
         yield frame
-        if not seen_message_start and strategy.observe_advances_to_phase2(frame):
-            seen_message_start = True
+        if not phase2 and strategy.observe_advances_to_phase2(frame):
+            phase2 = True
+        task = asyncio.ensure_future(real_frames.__anext__())
 
 
 class DownstreamSSESurface(str, Enum):
