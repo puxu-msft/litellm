@@ -84,3 +84,11 @@ fetcher 与缓存均通过依赖注入传入（HTTP client / clock），便于�
 - 路由热路径不因能力取值而阻塞或触发 device flow
 
 真实验证（按项目约定，非 pytest 截图）：起本地 proxy，用 curl 打 `/v1/messages`，分别用一个 claude 模型、一个 responses-only 的 gpt 模型、一个 chat-only 模型，观察实际命中的上游端点与成功响应。
+
+## 已知限制（多租户 / 共享 backend 别名，单账号部署不受影响）
+
+当前实现按**单 Copilot 账号 + 单 api_base**（用户已确认的部署形态）设计并验证。以下为多租户/异常配置下的已知限制，记录以备后续（对单账号单 base、每 deployment 唯一模型的配置**不产生影响**）：
+
+1. **多个不同 api_base**：路由读取用 `copilot_api_base()`（Authenticator 解析的 base）作为动态缓存键。若某 deployment 显式配置了与 Authenticator base 不同的 `api_base`，其动态能力缓存不会被该 deployment 的请求命中（后台会按各 base 刷新，但读路径未接入 per-request deployment api_base）。单账号单 base 时两者一致，无影响。彻底修复需把选中 deployment 的 effective api_base 一路传入 `get_provider_anthropic_messages_config` 与 `_should_route_to_responses_api`
+2. **共享 backend 别名的 responses 二次判据**：`mode: responses` 在 messages 选择层已按 per-request `model_info` 正确放行到 Responses 桥；但桥内 `litellm.responses()` 会再次经 `get_provider_responses_api_config` → `github_copilot_supports_responses_api` 判据，该处读的是共享 `model_cost` 的 mode。若两个别名映射到同一 `github_copilot/<model>` 且 mode 冲突（如 A=responses、B=anthropic），下游可能按共享 mode 重判。每 deployment 唯一模型时不发生。彻底修复需把 per-request `model_info`/api_base 贯穿 `litellm.responses()` 的 config 选择，或在桥内已强制决策后直接注入 `GithubCopilotResponsesAPIConfig`
+3. **非交互认证**：后台刷新在 OAuth `access-token` 文件非空时才取 token（避免 device flow）；`api-key.json` 仍有效但 `access-token` 缺失的罕见状态下会跳过该轮刷新（不使用尚有效的 api-key）
