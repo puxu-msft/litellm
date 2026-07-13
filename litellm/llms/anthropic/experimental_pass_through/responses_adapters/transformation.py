@@ -198,14 +198,22 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     @staticmethod
     def translate_tool_choice_to_responses_api(
         tool_choice: AnthropicMessagesToolChoice,
-    ) -> Dict[str, Any]:
-        """Convert Anthropic tool_choice to Responses API tool_choice."""
+    ) -> Union[str, Dict[str, Any]]:
+        """Convert Anthropic tool_choice to Responses API tool_choice.
+
+        The Responses API expects the mode selectors (``auto``/``required``/``none``)
+        as bare strings; only forcing a specific function uses the object form
+        ``{"type": "function", "name": ...}``. Emitting ``{"type": "auto"}`` makes the
+        upstream validate ``auto`` as a tool ``type`` and reject the request.
+        """
         tc_type = tool_choice.get("type")
-        if tc_type == "any":
-            return {"type": "required"}
-        elif tc_type == "tool":
+        if tc_type == "tool":
             return {"type": "function", "name": tool_choice.get("name", "")}
-        return {"type": "auto"}
+        if tc_type == "any":
+            return "required"
+        if tc_type == "none":
+            return "none"
+        return "auto"
 
     @staticmethod
     def translate_context_management_to_responses_api(
