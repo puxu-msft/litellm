@@ -109,3 +109,40 @@ class StreamLease:
             await self._inner.aclose()
         except BaseException:  # noqa: BLE001
             pass
+
+
+async def sse_keepalive(
+    real_frames: "AsyncGenerator[SSEFrame, None]",
+    strategy: KeepaliveStrategy,
+    interval: float,
+    lease: StreamLease,
+) -> "AsyncGenerator[SSEFrame, None]":
+    """Forward ``real_frames``, injecting keepalive frames during idle gaps.
+
+    Each ``__anext__`` runs as a persistent task (handed to ``lease`` so a
+    downstream disconnect can cancel it). While that task is pending we race it
+    against ``interval`` with ``asyncio.wait`` — never ``wait_for``, which would
+    cancel the in-flight ``__anext__`` and tear down the upstream read. On idle
+    we emit ``strategy.idle_frames`` and keep waiting on the *same* task; a new
+    task is only created once the current one resolves. Same-tick priority:
+    when the task is already done we consume the real frame rather than inject a
+    ping. Anthropic phase advances only after a ``message_start`` frame is
+    forwarded (the frame itself carries no synchronous ping).
+    """
+    seen_message_start = False
+    while True:
+        task: "asyncio.Task[SSEFrame]" = asyncio.ensure_future(real_frames.__anext__())
+        lease.set_pending_task(task)
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=interval)
+            if done:
+                break
+            for frame in strategy.idle_frames(seen_message_start):
+                yield frame
+        try:
+            frame = task.result()
+        except StopAsyncIteration:
+            return
+        yield frame
+        if not seen_message_start and strategy.observe_advances_to_phase2(frame):
+            seen_message_start = True
