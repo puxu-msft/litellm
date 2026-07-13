@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import os
 
-import litellm
 from litellm._logging import verbose_logger
 from litellm.constants import DEFAULT_MAX_RECURSE_DEPTH
 from litellm.exceptions import AuthenticationError
