@@ -12,6 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from typing_extensions import Required, TypedDict
 
 from litellm._uuid import uuid
+from litellm.litellm_core_utils.http_client_config import (
+    HttpClientConfig,
+    HttpClientConfigDict,
+)
 
 from .completion import CompletionRequest
 from .embedding import EmbeddingRequest
@@ -215,6 +219,7 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     tpm: Optional[int] = None
     rpm: Optional[int] = None
     timeout: Optional[Union[float, str, httpx.Timeout]] = None  # if str, pass in as os.environ/
+    http_client: Optional[HttpClientConfig] = None
     stream_timeout: Optional[Union[float, str]] = (
         None  # timeout when making stream=True calls, if str, pass in as os.environ/
     )
@@ -366,6 +371,7 @@ class LiteLLMParamsTypedDict(TypedDict, total=False):
     api_base: Optional[str]
     api_version: Optional[str]
     timeout: Optional[Union[float, str, httpx.Timeout]]
+    http_client: Optional[HttpClientConfigDict]
     stream_timeout: Optional[Union[float, str]]
     max_retries: Optional[int]
     organization: Optional[Union[List, str]]  # for openai orgs

@@ -5304,3 +5304,27 @@ class TestRouterRequestTimeoutPropagation:
             )
             == 60
         )
+
+
+def test_generic_litellm_params_accepts_http_client_dict():
+    from litellm.litellm_core_utils.http_client_config import HttpClientConfig
+    from litellm.types.router import GenericLiteLLMParams
+
+    params = GenericLiteLLMParams(http_client={"connect_timeout": 3.0})
+    assert params.http_client == HttpClientConfig(connect_timeout=3.0)
+
+
+def test_generic_litellm_params_http_client_defaults_to_none():
+    from litellm.types.router import GenericLiteLLMParams
+
+    assert GenericLiteLLMParams().http_client is None
+
+
+def test_generic_litellm_params_rejects_invalid_http_client_keys():
+    import pytest
+    from pydantic import ValidationError
+
+    from litellm.types.router import GenericLiteLLMParams
+
+    with pytest.raises(ValidationError):
+        GenericLiteLLMParams(http_client={"bogus_key": 1})
