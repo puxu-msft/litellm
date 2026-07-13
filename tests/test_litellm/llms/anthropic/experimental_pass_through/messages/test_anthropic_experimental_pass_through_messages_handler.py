@@ -852,3 +852,43 @@ class TestShouldRouteToResponsesApiCopilot:
         monkeypatch.setattr(litellm, "use_chat_completions_url_for_anthropic_messages", True)
         assert self._fn()("github_copilot", model="gpt-5.5", model_info={}) is False
         assert self._fn()("openai", model="gpt-5.5", model_info=None) is False
+
+
+class TestCopilotMergedStateRouting:
+    """Drive anthropic_messages_handler end-to-end for github_copilot and assert
+    each model class reaches exactly one terminal (native messages / responses
+    bridge / chat bridge)."""
+
+    def _run(self, monkeypatch, model, supports_messages, supports_responses):
+        from unittest.mock import patch
+
+        import litellm.llms.github_copilot.model_capabilities as mc
+        from litellm.llms.anthropic.experimental_pass_through.messages import handler as h
+
+        monkeypatch.setattr(mc, "route_supports_messages", lambda *a, **k: supports_messages)
+        monkeypatch.setattr(mc, "route_supports_responses", lambda *a, **k: supports_responses)
+        monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: None)
+
+        common = dict(
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+            model=model,
+            api_key="k",
+        )
+        with patch.object(h.base_llm_http_handler, "anthropic_messages_handler", return_value="MESSAGES") as m_msg, \
+             patch.object(h.LiteLLMMessagesToResponsesAPIHandler, "anthropic_messages_handler", return_value="RESPONSES") as m_resp, \
+             patch.object(h.LiteLLMMessagesToCompletionTransformationHandler, "anthropic_messages_handler", return_value="CHAT") as m_chat:
+            h.anthropic_messages_handler(**common)
+        return (m_msg.called, m_resp.called, m_chat.called)
+
+    def test_messages_capable_model_hits_native_messages(self, monkeypatch):
+        called = self._run(monkeypatch, "github_copilot/claude-opus-4.8", True, False)
+        assert called == (True, False, False)
+
+    def test_responses_only_model_hits_responses_bridge(self, monkeypatch):
+        called = self._run(monkeypatch, "github_copilot/gpt-5.6-sol", False, True)
+        assert called == (False, True, False)
+
+    def test_chat_only_model_hits_chat_bridge(self, monkeypatch):
+        called = self._run(monkeypatch, "github_copilot/gpt-4o", False, False)
+        assert called == (False, False, True)

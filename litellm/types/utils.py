@@ -260,6 +260,7 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
             "chat",
             "audio_transcription",
             "responses",
+            "anthropic",
             "ocr",
         ]
     ]
