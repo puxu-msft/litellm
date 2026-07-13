@@ -9,20 +9,31 @@ from litellm import verbose_logger
 from litellm._uuid import uuid
 
 
-def _poc_reasoning_signature_delta(item: Any, block_idx: int) -> Union[Dict[str, Any], None]:
+def _poc_reasoning_signature_delta(item: object, block_idx: int) -> Union[Dict[str, object], None]:
     """PoC (behind ``GHC_REASONING_POC=1``): build a ``signature_delta`` carrying
     the reasoning replay envelope for a completed reasoning item.
 
-    Returns None when the flag is off or the item is not a reasoning item, so the
-    normal path is completely unchanged. This is the streaming instrumentation for
-    spec block 1 phase 0 (the path a real Claude Code gpt session hits).
+    Returns None when the flag is off, the item is not a reasoning item, or the
+    reasoning state is incomplete (missing/empty id or encrypted_content) -- so the
+    normal path is unchanged and we never emit a valid-looking but unreplayable
+    carrier. This is the streaming instrumentation for spec block 1 phase 0.
     """
     import os
 
     if os.environ.get("GHC_REASONING_POC") != "1" or item is None:
         return None
-    item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
-    if item_type != "reasoning":
+
+    def _get(obj: object, key: str) -> object:
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    if _get(item, "type") != "reasoning":
+        return None
+
+    item_id = _get(item, "id")
+    encrypted = _get(item, "encrypted_content")
+    # Only emit when we actually hold the real reasoning state. Empty id/encrypted
+    # content would be a misleading carrier that cannot be replayed to the backend.
+    if not (isinstance(item_id, str) and item_id and isinstance(encrypted, str) and encrypted):
         return None
 
     from litellm.llms.github_copilot.reasoning_carrier import (
@@ -30,14 +41,12 @@ def _poc_reasoning_signature_delta(item: Any, block_idx: int) -> Union[Dict[str,
         serialize_envelope,
     )
 
-    def _get(obj: Any, key: str) -> Any:
-        return getattr(obj, key, None) or (obj.get(key) if isinstance(obj, dict) else None)
-
-    summary_raw = _get(item, "summary") or ()
-    summary_parts = tuple(t for t in (_get(s, "text") or "" for s in summary_raw) if t)
+    summary_raw = _get(item, "summary")
+    summary_seq = summary_raw if isinstance(summary_raw, (list, tuple)) else ()
+    summary_parts = tuple(t for t in (_get(s, "text") for s in summary_seq) if isinstance(t, str) and t)
     env = ReasoningReplayEnvelope(
-        reasoning_item_id=_get(item, "id") or "",
-        encrypted_content=_get(item, "encrypted_content") or "",
+        reasoning_item_id=item_id,
+        encrypted_content=encrypted,
         summary_parts=summary_parts,
         origin_model=None,
     )
@@ -246,9 +255,13 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
-            poc_delta = _poc_reasoning_signature_delta(item, block_idx)
-            if poc_delta is not None:
-                self._chunk_queue.append(poc_delta)
+            # Only attach the reasoning carrier when this done event maps to a real
+            # opened reasoning block; never fall back to the current (possibly text)
+            # block, which would inject the signature into the wrong content block.
+            if item_id is not None and item_id in self._item_id_to_block_index:
+                poc_delta = _poc_reasoning_signature_delta(item, self._item_id_to_block_index[item_id])
+                if poc_delta is not None:
+                    self._chunk_queue.append(poc_delta)
             self._chunk_queue.append(
                 {
                     "type": "content_block_stop",

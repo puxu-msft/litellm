@@ -8,20 +8,29 @@ Anthropic thinking/redacted_thinking carrier block and decode it back on the
 next request.
 
 This module is pure: no litellm request/response machinery. Failures are modeled
-as values via the ``DecodeResult`` tagged union rather than raised.
+as values via the ``DecodeResult`` tagged union rather than raised. The decode
+boundary validates the wire payload with a strict Pydantic model, so a
+``DecodedCarrier`` is a trusted, fully-typed envelope.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 from dataclasses import dataclass
-from typing import Literal, Union
+from typing import Annotated, Literal, Mapping, Union
+
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
+from typing_extensions import assert_never
 
 _NS = "ghc-rsn"
 _VERSION = 1
 
 _Carrier = Literal["signature", "redacted_thinking"]
+
+# non-empty strict string: rejects non-str and empty at the decode boundary
+_NonEmptyStr = Annotated[StrictStr, Field(min_length=1)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,15 +65,31 @@ class UnsupportedCarrierVersion:
 DecodeResult = Union[DecodedCarrier, NotOurCarrier, InvalidCarrier, UnsupportedCarrierVersion]
 
 
+class _CarrierPayload(BaseModel):
+    """Strict wire payload validated at the decode boundary.
+
+    ``extra="forbid"`` rejects unknown keys; ``StrictStr`` rejects non-string
+    values (so ``sp=[1]`` / ``om=123`` fail); ``sp`` is required (missing fails)
+    but may be an empty list; ``id``/``ec`` must be non-empty.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: _NonEmptyStr
+    ec: _NonEmptyStr
+    sp: list[StrictStr]
+    om: Union[StrictStr, None] = None
+
+
 def serialize_envelope(env: ReasoningReplayEnvelope) -> str:
-    """Serialize an envelope into the ``ghc-rsn:v<N>:<b64(json)>`` carrier token."""
+    """Serialize an envelope into the ``ghc-rsn:v<N>:<b64url(json)>`` carrier token."""
     payload = {
         "id": env.reasoning_item_id,
         "ec": env.encrypted_content,
         "sp": list(env.summary_parts),
         "om": env.origin_model,
     }
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     b64 = base64.urlsafe_b64encode(raw).decode("ascii")
     return f"{_NS}:v{env.version}:{b64}"
 
@@ -73,7 +98,7 @@ def _summary_text(env: ReasoningReplayEnvelope) -> str:
     return " ".join(env.summary_parts).strip()
 
 
-def encode_carrier(env: ReasoningReplayEnvelope, carrier: _Carrier) -> tuple[dict, ...]:
+def encode_carrier(env: ReasoningReplayEnvelope, carrier: _Carrier) -> tuple[dict[str, object], ...]:
     """Encode a reasoning envelope into Anthropic carrier block(s).
 
     ``signature`` -> a single ``thinking`` block whose ``signature`` carries the
@@ -83,13 +108,19 @@ def encode_carrier(env: ReasoningReplayEnvelope, carrier: _Carrier) -> tuple[dic
     """
     token = serialize_envelope(env)
     summary = _summary_text(env)
-    if carrier == "signature":
-        return ({"type": "thinking", "thinking": summary, "signature": token},)
-    summary_block = ({"type": "thinking", "thinking": summary},) if summary else ()
-    return (*summary_block, {"type": "redacted_thinking", "data": token})
+    match carrier:
+        case "signature":
+            return ({"type": "thinking", "thinking": summary, "signature": token},)
+        case "redacted_thinking":
+            summary_block: tuple[dict[str, object], ...] = (
+                ({"type": "thinking", "thinking": summary},) if summary else ()
+            )
+            return (*summary_block, {"type": "redacted_thinking", "data": token})
+        case _:
+            assert_never(carrier)
 
 
-def _carrier_field(block: dict) -> Union[str, None]:
+def _carrier_field(block: Mapping[str, object]) -> Union[str, None]:
     block_type = block.get("type")
     if block_type == "thinking":
         sig = block.get("signature")
@@ -100,19 +131,14 @@ def _carrier_field(block: dict) -> Union[str, None]:
     return None
 
 
-def _req_str(value: object) -> str:
-    if not isinstance(value, str):
-        raise ValueError("expected str")
-    return value
-
-
-def decode_carrier(block: dict) -> DecodeResult:
+def decode_carrier(block: Mapping[str, object]) -> DecodeResult:
     """Decode an Anthropic carrier block back into a reasoning envelope.
 
-    Returns a tagged union: ``NotOurCarrier`` for anything without our
-    namespace (including genuine Claude signatures), ``UnsupportedCarrierVersion``
-    for a known-namespace but future version, ``InvalidCarrier`` for corruption,
-    and ``DecodedCarrier`` on success. Never raises.
+    Returns a tagged union: ``NotOurCarrier`` for anything without our namespace
+    (including genuine Claude signatures), ``UnsupportedCarrierVersion`` for a
+    known-namespace but future version, ``InvalidCarrier`` for corruption or a
+    payload that violates the strict schema, and ``DecodedCarrier`` on success.
+    Never raises.
     """
     field = _carrier_field(block)
     if field is None or not field.startswith(f"{_NS}:"):
@@ -126,21 +152,24 @@ def decode_carrier(block: dict) -> DecodeResult:
         return InvalidCarrier("malformed-version")
     if version != _VERSION:
         return UnsupportedCarrierVersion(version)
+    # strict base64url: reject any non-alphabet byte (validate=True) so a tampered
+    # token cannot decode unchanged.
     try:
-        raw = base64.urlsafe_b64decode(parts[2].encode("ascii"))
-        payload = json.loads(raw)
-    except (ValueError, json.JSONDecodeError):
-        return InvalidCarrier("malformed-base64-or-json")
-    if not isinstance(payload, dict):
-        return InvalidCarrier("payload-not-object")
+        raw = base64.b64decode(parts[2].encode("ascii"), altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        return InvalidCarrier("malformed-base64")
+    # parse + strict-validate in one step (malformed JSON and schema violations both
+    # surface as ValidationError), avoiding an untyped json.loads hop.
     try:
-        env = ReasoningReplayEnvelope(
-            reasoning_item_id=_req_str(payload["id"]),
-            encrypted_content=_req_str(payload["ec"]),
-            summary_parts=tuple(payload.get("sp") or ()),
-            origin_model=payload.get("om"),
+        payload = _CarrierPayload.model_validate_json(raw)
+    except ValidationError:
+        return InvalidCarrier("schema-invalid")
+    return DecodedCarrier(
+        ReasoningReplayEnvelope(
+            reasoning_item_id=payload.id,
+            encrypted_content=payload.ec,
+            summary_parts=tuple(payload.sp),
+            origin_model=payload.om,
             version=version,
         )
-    except (KeyError, ValueError, TypeError) as exc:
-        return InvalidCarrier(f"missing-or-invalid-field:{type(exc).__name__}")
-    return DecodedCarrier(env)
+    )

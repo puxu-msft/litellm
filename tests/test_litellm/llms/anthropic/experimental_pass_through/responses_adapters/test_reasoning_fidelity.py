@@ -6,6 +6,7 @@ Responses events and asserts that, behind the ``GHC_REASONING_POC`` flag, a
 before ``content_block_stop`` on ``response.output_item.done`` for a reasoning
 item. This is the streaming path a real Claude Code gpt session hits.
 """
+
 from __future__ import annotations
 
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
@@ -56,3 +57,75 @@ def test_poc_off_by_default_no_signature_delta(monkeypatch):
     monkeypatch.delenv("GHC_REASONING_POC", raising=False)
     chunks = _drive_reasoning(_wrapper())
     assert not any(c.get("delta", {}).get("type") == "signature_delta" for c in chunks)
+
+
+def _sig_deltas(chunks):
+    return [c for c in chunks if c.get("delta", {}).get("type") == "signature_delta"]
+
+
+def test_no_carrier_when_encrypted_content_empty(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    w = _wrapper()
+    w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_e"}})
+    w._process_event(
+        {
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "id": "rs_e", "encrypted_content": "", "summary": []},
+        }
+    )
+    assert not _sig_deltas(list(w._chunk_queue)), "empty encrypted_content must not emit a carrier"
+
+
+def test_no_carrier_when_id_missing(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    w = _wrapper()
+    w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_x"}})
+    w._process_event(
+        {"type": "response.output_item.done", "item": {"type": "reasoning", "encrypted_content": "E", "summary": []}}
+    )
+    assert not _sig_deltas(list(w._chunk_queue))
+
+
+def test_signature_delta_index_equals_reasoning_block_start(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    chunks = _drive_reasoning(_wrapper())
+    start = next(
+        c
+        for c in chunks
+        if c.get("type") == "content_block_start" and c.get("content_block", {}).get("type") == "thinking"
+    )
+    sig = _sig_deltas(chunks)[0]
+    assert sig["index"] == start["index"], "signature_delta must ride the reasoning block, not another"
+
+
+def test_unmapped_done_id_does_not_inject_carrier_into_other_block(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    w = _wrapper()
+    # reasoning block opened for rs_s, then a text/message block opened
+    w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_s"}})
+    w._process_event({"type": "response.output_item.added", "item": {"type": "message", "id": "m1"}})
+    # done event with an unmapped reasoning id -> must NOT emit a carrier at all
+    w._process_event(
+        {
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "id": "other", "encrypted_content": "E", "summary": []},
+        }
+    )
+    assert not _sig_deltas(list(w._chunk_queue))
+
+
+def test_malformed_summary_does_not_crash_and_still_carries(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    w = _wrapper()
+    w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_m"}})
+    w._process_event(
+        {
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "id": "rs_m", "encrypted_content": "E", "summary": 123},
+        }
+    )
+    sig = _sig_deltas(list(w._chunk_queue))
+    assert sig, "malformed summary must not suppress the carrier when id+ec are present"
+    res = decode_carrier({"type": "thinking", "thinking": "", "signature": sig[0]["delta"]["signature"]})
+    assert isinstance(res, DecodedCarrier)
+    assert res.envelope.summary_parts == ()
