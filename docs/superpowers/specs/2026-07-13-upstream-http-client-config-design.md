@@ -111,7 +111,7 @@ model_list:
 
 - `HttpClientConfig`（Pydantic `frozen`）：`connect_timeout`/`read_timeout`/`pool_timeout`/`total_timeout: Optional[float]`（>0 校验），`http2: Optional[bool]`
 - `parse(raw) -> HttpClientConfig`：边界校验（负值/非法类型/未知键报错，不放 `Any` 下游）
-- `merge(global_cfg, deployment_cfg) -> HttpClientConfig`：deployment 非 None 键覆盖全局
+- `merge(global_cfg, deployment_cfg) -> HttpClientConfig`：deployment **已设置且非 None** 的键覆盖全局；**显式 `null` 视同未设**（回退全局，不引入「清除全局」语义），键缺失同样回退全局
 - `resolve(cfg, legacy_effective_timeout) -> ResolvedHttpClient`：产出 `httpx.Timeout(connect, read, write, pool)`（未配置轴用该面 `legacy_effective_timeout`，connect 用 5s）+ `total_timeout: Optional[float]`
 
 ### 2. http_client 注册为 litellm 级参数（杜绝上游泄漏）
