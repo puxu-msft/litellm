@@ -1,118 +1,163 @@
 # GPT reasoning ↔ Anthropic thinking 全保真转换 · 设计/规格
 
-状态: **草案，待评审**
+状态: **草案 v2（已吸收 2026-07-14 GPT 对抗评审的 2 blocker + 8 major + 3 minor），待评审**
 日期: 2026-07-14
-范围: Anthropic ↔ GPT 全保真格式转换的 **block 1**（reasoning↔thinking）。block 2/3/4 见 `docs/BACKLOG.md`，本 spec 不覆盖。
-适用: 私有 fork 的 `github_copilot` provider（focus provider），gpt-* 模型经 `/v1/messages` 路由到 Responses API。
+范围: Anthropic ↔ GPT 全保真格式转换的 **block 1**（reasoning↔thinking）。block 2/3/4 见 `docs/BACKLOG.md`。
+适用: 私有 fork 的 `github_copilot` provider，gpt-* 模型经 `/v1/messages` 路由到 Responses API。
+
+> v2 变更提要（评审驱动，证据见 §10）: ①主技术落点纠正为 **direct Responses adapter（`responses_adapters/`）**，旧 chat bridge 降为兼容路径; ②carrier 从裸 `encrypted_content` 升级为**强类型 replay envelope**（含原始 reasoning item `id` + `encrypted_content` + `summary`）; ③新增 gpt-origin→Claude 的**跨模型 carrier 剥离合同**; ④配置解析/传播合同显式化; ⑤`decode` 返回 tagged union; ⑥phase 0 PoC 补 oracle; ⑦测试主 seam 移到 `responses_adapters/`; ⑧双 `message_start` 已证实，纳入 phase 0 归因。
 
 ## 1. 背景与问题（why）
 
-Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、经 copilot 走 Responses API，其推理状态是 `encrypted_content`（不透明、加密）。litellm 在中间做 Anthropic ↔ OpenAI/Responses 双向翻译。
+Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、经 copilot 走 Responses API，其推理状态是 `encrypted_content`（不透明、加密）。gpt-* 的 `/v1/messages` 请求经 `_should_route_to_responses_api` 判定后，走 **direct Responses adapter**（`LiteLLMMessagesToResponsesAPIHandler`，落在 `litellm/llms/anthropic/experimental_pass_through/responses_adapters/`），而非 chat completion bridge。
 
-2026-07-14 live 探针（原始数据存 `~/.claude/litellm/probe-logs/live-probe-t1.sse`/`t2.json`，方法与结论另见 `~/.claude/litellm/docs/illformed-fix.md` 的「thinking block 处置的 provider 差异」一节）确证:
+2026-07-14 live 探针（原始数据 `~/.claude/litellm/probe-logs/live-probe-t1.sse`/`t2.json`；方法与结论见 `~/.claude/litellm/docs/illformed-fix.md`「thinking block 处置的 provider 差异」）+ GPT 评审代码核实确证:
 
-- gpt 经此桥回来的 thinking 块是**空壳**: `{"type":"thinking","thinking":""}`，无 `signature`、无 delta、无 `encrypted_content`。真正的推理当普通 text 块吐出。
-- 根因两条: ①Responses 请求**没设 `reasoning.summary`**，故 gpt 不回可见摘要 → thinking 无文本; ②响应侧 chat→Anthropic 转换（`litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py` 的 `~1165-1190` 非流式、`~1412+` 流式）**只读 `thinking_blocks`/`reasoning_content`，丢弃 `reasoning_items`/`encrypted_content`**。
-- litellm 自带的 encrypted_content 往返（`_build_reasoning_item` + item-id affinity，`litellm/responses/utils.py` 的 `_wrap_encrypted_content_with_model_id`）**只对原生 Responses 客户端有效**: 它靠 Responses item-id 传递，而 Anthropic 客户端只存 thinking 块的 `{thinking, signature}`、不回传 assistant message id，故 encrypted_content 在 Anthropic 边界结构性丢失。
-- 全量存量 transcript（463 文件、3.7 万+ thinking 块）无一个 gpt-origin thinking 块，佐证 gpt 推理从未以可回放形式落地。
+- gpt 回来的 thinking 块是**空壳**: `{"type":"thinking","thinking":""}`，无 `signature`/无 `encrypted_content`。
+- 丢失点在 direct Responses adapter 非流式 [responses_adapters/transformation.py:410-420](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L410-L420): 对每个 `ResponseReasoningItem` 只遍历 `item.summary` 输出 `thinking(signature=None)`，**完全不读 `item.id`/`item.encrypted_content`**。流式路径 [streaming_iterator.py](litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py) 在 `output_item.added` 开 thinking 块、发 summary delta、`output_item.done` 直接 stop，同样不读 `encrypted_content`。
+- 空壳无文本的另一因: 当前默认**不请求 reasoning summary**（仅 global `litellm.reasoning_auto_summary`/env 打开时注入 `summary="detailed"`），故 `item.summary` 常为空 → thinking 无文本。
+- litellm 自带的 encrypted_content 往返（affinity，`responses/utils.py`）靠 Responses **item-id** 传递，Anthropic 客户端不回传 assistant message id、只存 thinking 的 `{thinking, signature}`，故 encrypted_content 在 Anthropic 边界结构性丢失。
+- 好消息（评审核实）: reasoning item 的 `id`/`encrypted_content`/`summary` 在 direct adapter 这层**都拿得到**，只是被丢——修复落点明确、数据可得。
 
-后果: gpt 对 Claude Code **不像原生 Anthropic 模型**——推理不可见、跨轮不连续。这是「全保真」的核心缺口。
+后果: gpt 对 Claude Code 不像原生 Anthropic 模型（推理不可见、跨轮不连续）。这是全保真的核心缺口。
 
-> 注: `fix_thinking`（hookpkg 请求侧）与本问题**无关**。探针证明它只为 claude 路承重（claude 后端严格要求 `thinking.signature: Field required`，gpt 路对畸形 thinking 容忍/丢弃、开不开都 200）。它是「修复损坏 thinking 排列」的补丁，不是「reasoning↔thinking 转换」。
+> `fix_thinking`（hookpkg 请求侧）与本问题无关（只为 claude 路承重），保持现状。
 
 ## 2. 目标与非目标
 
 ### 目标（block 1）
 
-让 gpt 的 reasoning 在经此代理时对 Claude Code **像原生 Anthropic 扩展思考一样**:
-
-1. gpt 的 reasoning summary 以**带载体的合法 thinking 块**呈现给客户端（可见）。
-2. gpt 的 `encrypted_content` 通过 Anthropic 原生载体**跨轮保留**，请求侧还原回 Responses reasoning item，使 gpt 保持推理连续性。
-3. 覆盖流式与非流式两条响应路径、请求侧回放路径。
+1. gpt 的 reasoning summary 以**符合 Anthropic wire schema、可被 Claude Code 存储回放的私有 carrier thinking 块**呈现（可见）。
+2. gpt 的 `id + encrypted_content + summary` 通过该 carrier **跨轮保留**，请求侧还原成后端可接受的 Responses reasoning item，使 gpt 保持推理连续性。
+3. 覆盖 direct Responses adapter 的流式与非流式响应路径、请求侧回放路径。
 4. 载体策略 A/B **可配置切换**，默认 A。
+5. **跨模型安全**: 私有 carrier 绝不抵达真正的 Anthropic/Claude 后端。
 
-### 非目标（本 spec 不做，见 BACKLOG）
+### 非目标（见 BACKLOG）
 
-- 双 `message_start`、空壳收尾、断流信封补全等协议信封问题（block 2）——除非它直接挡住 block 1 的 reasoning 块发射。
-- 工具调用保真（block 3）、流式畸形谱系主动改写（block 4）。
-- claude 路的 `fix_thinking` 行为（已证与本问题无关，保持现状）。
+- 协议信封问题（block 2），除非双 `message_start` 经 phase 0 证实会阻断 block 1（见 §7、§9-R）。
+- 工具保真（block 3）、流式畸形主动改写（block 4）、claude 路 `fix_thinking`。
+
+### 术语澄清（评审 #12）
+
+「合法 thinking 块」在本 spec 指: **符合 Anthropic Messages wire schema、可被 Claude Code 存储与回放、但仅由本 fork 解释的私有 carrier**。它**不是** Anthropic 服务端可验签的真 signature。不变量: 私有 carrier 绝不允许发往 Anthropic/Claude 后端（§4.7）。
 
 ## 3. 验收标准（可测）
 
-1. **响应侧可见**: 触发 reasoning 的 gpt 流式请求，客户端收到的 thinking 块含非空 `thinking` 文本（= summary）与非空载体（signature 或 redacted_thinking.data），不再是空壳。
-2. **encrypted_content 往返**: 载体里 decode 出的 encrypted_content 与响应侧 encode 进去的**逐字节一致**（单测保证）。
-3. **跨轮连续性**: 两轮真实 gpt 会话，第二轮请求侧成功把回放载体还原成 Responses reasoning item、后端接受（200）、且 gpt 行为体现出用到了上一轮推理（live 验证）。
-4. **配置切换**: `reasoning_carrier` 切 A/B，响应侧产出对应块类型、请求侧对应 decode，均通过往返测试。
-5. **不误伤 claude**: 混用历史里的真 claude thinking（无我们标记）原样透传，不被当 encrypted_content 解析；claude 路请求行为不变。
-6. **失败即值**: decode 遇未知/损坏载体返回 None、安全丢弃，不抛错、不污染请求。
+1. **响应侧可见**: 触发 reasoning 的 gpt 流式请求，客户端收到的 thinking 块含非空 `thinking` 文本（=summary）与非空 carrier，不再空壳。
+2. **envelope 往返精确**: carrier decode 出的 `id`/`encrypted_content`/`summary` 与响应侧 encode 进去的**逐字节一致**（单测）。仅保 encrypted_content、丢 id 视为不达标。
+3. **跨轮连续性**: 两轮真实 gpt 会话，第二轮请求侧把回放 carrier 还原成**带原始 id** 的 Responses reasoning item、后端 200 接受（live）。
+4. **配置切换**: `reasoning_carrier` 切 A/B，响应产对应块、请求对应 decode，往返测试通过。
+5. **跨模型矩阵**（§4.6）: 四组合 × A/B 全部符合预期; 尤其 gpt-origin→Claude 时 carrier 被剥离/降级，不把伪签名发往 Claude 后端。
+6. **失败即值**: decode 返回 tagged union; `InvalidCarrier`/`UnsupportedVersion` 安全丢弃 + 观测计数、不吞错、不泄露密文正文; 仅 `NotOurCarrier` 进既有逻辑。
+7. **mutation oracle**: 删 encrypted_content、删 id、漏 summary 请求、错载体、提前 `content_block_stop`、篡改 envelope 一字节——对应测试必须变红。
 
 ## 4. 设计
 
-### 4.1 载体抽象（单一职责、可测、可配）
+### 4.1 replay envelope + carrier codec + block renderer（三层，评审建议）
 
-新增小模块（建议 `litellm/llms/github_copilot/reasoning_carrier.py`，最终位置实现时定），接口:
+**ReasoningReplayEnvelope**（强类型，frozen dataclass/Pydantic）: `{ version, reasoning_item_id, encrypted_content, summary_parts, origin_model? }`。保留 Responses 要求的 `summary` 空数组语义（`summary_parts` 可空但非缺失）。
 
-- `encode(reasoning_item, *, carrier, summary_text) -> list[AnthropicBlock]`
-  - `carrier="signature"`（A）: 产 `thinking{thinking: summary_text, signature: MARK + b64(encrypted_content)}`。
-  - `carrier="redacted_thinking"`（B）: 产 `redacted_thinking{data: MARK + b64(encrypted_content)}`；若有 `summary_text`，并排追加一个 `thinking{thinking: summary_text}` 块（无独立签名）。
-- `decode(block) -> str | None`: 若块的载体字段以 `MARK` 起头，剥离并解码返回原始 `encrypted_content`；否则返回 None（含真 claude 签名 → None，原样透传）。
+**carrier codec**（两实现，配置选）: 把 envelope 序列化进 Anthropic 块字段:
+- A（`signature`）: `thinking{thinking: summary_text, signature: NS(envelope)}`。
+- B（`redacted_thinking`）: `redacted_thinking{data: NS(envelope)}`; 若有 summary，并排一个 `thinking{thinking: summary_text}` **展示块**。
+- `NS(...)` = 命名空间化、版本化、带必填校验（可选 checksum）的编码，**非**「前缀 + 裸 base64」（评审 #11）。
 
-**标记**: `MARK = "ghc-rsn:v1:"`（版本化）。作用: 请求侧区分「我们的载体」与「真 claude 签名」; 版本便于演进。编码用 base64 保证载体字段是安全字符串、往返字节精确。
+**block renderer**: 把 codec 产物拼成 Anthropic content 块 / 流式 SSE 事件序列。
 
-**encrypted_content 形态**: 直接搬 copilot Responses 返回的 `encrypted_content` 原值（含 litellm 若已做的 `litellm_enc:` 包装则一并搬），请求侧原样还原，不自行拆解其内部结构。
+`decode(block) -> DecodeResult`（tagged union，评审 #10）: `DecodedCarrier(envelope) | NotOurCarrier | InvalidCarrier(reason) | UnsupportedCarrierVersion`。
 
-### 4.2 响应侧（gpt → Claude Code）
+> 三层拆分有 A/B 两个真实 codec 消费者，非空泛化; 不为单实现加无消费者的抽象。
 
-在 `adapters/transformation.py` 的 chat→Anthropic 转换（非流式 `~1165-1190`、流式 `~1412+`）接线: 当 message 带 `reasoning_items`（其中含 `encrypted_content`）时，调 `encode(...)` 产出 thinking/redacted_thinking 块，替换/补齐现在产出的空壳。summary 文本取自 reasoning item 的 summary（见 4.4）。流式路径需把 encode 结果拆成 `content_block_start/delta/stop`（signature 经 `signature_delta` 事件下发，遵循既有 `agentic_streaming_iterator.py`/`fake_stream_iterator.py` 的 thinking+signature_delta 机制）。
+### 4.2 响应侧（gpt → Claude Code）· direct adapter
 
-### 4.3 请求侧（Claude Code → gpt）
+- **非流式** [responses_adapters/transformation.py:~392-491](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py)（丢失点 410-420）: 对 `ResponseReasoningItem`，用 `item.id`/`item.encrypted_content`/`item.summary` 构 envelope → codec/renderer 产 carrier 块，替换现在的空壳。
+- **流式** [responses_adapters/streaming_iterator.py:~67-276](litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py): `output_item.added` 开 thinking 块、`reasoning_summary_text.delta*` 发 summary 文本、**`output_item.done` 时先发 `signature_delta`（A）或发 `redacted_thinking`（B）再 `content_block_stop`**——因为 `encrypted_content` 在 `output_item.done` 才齐（评审 #3、#8）。注意 affinity `litellm_enc:` 包装发生在 [responses/streaming_iterator.py:198-219](litellm/responses/streaming_iterator.py#L198-L219)，envelope 要搬**包装后**上游实际给的 encrypted_content 值。
 
-在 Anthropic→Responses 的请求转换里，遍历历史 assistant message 的 content 块: 对每个 thinking/redacted_thinking 块调 `decode(block)`; 非 None 则据此重建一个 Responses `reasoning` item（`encrypted_content` = decode 结果），插入 Responses input 的对应位置; None 则按现状处理（真 claude 签名透传 / 无载体 thinking 交由既有逻辑）。
+### 4.3 请求侧（Claude Code → gpt）· direct adapter
+
+落点 [responses_adapters/transformation.py:~134-174](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L134-L174)（现状 161-164 把 `thinking.thinking` 当普通 assistant `output_text`、无 `redacted_thinking` 分支，评审 #4）。冻结规则:
+
+- 识别到的 carrier 块 → **只**生成 Responses `reasoning` item（`id`+`encrypted_content`+`summary` 从 envelope 还原），**不生成 `output_text`**。
+- B 版与 carrier 配对的 summary thinking 块是**展示副本**，也不生成 `output_text`（消费/去重，评审 #4）。
+- 多 reasoning item / 多 summary part / reasoning 与 tool call 交错时，保持原始 item 顺序。
+- 未识别的真 claude thinking（`NotOurCarrier`）当前目标为 gpt 时的处置（丢弃/转文本/保留）**须明确定义并测试**。
 
 ### 4.4 Responses 请求补 summary
 
-在 `github_copilot/responses/transformation.py` 组装 Responses 请求时，按 `reasoning_summary` 配置设 `reasoning.summary`（`"auto"` 默认 / `"off"` 关闭）。关闭时 reasoning 无可见摘要 → A 版退化为「空 thinking + 有效载体」、B 版为「纯 redacted_thinking」，仍保往返连续性（等价方案 C）。
+落点 [responses_adapters/transformation.py:~250-284](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L250-L284) + [handler.py:~22-113](litellm/llms/anthropic/experimental_pass_through/responses_adapters/handler.py)（**不是** `github_copilot/responses/transformation.py`，评审 #6）。两层枚举:
+- 部署配置 `reasoning_summary: off | auto | concise | detailed`。
+- wire 映射: `off -> 省略 summary 字段`; 其余原样进 `reasoning.summary`（wire 合法值只有 `auto|concise|detailed`，无 `off`）。
+- 与现有 `litellm.reasoning_auto_summary` 的**优先级/兼容/弃用**须明确，避免同一请求被两机制双重覆盖。
 
-### 4.5 配置
+### 4.5 配置解析与传播合同（评审 #7）
 
-挂在 github_copilot 部署的 litellm 配置（与现有 copilot 参数同处），全局默认 + 可按模型覆盖:
+现状: `_ADAPTER` 是 module-global 实例，`translate_response()` 只收 response，`AnthropicResponsesStreamWrapper` 只收 stream+model——**没有配置参数入口**。故不能只说「走已有通道」。冻结:
 
-- `reasoning_carrier: "signature" | "redacted_thinking"`，默认 `"signature"`（A）。
-- `reasoning_summary: "auto" | "off"`，默认 `"auto"`。
+- 字段位置: `model_info`（extra 允许）还是 `litellm_params`——实现时二选一并固定; deployment `model_info` 已由 [handler.py:~495-533](litellm/llms/anthropic/experimental_pass_through/messages/handler.py) 读到，可承载。
+- 优先级: global < model group < deployment < per-request; null/unset 语义明确。
+- 非 github_copilot provider: 忽略（不报错）。
+- 解析失败: tagged error。
+- 用 **frozen dataclass/Pydantic** 表示 resolved config，**同时**传入 request adapter、non-stream response adapter、stream wrapper（需新增 plumbing，不再传裸 `dict[str, Any]`）。
 
-配置读取走 fork 已有的 capability/deployment 参数通道（近期提交已有 per-request deployment model_info 线索，实现时对齐），不新造 hookpkg 开关。
+### 4.6 跨模型矩阵（评审 #5，新增）
 
-### 4.6 错误处理
+| 历史 origin | 当前目标 | 要求 |
+|---|---|---|
+| claude-origin | claude | 原样透传（现状） |
+| claude-origin | gpt | 真 claude 签名无我们 NS → `NotOurCarrier` → 按 §4.3 未识别处置 |
+| gpt-origin | gpt | carrier decode → 重建 reasoning item（核心正路） |
+| **gpt-origin** | **claude** | **进入原生 Anthropic 路由前，剥离/降级私有 carrier**——绝不把伪签名发往 Claude 后端（否则 400）。若保 summary 可见，降级为普通 text，且不把伪 thinking 块留在 latest assistant message |
 
-- decode 未知/损坏载体 → None → 安全丢弃该 reasoning，不抛错。
-- 真 claude 签名（无 `MARK`）→ decode 返回 None → 原样透传，绝不误解。
-- gpt 未给 summary → 按 4.4 退化，不报错。
-- 编解码异常收敛为「返回值/None」，不向上抛破坏请求（遵循 never-swallow 的同时以值建模失败: 记一条 warning 便于观测）。
+每组合再 × A/B 各验。
 
-## 5. 前置 PoC（phase 0，设计押在其上）
+### 4.7 错误处理与不变量
 
-**验证 Claude Code 是否忠实存储并原样回放两种载体**（signature / redacted_thinking.data）。这是全设计的可行性根基，必须在正式实现前跑出结论。
+- `decode` tagged union; 仅 `NotOurCarrier` 进既有逻辑; `InvalidCarrier`/`UnsupportedCarrierVersion` → 不含密文正文的 warning + 可观测计数，按冻结策略丢弃。
+- **不变量**: 私有 carrier（`ghc-rsn` NS）绝不抵达 Anthropic/Claude 后端（§4.6 末行保证）。
+- 编解码异常收敛为返回值，不向上抛破坏请求。
 
-做法: 最小实现响应侧 `encode`（先只 A，或 A/B 各一）→ 在 Claude Code 里用 gpt 跑一次真实会话 → 查存下的 transcript，确认载体字段原样存在 → 触发下一轮，抓代理侧请求，确认载体被原样回放、请求侧 `decode` 能还原、后端 200 接受。两载体各验一遍。
+## 5. 前置 PoC（phase 0，带 oracle 表，评审 #8）
 
-PoC 结论用于: 定默认载体; 若某载体被 Claude Code 篡改/校验拒绝，则调整标记/编码或改默认到另一载体。**客户端存储行为只能用真实 Claude Code gpt 会话测**，非 curl 可替代——此步需要人工在 Claude Code 侧驱动 gpt。
+必须用**真实 Claude Code gpt 会话**（客户端存储行为不可 curl 替代）。A、B **各**跑，每轮记录并断言:
 
-## 6. 测试策略
+1. 抓 direct wrapper 实际收到的原始 `output_item.done`，记 `id` 与 `encrypted_content`（不从 transcript 反推）。
+2. Claude Code transcript 里 carrier **逐字节原样存在**。
+3. 下一轮抓代理构造的 Responses input，**精确断言** replay item 的 `id`/`encrypted_content`/`summary` 与原值一致。
+4. 后端 200。
+5. **重启 Claude Code** 后重复下一轮（验从 transcript 恢复）。
+6. **切到 Claude** 验证不发送伪签名（§4.6）。
+7. 篡改 carrier 一字节 → 明确失败行为。
+8. 记录**完整 SSE 事件顺序**，确认双 `message_start`（§7）对 Claude Code 的实际影响。
+9. 量 encrypted_content 大小 p50/p95/max（评审 R2，供 §4.1 是否需压缩 codec 决策）。
 
-- **单元**: `encode`/`decode` 两载体往返字节一致; 标记识别; 真 claude 签名不误伤; summary 有/无两分支。
-- **集成**（转换层，走既有 `tests/test_litellm/llms/github_copilot/`）: 「带载体的 Anthropic 请求 → 正确 Responses reasoning item（encrypted_content 精确）」; 「带 encrypted_content 的 Responses reasoning item → 正确 Anthropic 块」; 流式/非流式各一。断言要能在代码被变异（丢 encrypted_content、错载体、漏 summary）时变红。
-- **e2e/live**: 沿用探针，两载体各跑真实 gpt 两轮，验可见性 + 往返连续 + 协议合规（无新增畸形）。
+「gpt 用到上一轮推理」只作辅助观察，不替代结构断言。
 
-## 7. 风险与未决
+## 6. 测试策略（主 seam 在 responses_adapters，评审 #9）
 
-- **R1（最高）**: Claude Code 可能不原样回放 signature（校验/丢弃）或 redacted_thinking.data。→ 由 phase 0 PoC 先证; A/B 可配置切换即为对冲。
-- **R2**: encrypted_content 体积可能较大，signature/data 膨胀。→ 探针量实际大小，必要时评估是否压缩（保持往返字节可还原）。
-- **R3**: 上游 litellm rebase 可能冲突转换层改动。→ 私有 fork、focus copilot，可接受; 改动尽量集中、带充分测试。
-- **U1**: summary `"auto"` 的 token/成本影响未量化。→ 可在 PoC 时一并观测，必要时默认调整。
-- **U2**: 双 `message_start` 是否会干扰流式 reasoning 块发射，待实现时确认; 若挡路则纳入本块顺带修，否则留 block 2。
+- **单元**: envelope encode/decode 往返字节一致、NS 识别、真 claude 签名不误伤（property-based: 真样本/随机串/合法 b64/伪前缀/未知版本）、summary 有无两分支、decode tagged union 各分支。
+- **集成（端到端单元链，放 `tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/`）**: `_should_route_to_responses_api` 确认 gpt 进 direct handler; 非流式 `ResponsesAPIResponse.output → Anthropic carrier`; 流式 raw Responses SSE（`output_item.added → summary delta* → output_item.done` 带 encrypted_content）→ 完整 Anthropic SSE 序列; Claude Code 回放形状 → direct request adapter → Responses input（带原始 id）; 目标切 Claude 时 carrier stripping。provider 目录保留 affinity/config 测试。
+- **mutation oracle**: 删 encrypted_content / 删 id / 漏 summary 请求 / 错载体 / 提前 stop → 变红。
+- **e2e/live**: 沿用探针，A/B 各跑真实 gpt 两轮。
 
-## 8. 相关
+## 7. 双 message_start（评审 #13，已证实）
+
+已复现（`streaming_iterator.py:~281-290` fallback 先发一次 + `~76-80` 上游 `response.created` 又发一次）。当前两个 start 通常都在 reasoning 块前，尚无证据证明它吞掉 reasoning 块，但可能让严格客户端重置/拒绝整条 stream，或污染 phase 0 归因。处置: phase 0 §5-8 记录并确认 Claude Code 行为; **若 Claude Code 在第二个 start 处重置/拒绝 → 它是 block 1 前置 blocker，一并修**; 若容忍且 carrier 稳定落盘 → 留 block 2。
+
+## 8. 风险与未决
+
+- **R1（最高）**: Claude Code 是否原样存储/回放 carrier（signature / redacted_thinking.data）。评审核实: Anthropic wire schema 只把二者定义为 string，未见客户端本地验签的必然证据，故 PoC 有实际价值、非已知必然失败; 但 Anthropic **服务端**会验真签名——故 §4.7 不变量必须成立。A/B 可配置切换对冲。
+- **R2**: encrypted_content 体积 → phase 0 量 p50/p95/max; 若需压缩，在 envelope version 显式表达 codec，不静默压缩。
+- **R3**: 上游 rebase 冲突 → 私有 fork、focus copilot，可接受; 改动集中 + 充分测试。
+- **U1**: summary token/成本 → phase 0 一并观测。
+- **U2**: 双 message_start 影响 → 见 §7，phase 0 定归属。
+
+## 9. 相关
 
 - `docs/BACKLOG.md` —— block 2/3/4 延后项。
-- `~/.claude/litellm/docs/illformed-fix.md` —— live 探针方法与 provider 差异结论、hookpkg 现状。
-- `~/.claude/skills/debugging-llm-proxy-transforms/` —— 代理转换排错方法论（先探针定位哪一层，别凭结构盲改）。
+- `~/.claude/litellm/docs/illformed-fix.md` —— live 探针方法与 provider 差异结论。
+- `~/.claude/skills/debugging-llm-proxy-transforms/` —— 代理转换排错方法论。
+
+## 10. 评审吸收记录（2026-07-14 GPT 对抗评审）
+
+代码核实的 2 blocker + 8 major + 3 minor 全部吸收（见 v2 变更提要与各节内嵌）。本人复核关键 blocker: [handler.py:532](litellm/llms/anthropic/experimental_pass_through/messages/handler.py#L532) 确走 `LiteLLMMessagesToResponsesAPIHandler`; [responses_adapters/transformation.py:410-420](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L410-L420) 确只用 summary、丢 id/encrypted_content。**未采纳/降级**: 无——评审均为事实性或与用户价值一致的加固，全采。评审建议的 encode 三层拆分采纳但保持最小（A/B 两真实消费者）。
