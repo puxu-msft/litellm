@@ -19,6 +19,7 @@ class _HTTPResponse(Protocol):
 class _HTTPGetClient(Protocol):
     def get(self, url: str, headers: "Mapping[str, str]", timeout: float) -> _HTTPResponse: ...
 
+
 _ALIASES: tuple[tuple[str, CopilotEndpoint], ...] = (
     ("/v1/messages", "messages"),
     ("messages", "messages"),
@@ -38,7 +39,7 @@ def normalize_endpoints(raw: tuple[str, ...]) -> "frozenset[CopilotEndpoint]":
 
 def strip_copilot_prefix(model: str) -> str:
     prefix = "github_copilot/"
-    return model[len(prefix):] if model.startswith(prefix) else model
+    return model[len(prefix) :] if model.startswith(prefix) else model
 
 
 class _ModelEntry(BaseModel):

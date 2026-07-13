@@ -76,9 +76,7 @@ def github_copilot_supports_responses_api(model: str) -> bool:
     if mode in ("chat", "anthropic"):
         return False
 
-    return "responses" in resolve_endpoints(
-        model, model_info=raw_model_info(model), api_base=copilot_api_base()
-    )
+    return "responses" in resolve_endpoints(model, model_info=raw_model_info(model), api_base=copilot_api_base())
 
 
 class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
