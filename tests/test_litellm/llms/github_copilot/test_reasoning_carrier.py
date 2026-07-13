@@ -106,3 +106,27 @@ def test_missing_required_field_is_invalid():
     b64 = base64.urlsafe_b64encode(json.dumps({"ec": "E", "sp": []}).encode()).decode()
     block = {"type": "thinking", "thinking": "", "signature": f"ghc-rsn:v1:{b64}"}
     assert isinstance(decode_carrier(block), InvalidCarrier)
+
+
+def test_never_decodes_non_envelope_and_never_raises():
+    import base64
+    import random
+    import string
+
+    seeds = [
+        "", "sig", "EqoBabc==", base64.urlsafe_b64encode(b"{}").decode(),
+        "ghc-rsn", "ghc-rsn:", "ghc-rsn:v1", "ghc-rsn:v1:", "ghc-rsn:vX:YWJj",
+        "ghc-rsn:v1:" + base64.urlsafe_b64encode(b"[1,2,3]").decode(),
+    ]
+    rng = random.Random(1234)
+    corpus = seeds + [
+        "".join(rng.choice(string.printable) for _ in range(rng.randint(0, 40)))
+        for _ in range(200)
+    ]
+    for s in corpus:
+        for block in (
+            {"type": "thinking", "thinking": "", "signature": s},
+            {"type": "redacted_thinking", "data": s},
+        ):
+            res = decode_carrier(block)  # must not raise
+            assert not isinstance(res, DecodedCarrier) or s.startswith("ghc-rsn:v1:")
