@@ -9,12 +9,14 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncGenerator,
+    AsyncIterator,
     Callable,
     Dict,
     Literal,
     Optional,
     Tuple,
     Union,
+    cast,
 )
 
 import anyio
@@ -53,6 +55,7 @@ from litellm.proxy.common_utils.sse_frame_normalizer import (
 )
 from litellm.proxy.common_utils.sse_keepalive import (
     DownstreamSSESurface,
+    SSEFrame,
     StreamLease,
     committed_error_frame,
     needs_frame_normalizer,
@@ -416,7 +419,7 @@ async def _buffer_first_chunk_honoring_disconnect(
     raise _ClientDisconnectedBeforeFirstChunk()
 
 
-def _error_obj_from_exception(exc: BaseException) -> dict:
+def _error_obj_from_exception(exc: BaseException) -> dict[str, str]:
     code = getattr(exc, "status_code", None) or getattr(exc, "code", None) or 500
     message = getattr(exc, "detail", None) or getattr(exc, "message", None) or str(exc)
     return {
@@ -428,9 +431,9 @@ def _error_obj_from_exception(exc: BaseException) -> dict:
 
 
 async def _committed_error_guard(
-    inner: AsyncGenerator[str, None],
+    inner: AsyncGenerator[SSEFrame, None],
     surface: DownstreamSSESurface,
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[SSEFrame, None]:
     """Post-commit, an error can no longer become a JSON response — serialize it
     as a client-recognizable SSE error frame instead of aborting the connection.
 
@@ -451,7 +454,7 @@ async def _committed_error_guard(
 async def _create_response_with_keepalive(
     generator: AsyncGenerator[str, None],
     media_type: str,
-    streaming_headers: dict,
+    streaming_headers: dict[str, str],
     default_status_code: int,
     request: Optional[Request],
     keepalive: ResolvedStreamKeepaliveConfig,
@@ -470,19 +473,23 @@ async def _create_response_with_keepalive(
     once.
     """
     strategy = strategy_for(surface)
-    framed: AsyncGenerator[str, None] = (
-        normalize_anthropic_sse_frames(generator)  # type: ignore[arg-type,assignment]
+    # For anthropic native passthrough the generator yields raw byte chunks; the
+    # normalizer reframes them to complete SSE frames. Both branches are
+    # AsyncIterator[SSEFrame] (str or bytes); the lease owns the original
+    # generator for closing.
+    framed: AsyncIterator[SSEFrame] = (
+        normalize_anthropic_sse_frames(cast("AsyncIterator[bytes]", generator))
         if needs_frame_normalizer(surface)
         else generator
     )
-    lease = StreamLease(inner=generator)
+    lease = StreamLease(inner=cast("AsyncGenerator[SSEFrame, None]", generator))
 
-    chunk_task: "asyncio.Task" = asyncio.ensure_future(framed.__anext__())
+    chunk_task: "asyncio.Task[SSEFrame]" = asyncio.ensure_future(framed.__anext__())
     lease.set_pending_task(chunk_task)
-    disconnect_task: Optional["asyncio.Task"] = (
+    disconnect_task: "Optional[asyncio.Task[None]]" = (
         asyncio.ensure_future(_wait_for_http_disconnect(request)) if request is not None else None
     )
-    wait_set = {chunk_task} | ({disconnect_task} if disconnect_task is not None else set())
+    wait_set = [t for t in (chunk_task, disconnect_task) if t is not None]
     await asyncio.wait(wait_set, timeout=keepalive.interval, return_when=asyncio.FIRST_COMPLETED)
 
     # Priority: disconnect > completed first frame > timer.
@@ -506,18 +513,18 @@ async def _create_response_with_keepalive(
                     "code": str(LITELLM_HTTP_STATUS_CLIENT_DISCONNECTED),
                 }
             },
-            headers={k: v for k, v in streaming_headers.items()},
+            headers=dict(streaming_headers),
         )
 
     if chunk_task.done():
         try:
-            first_frame = chunk_task.result()
+            first_frame: SSEFrame = chunk_task.result()
         except StopAsyncIteration:
             await lease.close()
 
-            async def _empty_gen() -> AsyncGenerator[str, None]:
-                if False:
-                    yield  # type: ignore[unreachable]
+            async def _empty_gen() -> AsyncGenerator[SSEFrame, None]:
+                return
+                yield  # pragma: no cover - makes this an async generator
 
             return StreamingResponse(
                 _empty_gen(),
@@ -537,12 +544,12 @@ async def _create_response_with_keepalive(
             return JSONResponse(
                 status_code=error_code_from_chunk,
                 content={"error": _extract_error_from_sse_chunk(first_frame)},
-                headers={k: v for k, v in streaming_headers.items()},
+                headers=dict(streaming_headers),
             )
 
         seen_message_start = strategy.observe_advances_to_phase2(first_frame)
 
-        async def _fast_body() -> AsyncGenerator[str, None]:
+        async def _fast_body() -> AsyncGenerator[SSEFrame, None]:
             yield first_frame
             async for frame in _committed_error_guard(
                 sse_keepalive(framed, strategy, keepalive.interval, lease, seen_message_start=seen_message_start),
@@ -551,11 +558,11 @@ async def _create_response_with_keepalive(
                 yield frame
 
         return _UpstreamClosingStreamingResponse(
-            _fast_body(),
+            cast("AsyncGenerator[str, None]", _fast_body()),
             media_type=media_type,
             headers=streaming_headers,
             status_code=default_status_code,
-            upstream_generator=lease,  # type: ignore[arg-type]
+            upstream_generator=cast("AsyncGenerator[str, None]", lease),
         )
 
     # Timer fired first: slow upstream. Commit 200 and keepalive during the wait.
@@ -564,11 +571,11 @@ async def _create_response_with_keepalive(
         surface,
     )
     return _UpstreamClosingStreamingResponse(
-        slow_body,
+        cast("AsyncGenerator[str, None]", slow_body),
         media_type=media_type,
         headers=streaming_headers,
         status_code=default_status_code,
-        upstream_generator=lease,  # type: ignore[arg-type]
+        upstream_generator=cast("AsyncGenerator[str, None]", lease),
     )
 
 
@@ -586,10 +593,10 @@ def _surface_for_route(route_type: str) -> Optional[DownstreamSSESurface]:
 
 def _resolve_downstream_keepalive(
     route_type: str,
-    response: Any,
+    response: object,
     llm_router: Optional[Router],
-    request_data: dict,
-) -> tuple[Optional[ResolvedStreamKeepaliveConfig], Optional[DownstreamSSESurface]]:
+    request_data: Dict[str, object],
+) -> Tuple[Optional[ResolvedStreamKeepaliveConfig], Optional[DownstreamSSESurface]]:
     """Resolve the effective keepalive config + surface for this streaming call.
 
     Global ``litellm.stream_keepalive`` merged with the selected deployment's
@@ -606,30 +613,46 @@ def _resolve_downstream_keepalive(
     if surface is None:
         return None, None
     try:
-        global_raw = getattr(litellm, "stream_keepalive", None)
+        global_raw: object = getattr(litellm, "stream_keepalive", None)
         global_override = parse_override(global_raw) if global_raw is not None else None
 
         deployment_override = None
         if llm_router is not None:
-            hidden_params = getattr(response, "_hidden_params", None) or {}
-            if isinstance(hidden_params, dict):
-                model_id = ProxyBaseLLMRequestProcessing._get_model_id_from_response(hidden_params, request_data)
-                if model_id:
-                    deployment = llm_router.get_deployment(model_id=model_id)
-                    dep_params = getattr(deployment, "litellm_params", None) if deployment is not None else None
-                    raw = None
-                    if isinstance(dep_params, dict):
-                        raw = dep_params.get("stream_keepalive")
-                    elif dep_params is not None:
-                        raw = getattr(dep_params, "stream_keepalive", None)
-                    if raw is not None:
-                        deployment_override = parse_override(raw)
+            model_id = _selected_model_id(response, request_data)
+            if model_id:
+                deployment = llm_router.get_deployment(model_id=model_id)
+                dep_params = getattr(deployment, "litellm_params", None) if deployment is not None else None
+                # Deployment litellm_params is a dict at runtime (LiteLLMParamsTypedDict).
+                raw = (
+                    cast("dict[str, object]", dep_params).get("stream_keepalive")
+                    if isinstance(dep_params, dict)
+                    else None
+                )
+                if raw is not None:
+                    deployment_override = parse_override(raw)
 
         resolved = resolve(merge_overrides(global_override, deployment_override))
         return resolved, surface
     except Exception as exc:  # noqa: BLE001
         verbose_proxy_logger.warning("stream_keepalive: failed to resolve config, disabling: %s", exc)
         return None, None
+
+
+def _selected_model_id(response: object, request_data: Dict[str, object]) -> str:
+    """Best-effort model_id of the selected deployment from the response's hidden
+    params, falling back to request litellm_metadata. Dynamic-dict lookups are
+    confined here."""
+
+    def _dict(value: object) -> Dict[str, object]:
+        return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+
+    hidden_params = _dict(getattr(response, "_hidden_params", None))
+    from_hidden = hidden_params.get("model_id")
+    if from_hidden:
+        return str(from_hidden)
+    model_info = _dict(_dict(request_data.get("litellm_metadata")).get("model_info"))
+    from_meta = model_info.get("id")
+    return str(from_meta) if from_meta else ""
 
 
 async def create_response(

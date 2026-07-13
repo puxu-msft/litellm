@@ -19,7 +19,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, AsyncIterator, Optional
 
 from typing_extensions import assert_never
 
@@ -120,7 +120,7 @@ class StreamLease:
 
 
 async def sse_keepalive(
-    real_frames: "AsyncGenerator[SSEFrame, None]",
+    real_frames: "AsyncIterator[SSEFrame]",
     strategy: KeepaliveStrategy,
     interval: float,
     lease: StreamLease,
@@ -186,7 +186,7 @@ def needs_frame_normalizer(surface: DownstreamSSESurface) -> bool:
     return surface is DownstreamSSESurface.ANTHROPIC
 
 
-def committed_error_frame(surface: DownstreamSSESurface, error_obj: dict) -> str:
+def committed_error_frame(surface: DownstreamSSESurface, error_obj: dict[str, str]) -> str:
     """Serialize an error as a client-recognizable SSE frame for a committed stream.
 
     Once the 200 + headers have been sent (slow-commit / mid-stream), an error
