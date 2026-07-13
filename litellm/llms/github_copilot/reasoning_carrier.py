@@ -12,11 +12,15 @@ as values via the ``DecodeResult`` tagged union rather than raised.
 """
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass
-from typing import Union
+from typing import Literal, Union
 
 _NS = "ghc-rsn"
 _VERSION = 1
+
+_Carrier = Literal["signature", "redacted_thinking"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,3 +53,35 @@ class UnsupportedCarrierVersion:
 
 
 DecodeResult = Union[DecodedCarrier, NotOurCarrier, InvalidCarrier, UnsupportedCarrierVersion]
+
+
+def _serialize(env: ReasoningReplayEnvelope) -> str:
+    payload = {
+        "id": env.reasoning_item_id,
+        "ec": env.encrypted_content,
+        "sp": list(env.summary_parts),
+        "om": env.origin_model,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("ascii")
+    return f"{_NS}:v{env.version}:{b64}"
+
+
+def _summary_text(env: ReasoningReplayEnvelope) -> str:
+    return " ".join(env.summary_parts).strip()
+
+
+def encode_carrier(env: ReasoningReplayEnvelope, carrier: _Carrier) -> tuple[dict, ...]:
+    """Encode a reasoning envelope into Anthropic carrier block(s).
+
+    ``signature`` -> a single ``thinking`` block whose ``signature`` carries the
+    serialized envelope. ``redacted_thinking`` -> a ``redacted_thinking`` block
+    carrying the envelope in ``data``, preceded by a display ``thinking`` block
+    when a summary is present (two independent content blocks).
+    """
+    token = _serialize(env)
+    summary = _summary_text(env)
+    if carrier == "signature":
+        return ({"type": "thinking", "thinking": summary, "signature": token},)
+    summary_block = ({"type": "thinking", "thinking": summary},) if summary else ()
+    return (*summary_block, {"type": "redacted_thinking", "data": token})
