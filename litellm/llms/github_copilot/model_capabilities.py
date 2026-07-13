@@ -1,11 +1,13 @@
+import os
 from typing import Literal, Mapping, Optional, Protocol
 
-from pydantic import BaseModel, TypeAdapter
+import httpx
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from litellm._logging import verbose_logger
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
-from litellm.llms.github_copilot.common_utils import get_copilot_default_headers
+from litellm.llms.github_copilot.common_utils import GetAPIKeyError, get_copilot_default_headers
 
 CopilotEndpoint = Literal["messages", "responses", "chat"]
 
@@ -69,7 +71,9 @@ def fetch_endpoint_pairs(
     return tuple((entry.id, normalize_endpoints(entry.supported_endpoints)) for entry in parsed.data)
 
 
-_CAP_CACHE: _TTLCache = InMemoryCache(max_size_in_memory=64, default_ttl=300)
+_CAP_CACHE: _TTLCache = InMemoryCache(max_size_in_memory=64, default_ttl=1800)
+_CACHE_TTL_SECONDS = 1800
+_REFRESH_INTERVAL_SECONDS = 300
 
 
 def refresh_capabilities(
@@ -79,11 +83,11 @@ def refresh_capabilities(
 ) -> "tuple[tuple[str, frozenset[CopilotEndpoint]], ...]":
     try:
         pairs = fetch_endpoint_pairs(api_key=api_key, api_base=api_base, client=client)
-    except Exception as e:
+    except (httpx.HTTPError, RuntimeError, ValidationError) as e:
         verbose_logger.debug("github_copilot refresh_capabilities failed for %s: %s", api_base, e)
         return ()
     _CAP_CACHE.delete_cache(api_base)
-    _CAP_CACHE.set_cache(api_base, pairs, ttl=300)
+    _CAP_CACHE.set_cache(api_base, pairs, ttl=_CACHE_TTL_SECONDS)
     return pairs
 
 
@@ -95,7 +99,7 @@ def get_cached_pairs(
         return None
     try:
         return _PAIRS_ADAPTER.validate_python(cached)
-    except Exception:
+    except ValidationError:
         return None
 
 
@@ -110,14 +114,14 @@ def resolve_endpoints(
         cached = get_cached_pairs(api_base)
         if cached is not None:
             hit = next((eps for m, eps in cached if m == bare), None)
-            if hit:
+            if hit is not None:
                 return hit
     raw = model_info.get("supported_endpoints") if model_info else None
     if raw is None:
         return frozenset()
     try:
         names = _ENDPOINTS_ADAPTER.validate_python(raw)
-    except Exception:
+    except ValidationError:
         return frozenset()
     return normalize_endpoints(names)
 
@@ -171,7 +175,7 @@ def raw_model_info(model: str) -> "Optional[Mapping[str, object]]":
         return None
     try:
         return _INFO_ADAPTER.validate_python(entry)
-    except Exception:
+    except ValidationError:
         return None
 
 
@@ -182,10 +186,66 @@ def copilot_api_base(explicit: Optional[str] = None) -> Optional[str]:
         return explicit.rstrip("/")
     try:
         base = Authenticator().get_api_base()
-    except Exception as e:
+    except (GetAPIKeyError, OSError, ValueError, KeyError) as e:
         verbose_logger.debug("github_copilot copilot_api_base failed: %s", e)
         return None
     return base.rstrip("/") if base else None
+
+
+class _DeploymentEntry(BaseModel):
+    litellm_params: "Optional[Mapping[str, object]]" = None
+
+
+_DEPLOYMENTS_ADAPTER: "TypeAdapter[tuple[_DeploymentEntry, ...]]" = TypeAdapter(tuple[_DeploymentEntry, ...])
+
+
+def _deployment_base(params: "Mapping[str, object]", default_base: Optional[str]) -> str:
+    api_base = params.get("api_base")
+    chosen = api_base if isinstance(api_base, str) and api_base else default_base
+    return chosen.rstrip("/") if chosen else ""
+
+
+def _copilot_deployment_bases(router: object) -> "tuple[str, ...]":
+    get_list = getattr(router, "get_model_list", None)
+    if get_list is None:
+        return ()
+    try:
+        deployments = _DEPLOYMENTS_ADAPTER.validate_python(get_list() or ())
+    except ValidationError:
+        return ()
+    default_base = copilot_api_base()
+    bases = frozenset(
+        _deployment_base(d.litellm_params, default_base)
+        for d in deployments
+        if d.litellm_params is not None and str(d.litellm_params.get("model", "")).startswith("github_copilot/")
+    )
+    return tuple(b for b in bases if b)
+
+
+def _non_interactive_api_key() -> Optional[str]:
+    from litellm.llms.github_copilot.authenticator import Authenticator
+
+    auth = Authenticator()
+    if not os.path.exists(auth.access_token_file):
+        verbose_logger.debug("github_copilot refresh: no oauth token file, skipping to avoid device flow")
+        return None
+    try:
+        return auth.get_api_key()
+    except GetAPIKeyError as e:
+        verbose_logger.debug("github_copilot refresh: get_api_key failed (%s)", e)
+        return None
+
+
+def refresh_all_deployments(router: object, client: Optional[HTTPHandler] = None) -> None:
+    bases = _copilot_deployment_bases(router)
+    if not bases:
+        return
+    key = _non_interactive_api_key()
+    if key is None:
+        return
+    http = client if client is not None else HTTPHandler()
+    for base in bases:
+        refresh_capabilities(key, base, http)
 
 
 def refresh_default_capabilities(
@@ -194,27 +254,24 @@ def refresh_default_capabilities(
     api_base: Optional[str] = None,
     client: Optional[HTTPHandler] = None,
 ) -> None:
-    from litellm.llms.github_copilot.authenticator import Authenticator
-
     base = copilot_api_base(api_base)
     if base is None:
         return
-    key = api_key
+    key = api_key if api_key is not None else _non_interactive_api_key()
     if key is None:
-        try:
-            key = Authenticator().get_api_key()
-        except Exception as e:
-            verbose_logger.debug("github_copilot refresh_default_capabilities: no api key (%s)", e)
-            return
+        return
     refresh_capabilities(key, base, client if client is not None else HTTPHandler())
 
 
-async def periodic_capability_refresh_loop(interval_seconds: float = 300.0) -> None:
+async def periodic_capability_refresh_loop(
+    router: object,
+    interval_seconds: float = float(_REFRESH_INTERVAL_SECONDS),
+) -> None:
     import asyncio
 
     while True:
         try:
-            refresh_default_capabilities()
-        except Exception as e:
+            await asyncio.to_thread(refresh_all_deployments, router)
+        except (httpx.HTTPError, OSError, ValueError, RuntimeError) as e:
             verbose_logger.debug("github_copilot periodic refresh error: %s", e)
         await asyncio.sleep(interval_seconds)

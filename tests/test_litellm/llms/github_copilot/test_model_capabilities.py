@@ -190,12 +190,61 @@ def test_refresh_default_capabilities_di_writes_cache():
     assert dict(cached)["gpt-5.5"] == frozenset({"responses"})
 
 
-def test_refresh_default_capabilities_no_base_is_noop():
+def test_refresh_default_capabilities_no_base_is_noop(monkeypatch):
     import litellm.llms.github_copilot.model_capabilities as mc
 
     mc._CAP_CACHE.flush_cache()
-    mc.refresh_default_capabilities(api_key="k", api_base=None, client=_FakeClient(_FakeResp(200, _MODELS_PAYLOAD)))
+    monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: None)
+    mc.refresh_default_capabilities(api_key="k", client=_FakeClient(_FakeResp(200, _MODELS_PAYLOAD)))
     assert mc.get_cached_pairs("https://b") is None
+
+
+def test_refresh_all_deployments_iterates_distinct_copilot_bases(monkeypatch):
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: "https://default")
+    monkeypatch.setattr(mc, "_non_interactive_api_key", lambda: "tok")
+
+    class _Router:
+        def get_model_list(self):
+            return [
+                {"litellm_params": {"model": "github_copilot/gpt-5.5", "api_base": "https://b1"}},
+                {"litellm_params": {"model": "github_copilot/claude-opus-4.8"}},
+                {"litellm_params": {"model": "openai/gpt-4o", "api_base": "https://skip"}},
+            ]
+
+    mc.refresh_all_deployments(_Router(), client=_FakeClient(_FakeResp(200, _MODELS_PAYLOAD)))
+    assert mc.get_cached_pairs("https://b1") is not None
+    assert mc.get_cached_pairs("https://default") is not None
+    assert mc.get_cached_pairs("https://skip") is None
+
+
+def test_refresh_all_deployments_skips_when_no_token(monkeypatch):
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: "https://default")
+    monkeypatch.setattr(mc, "_non_interactive_api_key", lambda: None)
+
+    class _Router:
+        def get_model_list(self):
+            return [{"litellm_params": {"model": "github_copilot/gpt-5.5", "api_base": "https://b1"}}]
+
+    mc.refresh_all_deployments(_Router(), client=_FakeClient(_FakeResp(200, _MODELS_PAYLOAD)))
+    assert mc.get_cached_pairs("https://b1") is None
+
+
+def test_dynamic_empty_endpoints_not_treated_as_miss():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    mc._CAP_CACHE.set_cache("https://b", (("gpt-4o", frozenset()),), ttl=300)
+    eps = mc.resolve_endpoints(
+        "gpt-4o", model_info={"supported_endpoints": ["/responses"]}, api_base="https://b"
+    )
+    assert eps == frozenset()
+
 
 
 def test_raw_model_info_reads_supported_endpoints():

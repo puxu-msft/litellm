@@ -1054,7 +1054,7 @@ async def proxy_startup_event(app: FastAPI):
             periodic_capability_refresh_loop,
         )
 
-        asyncio.create_task(periodic_capability_refresh_loop())
+        asyncio.create_task(periodic_capability_refresh_loop(llm_router))
 
     ## [Optional] Initialize dd tracer
     ProxyStartupEvent._init_dd_tracer()
