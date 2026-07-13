@@ -412,42 +412,22 @@ git commit -m "test(github_copilot): property-based carrier decode safety (never
 
 > 目的: 用**真实 Claude Code gpt 会话**证伪/证实 spec R1——Claude Code 是否原样存储并回放载体（A 与 B），后端是否接受还原的 reasoning item。**未过则停，回到载体/编码决策，不进 Phase 3。**
 
-### Task 5: 最小响应侧发射（非流式，插桩，配置 flag 硬开）
+### Task 5: 最小**流式**响应侧发射（插桩，配置 flag 硬开）
+
+> **执行期修正（sync-plan-with-impl）**: 原计划写「非流式 translate_response」，实现时发现 **Claude Code 恒流式**，真实 gpt 会话走 `streaming_iterator.py` 而非 `translate_response`，非流式插桩不会被 live 门禁（Task 6）触及。故改为**流式**插桩——这才是门禁验证的路径。已实现并提交（`8abc846c47`）。
 
 **Files:**
-- Modify: `litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py:~410-420`（非流式 reasoning item 分支）
+- Modify: `responses_adapters/streaming_iterator.py`（`response.output_item.done` 处理，`~200-216`；加模块级 `_poc_reasoning_signature_delta`）
+- Modify: `github_copilot/reasoning_carrier.py`（`_serialize` → public `serialize_envelope`）
 - Test: `tests/test_litellm/llms/anthropic/experimental_pass_through/responses_adapters/test_reasoning_fidelity.py`
 
 **Interfaces:**
-- Consumes: `encode_carrier`（Task 2）、`ReasoningReplayEnvelope`（Task 1）。
-- Produces: 非流式 `translate_response` 对每个 `ResponseReasoningItem`，当环境 flag `GHC_REASONING_POC=1` 时，用 `item.id`/`item.encrypted_content`/`item.summary` 构 envelope、`encode_carrier(env,"signature")` 产块替换现有空壳；flag 未开则保持现状（零风险）。
+- Consumes: `serialize_envelope`（Task 2 codec，rename 后 public）、`ReasoningReplayEnvelope`（Task 1）。
+- Produces: 流式 `_process_event` 在 `response.output_item.done` 且 item 为 reasoning 时，当 `GHC_REASONING_POC=1`，于 `content_block_stop` **之前**追加一个 `content_block_delta{delta:{type:signature_delta, signature: ghc-rsn:v1:...}}`（envelope 从 `item.id`/`item.encrypted_content`/`item.summary[*].text` 构）；flag 未开则零改动（保持现状）。
 
-- [ ] **Step 1: 写失败集成测试**（构造带 `ResponseReasoningItem(id, encrypted_content, summary=[...])` 的 `ResponsesAPIResponse`，flag 开时 `translate_response` 产出的 Anthropic content 里出现 `thinking{signature: ghc-rsn:v1:...}`，且 `decode_carrier` 还原的 `encrypted_content`/`id`/`summary_parts` 与输入精确一致）
+**已完成的 step（TDD，已提交）:** 写流式驱动测试（`_process_event` 喂 added+done 事件、断言 signature_delta 在 stop 前且 `decode_carrier` 还原 id/encrypted/summary 精确）→ 确认失败 → 实现 `_poc_reasoning_signature_delta` + 接线 → 通过 → 变异验证（丢 encrypted_content 变红）+ 100 个既有 responses_adapters 测试无回归。
 
-```python
-# 测试骨架（实现时按 responses_adapters 的实际构造/入口补全 import 与 fixture）
-import os
-from litellm.llms.github_copilot.reasoning_carrier import decode_carrier, DecodedCarrier
-# from ... import LiteLLMAnthropicToResponsesAPIAdapter, 构造 ResponsesAPIResponse 的 helper
-
-def test_poc_nonstream_reasoning_item_becomes_carrier(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
-    resp = _make_responses_api_response_with_reasoning(
-        item_id="rs_poc", encrypted="ENC-POC==", summary_texts=["think a", "think b"])
-    anthropic = _adapter().translate_response(resp)
-    thinking_blocks = [b for b in anthropic["content"] if b.get("type") == "thinking" and b.get("signature")]
-    assert thinking_blocks, "expected a carrier thinking block"
-    res = decode_carrier(thinking_blocks[0])
-    assert isinstance(res, DecodedCarrier)
-    assert res.envelope.reasoning_item_id == "rs_poc"
-    assert res.envelope.encrypted_content == "ENC-POC=="
-    assert res.envelope.summary_parts == ("think a", "think b")
-```
-
-- [ ] **Step 2: 跑确认失败** → `python -m pytest .../test_reasoning_fidelity.py -q`（FAIL）
-- [ ] **Step 3: 实现**（读 `responses_adapters/transformation.py:392-491`，在 `ResponseReasoningItem` 分支 flag-gated 接入 `encode_carrier`；summary 从 `item.summary[*].text` 组 `summary_parts`；无 `Any`、tuple 构造）
-- [ ] **Step 4: 跑确认通过**
-- [ ] **Step 5: Commit** `feat(github_copilot): [POC] emit reasoning carrier on non-stream responses behind GHC_REASONING_POC`
+> **pre-commit 说明**: 我的 3 个文件 `ruff check` 全绿；`make pre-commit` 的**全worktree**门禁当前红在**预存/他人在途**问题（`llms/github_copilot/count_tokens.py` 的 F401 已在 HEAD、BLE001/LIT006 预算漂移来自非本次文件），与本次改动无关。
 
 ### Task 6: 人机协同 live 验证（oracle 表，A 与 B 各一）
 
