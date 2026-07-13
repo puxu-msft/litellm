@@ -181,6 +181,32 @@ FirstChunkRace =
 - **关联 upstream spec 实现后**：更细的 read gap + total deadline
 - **发布门槛**：`enabled=true` 且检测不到有效上游 read/total 超时 → 启动 warning。BACKLOG 记依赖 + 可观测性指标（active keepalive streams / ping count / stream age / timeout termination）
 
+## 端到端超时链（部署实况，2026-07-14 核实）
+
+实际部署拓扑：**Claude Code → Caddy `:4143` → litellm（`:4142` 主 / `:4141` 备）→ github_copilot 上游**。逐跳超时:
+
+- **Claude Code（客户端）**：`API_TIMEOUT_MS`（默认 600s，等响应头,头到即清）+ `API_FORCE_IDLE_TIMEOUT`（默认 300s，body 空闲 watchdog，收字节即重置）。**这是唯一会咬的计时器**,也是保活的目标
+- **Caddy（反代,`~/.claude/litellm/Caddyfile`）——对保活完全透明,无需改**:
+  - 下游侧（client→Caddy）`servers.timeouts.idle 20m`、`stream_timeout 0`、`stream_close_delay 300s`
+  - 上游侧（Caddy→litellm）`transport http`: `response_header_timeout 0`（等 litellm 首字节无上限,故 litellm TTFB 缓冲期间 Caddy 不切）、`read_timeout 0`、`write_timeout 0`、`dial_timeout 3s`
+  - `flush_interval -1`（每个 chunk 立即透传不缓冲）→ `: ping` 帧即时到达客户端
+  - 结论:Caddy 不对 SSE 流施加任何 deadline,`: ping` 帧原样即时穿透。**保活工作不需要动 Caddy**
+- **litellm**：本 spec 的两面保活
+- **上游兜底**：既有 600s 默认 read 超时（见「上限与兜底」）
+
+**关键推论**:整条链上只有 Claude Code 的计时器会主动中止流；Caddy 因 `response_header_timeout 0` + `read_timeout 0` + `idle 20m` + `flush -1` 而透明。所以「litellm 尽早发头 + 周期性 `: ping`」正好且仅需针对 Claude Code 的计时器,链路其余环节不构成额外约束（除非将来给 Caddy 配了更紧的超时,那需相应调低或依赖保活）。
+
+## 可观测性（Prometheus，已实现）
+
+`litellm/proxy/common_utils/keepalive_metrics.py`——lazy + guarded（`prometheus_client` 缺失则 record 函数静默 no-op,保活不依赖指标后端）,定义在默认 registry（litellm `/metrics` 抓取的那个）,均带 `surface` 标签（anthropic / openai_chat / openai_responses）:
+
+- `litellm_keepalive_active_streams`（Gauge）：当前打开的保活流数（提交时 +1,body 结束 finally −1）
+- `litellm_keepalive_pings_sent_total`（Counter）：发出的保活帧数（经 `sse_keepalive` 的注入式 `on_idle_frames` 回调计数,保持组合子与 prometheus 解耦）
+- `litellm_keepalive_stream_duration_seconds`（Histogram）：提交流结束时的时长
+- `litellm_keepalive_terminations_total{reason}`（Counter）：结束原因 `completed` / `disconnect`（上游错误被 `_committed_error_guard` 转成 error 帧,故此处按 completed 计,`error` 仅覆盖逃逸异常这一罕见路径）
+
+指标由 `_metered_keepalive_body` 包裹提交后的 body 生成器统一记录,不进入纯组合子,`disconnect` 经 `GeneratorExit`/`CancelledError` 分支判定。
+
 ## 配置（Override / Resolved 双类型 + 真实防泄漏）
 
 ```yaml
