@@ -15,6 +15,7 @@ from litellm.llms.github_copilot.reasoning_carrier import (
     InvalidCarrier,
     UnsupportedCarrierVersion,
     encode_carrier,
+    decode_carrier,
 )
 
 
@@ -61,3 +62,47 @@ def test_encode_redacted_without_summary_single_redacted_block():
     blocks = encode_carrier(_env(summary=()), "redacted_thinking")
     assert [b["type"] for b in blocks] == ["redacted_thinking"]
     assert blocks[0]["data"].startswith("ghc-rsn:v1:")
+
+
+def test_roundtrip_signature():
+    env = ReasoningReplayEnvelope("rs_1", "ENC==", ("s1", "s2"), "gpt-5.6-sol")
+    (block,) = encode_carrier(env, "signature")
+    res = decode_carrier(block)
+    assert isinstance(res, DecodedCarrier)
+    assert res.envelope == env
+
+
+def test_roundtrip_redacted():
+    env = ReasoningReplayEnvelope("rs_2", "ENC2", (), None)
+    blocks = encode_carrier(env, "redacted_thinking")
+    res = decode_carrier(blocks[-1])
+    assert isinstance(res, DecodedCarrier)
+    assert res.envelope == env
+
+
+def test_real_claude_signature_is_not_our_carrier():
+    block = {"type": "thinking", "thinking": "x", "signature": "EqoBCkYIB..."}
+    assert isinstance(decode_carrier(block), NotOurCarrier)
+
+
+def test_random_string_not_our_carrier():
+    assert isinstance(decode_carrier({"type": "redacted_thinking", "data": "just-random"}), NotOurCarrier)
+
+
+def test_corrupt_base64_is_invalid():
+    block = {"type": "thinking", "thinking": "", "signature": "ghc-rsn:v1:!!!notb64!!!"}
+    assert isinstance(decode_carrier(block), InvalidCarrier)
+
+
+def test_unknown_version():
+    block = {"type": "thinking", "thinking": "", "signature": "ghc-rsn:v9:YWJj"}
+    assert isinstance(decode_carrier(block), UnsupportedCarrierVersion)
+
+
+def test_missing_required_field_is_invalid():
+    import base64
+    import json
+
+    b64 = base64.urlsafe_b64encode(json.dumps({"ec": "E", "sp": []}).encode()).decode()
+    block = {"type": "thinking", "thinking": "", "signature": f"ghc-rsn:v1:{b64}"}
+    assert isinstance(decode_carrier(block), InvalidCarrier)

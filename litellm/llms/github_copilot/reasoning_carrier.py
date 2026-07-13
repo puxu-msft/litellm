@@ -85,3 +85,60 @@ def encode_carrier(env: ReasoningReplayEnvelope, carrier: _Carrier) -> tuple[dic
         return ({"type": "thinking", "thinking": summary, "signature": token},)
     summary_block = ({"type": "thinking", "thinking": summary},) if summary else ()
     return (*summary_block, {"type": "redacted_thinking", "data": token})
+
+
+def _carrier_field(block: dict) -> Union[str, None]:
+    block_type = block.get("type")
+    if block_type == "thinking":
+        sig = block.get("signature")
+        return sig if isinstance(sig, str) else None
+    if block_type == "redacted_thinking":
+        data = block.get("data")
+        return data if isinstance(data, str) else None
+    return None
+
+
+def _req_str(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected str")
+    return value
+
+
+def decode_carrier(block: dict) -> DecodeResult:
+    """Decode an Anthropic carrier block back into a reasoning envelope.
+
+    Returns a tagged union: ``NotOurCarrier`` for anything without our
+    namespace (including genuine Claude signatures), ``UnsupportedCarrierVersion``
+    for a known-namespace but future version, ``InvalidCarrier`` for corruption,
+    and ``DecodedCarrier`` on success. Never raises.
+    """
+    field = _carrier_field(block)
+    if field is None or not field.startswith(f"{_NS}:"):
+        return NotOurCarrier()
+    parts = field.split(":", 2)
+    if len(parts) != 3 or not parts[1].startswith("v"):
+        return InvalidCarrier("malformed-structure")
+    try:
+        version = int(parts[1][1:])
+    except ValueError:
+        return InvalidCarrier("malformed-version")
+    if version != _VERSION:
+        return UnsupportedCarrierVersion(version)
+    try:
+        raw = base64.urlsafe_b64decode(parts[2].encode("ascii"))
+        payload = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return InvalidCarrier("malformed-base64-or-json")
+    if not isinstance(payload, dict):
+        return InvalidCarrier("payload-not-object")
+    try:
+        env = ReasoningReplayEnvelope(
+            reasoning_item_id=_req_str(payload["id"]),
+            encrypted_content=_req_str(payload["ec"]),
+            summary_parts=tuple(payload.get("sp") or ()),
+            origin_model=payload.get("om"),
+            version=version,
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        return InvalidCarrier(f"missing-or-invalid-field:{type(exc).__name__}")
+    return DecodedCarrier(env)
