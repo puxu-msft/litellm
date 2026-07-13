@@ -44,3 +44,28 @@ def parse_http_client_config(
     if isinstance(raw, HttpClientConfig):
         return raw
     return HttpClientConfig(**raw)
+
+
+def merge_http_client_config(
+    global_cfg: Optional[HttpClientConfig],
+    deployment_cfg: Optional[HttpClientConfig],
+) -> Optional[HttpClientConfig]:
+    """Merge global and per-deployment http_client config, field by field. A field the
+    deployment config explicitly sets to a non-None value wins; a field the deployment config
+    leaves unset, OR explicitly sets to None (e.g. an explicit `null` in a deployment's YAML
+    http_client block), falls back to the global config's value for that field. There is no
+    "explicit null clears the global value" semantic — per the frozen spec, explicit null and
+    "not set at all" are equivalent from the deployment's perspective."""
+    if global_cfg is None and deployment_cfg is None:
+        return None
+    base_values = global_cfg.model_dump() if global_cfg is not None else {}
+    override_values = (
+        {
+            field: value
+            for field, value in deployment_cfg.model_dump(include=deployment_cfg.model_fields_set).items()
+            if value is not None
+        }
+        if deployment_cfg is not None
+        else {}
+    )
+    return HttpClientConfig(**{**base_values, **override_values})

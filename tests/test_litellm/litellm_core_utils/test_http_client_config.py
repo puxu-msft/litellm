@@ -74,3 +74,68 @@ def test_parse_http_client_config_rejects_unknown_keys():
 
     with pytest.raises(ValidationError):
         parse_http_client_config({"not_a_real_field": 1})
+
+
+def test_merge_http_client_config_both_none_returns_none():
+    from litellm.litellm_core_utils.http_client_config import merge_http_client_config
+
+    assert merge_http_client_config(None, None) is None
+
+
+def test_merge_http_client_config_deployment_only():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        merge_http_client_config,
+    )
+
+    deployment = HttpClientConfig(connect_timeout=1.0)
+    assert merge_http_client_config(None, deployment) == deployment
+
+
+def test_merge_http_client_config_global_only():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        merge_http_client_config,
+    )
+
+    glob = HttpClientConfig(total_timeout=60.0)
+    assert merge_http_client_config(glob, None) == glob
+
+
+def test_merge_http_client_config_deployment_field_wins_over_global_field():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        merge_http_client_config,
+    )
+
+    glob = HttpClientConfig(connect_timeout=1.0, total_timeout=60.0)
+    deployment = HttpClientConfig(connect_timeout=9.0)
+    merged = merge_http_client_config(glob, deployment)
+    assert merged == HttpClientConfig(connect_timeout=9.0, total_timeout=60.0)
+
+
+def test_merge_http_client_config_deployment_none_field_does_not_shadow_global():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        merge_http_client_config,
+    )
+
+    glob = HttpClientConfig(read_timeout=5.0)
+    deployment = HttpClientConfig(connect_timeout=2.0)
+    merged = merge_http_client_config(glob, deployment)
+    assert merged.read_timeout == 5.0
+    assert merged.connect_timeout == 2.0
+
+
+def test_merge_http_client_config_explicit_null_in_deployment_falls_back_to_global_not_cleared():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        merge_http_client_config,
+    )
+
+    glob = HttpClientConfig(connect_timeout=7.0)
+    deployment = HttpClientConfig(connect_timeout=None, read_timeout=2.0)
+    assert "connect_timeout" in deployment.model_fields_set
+    merged = merge_http_client_config(glob, deployment)
+    assert merged.connect_timeout == 7.0
+    assert merged.read_timeout == 2.0
