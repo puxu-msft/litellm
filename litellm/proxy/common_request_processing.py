@@ -574,6 +574,66 @@ async def _create_response_with_keepalive(
     )
 
 
+def _surface_for_route(route_type: str) -> Optional[DownstreamSSESurface]:
+    """Map a proxy route_type to its downstream SSE surface, or None if keepalive
+    does not apply (e.g. atext_completion, assistants)."""
+    if route_type == "anthropic_messages":
+        return DownstreamSSESurface.ANTHROPIC
+    if route_type == "acompletion":
+        return DownstreamSSESurface.OPENAI_CHAT
+    if route_type == "aresponses":
+        return DownstreamSSESurface.OPENAI_RESPONSES
+    return None
+
+
+def _resolve_downstream_keepalive(
+    route_type: str,
+    response: Any,
+    llm_router: Optional[Router],
+    request_data: dict,
+) -> tuple[Optional[ResolvedStreamKeepaliveConfig], Optional[DownstreamSSESurface]]:
+    """Resolve the effective keepalive config + surface for this streaming call.
+
+    Global ``litellm.stream_keepalive`` merged with the selected deployment's
+    ``litellm_params.stream_keepalive`` (deployment wins per set field). Any
+    failure resolving config degrades to keepalive-off (never breaks streaming).
+    """
+    from litellm.proxy.common_utils.stream_keepalive_config import (
+        merge_overrides,
+        parse_override,
+        resolve,
+    )
+
+    surface = _surface_for_route(route_type)
+    if surface is None:
+        return None, None
+    try:
+        global_raw = getattr(litellm, "stream_keepalive", None)
+        global_override = parse_override(global_raw) if global_raw is not None else None
+
+        deployment_override = None
+        if llm_router is not None:
+            hidden_params = getattr(response, "_hidden_params", None) or {}
+            if isinstance(hidden_params, dict):
+                model_id = ProxyBaseLLMRequestProcessing._get_model_id_from_response(hidden_params, request_data)
+                if model_id:
+                    deployment = llm_router.get_deployment(model_id=model_id)
+                    dep_params = getattr(deployment, "litellm_params", None) if deployment is not None else None
+                    raw = None
+                    if isinstance(dep_params, dict):
+                        raw = dep_params.get("stream_keepalive")
+                    elif dep_params is not None:
+                        raw = getattr(dep_params, "stream_keepalive", None)
+                    if raw is not None:
+                        deployment_override = parse_override(raw)
+
+        resolved = resolve(merge_overrides(global_override, deployment_override))
+        return resolved, surface
+    except Exception as exc:  # noqa: BLE001
+        verbose_proxy_logger.warning("stream_keepalive: failed to resolve config, disabling: %s", exc)
+        return None, None
+
+
 async def create_response(
     generator: AsyncGenerator[str, None],
     media_type: str,
@@ -1774,11 +1834,16 @@ class ProxyBaseLLMRequestProcessing:
                             proxy_logging_obj=proxy_logging_obj,
                             request=request,
                         )
+                        _ka, _surface = _resolve_downstream_keepalive(
+                            route_type, response, llm_router, self.data
+                        )
                         return await create_response(
                             generator=selected_data_generator,
                             media_type="text/event-stream",
                             headers=custom_headers,
                             request=request,
+                            keepalive=_ka,
+                            surface=_surface,
                         )
                     # Non-streaming response - fall through to normal response handling
                 elif select_data_generator:
@@ -1805,11 +1870,16 @@ class ProxyBaseLLMRequestProcessing:
                                 user_api_key_dict=user_api_key_dict,
                             )
                         )
+                    _ka_sdg, _surface_sdg = _resolve_downstream_keepalive(
+                        route_type, response, llm_router, self.data
+                    )
                     return await create_response(
                         generator=selected_data_generator,
                         media_type="text/event-stream",
                         headers=custom_headers,
                         request=request,
+                        keepalive=_ka_sdg,
+                        surface=_surface_sdg,
                     )
 
             ### CALL HOOKS ### - modify outgoing data

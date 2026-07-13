@@ -240,6 +240,11 @@ use_chat_completions_url_for_anthropic_messages: bool = bool(
 # Or via `litellm_settings.strip_anthropic_total_tokens: true` in
 # config.yaml.
 strip_anthropic_total_tokens: bool = False
+# Downstream SSE keepalive (proxy): inject periodic keepalive frames so a slow
+# upstream doesn't trip the client's idle/read timeout. Raw dict form
+# ({"enabled": bool, "interval": float}); parsed/validated at the proxy layer.
+# None means "unset" (defaults to enabled at the resolve step).
+stream_keepalive: Optional[dict] = None
 route_all_chat_openai_to_responses: bool = (
     os.getenv("LITELLM_ROUTE_ALL_CHAT_OPENAI_TO_RESPONSES", "false").lower() == "true"
 )  # When True, routes all OpenAI /chat/completions requests through the Responses API bridge
