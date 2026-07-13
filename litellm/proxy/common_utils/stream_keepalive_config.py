@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 
 from pydantic import BaseModel, ConfigDict, field_validator
+from typing_extensions import cast
 
 KEEPALIVE_MIN_INTERVAL_SECONDS = 1.0
 KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 15.0
@@ -66,3 +67,26 @@ def resolve(merged: StreamKeepaliveOverride) -> ResolvedStreamKeepaliveConfig:
         enabled=merged.enabled if merged.enabled is not None else True,
         interval=(merged.interval if merged.interval is not None else KEEPALIVE_DEFAULT_INTERVAL_SECONDS),
     )
+
+
+def validate_global_config(value: object) -> str | None:
+    """Validate a global ``stream_keepalive`` setting at proxy load. Returns an
+    error message if invalid, else None. ``None`` (explicit yaml null) is a valid
+    "unset"."""
+    if value is None:
+        return None
+    try:
+        parse_override(value)
+        return None
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
+def should_advise_missing_upstream_timeout(value: object, request_timeout_explicitly_set: bool) -> bool:
+    """True when keepalive is enabled but no explicit upstream request_timeout is
+    set — the operator should be advised the backstop is the default read timeout."""
+    if request_timeout_explicitly_set:
+        return False
+    if not isinstance(value, dict):
+        return False
+    return bool(cast("dict[str, object]", value).get("enabled", True))

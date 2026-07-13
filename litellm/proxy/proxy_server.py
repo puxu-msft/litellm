@@ -4312,6 +4312,23 @@ class ProxyConfig:
                     litellm.json_logs = True
                     litellm._turn_on_json()
                     verbose_proxy_logger.debug(f"{blue_color_code} Enabled JSON logging via config{reset_color_code}")
+                elif key == "stream_keepalive":
+                    # Fail-fast validate the downstream keepalive config at load
+                    # instead of silently degrading per-request on a typo.
+                    from litellm.proxy.common_utils.stream_keepalive_config import (
+                        validate_global_config,
+                    )
+
+                    _ka_err = validate_global_config(cast(object, value))
+                    if _ka_err is not None:
+                        verbose_proxy_logger.error(
+                            "Invalid litellm_settings.stream_keepalive=%s (%s); keepalive disabled",
+                            cast(object, value),
+                            _ka_err,
+                        )
+                        litellm.stream_keepalive = None
+                    else:
+                        setattr(litellm, key, value)
                 else:
                     verbose_proxy_logger.debug(
                         f"{blue_color_code} setting litellm.{key}={_redact_general_setting_value(key, value, is_full_admin=False)}{reset_color_code}"
@@ -4330,6 +4347,23 @@ class ProxyConfig:
 
                         reset_audit_log_callback_cache()
                         _in_memory_loggers[:] = [cb for cb in _in_memory_loggers if not isinstance(cb, S3V2Logger)]
+
+        # Downstream keepalive holds a connection open across upstream idle; its
+        # backstop against a half-open upstream is the upstream read timeout
+        # (litellm default ~600s). Advise an explicit timeout when none is set.
+        from litellm.proxy.common_utils.stream_keepalive_config import (
+            should_advise_missing_upstream_timeout,
+        )
+
+        if should_advise_missing_upstream_timeout(
+            getattr(litellm, "stream_keepalive", None),
+            getattr(litellm, "request_timeout_explicitly_set", False),
+        ):
+            verbose_proxy_logger.warning(
+                "stream_keepalive is enabled but no explicit litellm_settings.request_timeout is set; "
+                "keepalive relies on the upstream read timeout (litellm default ~600s) as the backstop for a "
+                "half-open upstream. Set request_timeout (or upstream http_client timeouts) for a tighter bound."
+            )
 
         ## GENERAL SERVER SETTINGS (e.g. master key,..) # do this after initializing litellm, to ensure sentry logging works for proxylogging
         general_settings = config.get("general_settings", {})
