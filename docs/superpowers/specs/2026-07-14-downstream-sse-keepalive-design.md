@@ -1,9 +1,15 @@
 # 下游 SSE 保活（two-face keepalive，防下游 idle/read 超时）
 
-状态：设计经两轮 GPT reviewer 对抗性评审（round-1 6 阻塞 / round-2 6 阻塞，均全程核对真实代码 + SDK 源码），本版冻结全部契约，待用户复核 gate
-日期：2026-07-14 初稿；同日 round-1、round-2 评审后两次修订
+状态：**已实现**（2026-07-14，本会话内联 TDD，11 任务全绿）。设计经两轮 GPT reviewer 对抗性评审（round-1 6 阻塞 / round-2 6 阻塞，均全程核对真实代码 + SDK 源码），本版冻结全部契约
+日期：2026-07-14 初稿；同日 round-1、round-2 评审后两次修订；同日实现完成
 分支：`ghc`
-关联：[上游 HTTP client 细粒度配置](./2026-07-13-upstream-http-client-config-design.md)（**尚未实现**，仅设计稿）
+关联：[上游 HTTP client 细粒度配置](./2026-07-13-upstream-http-client-config-design.md)（**尚未实现**，仅设计稿）；实施计划见 [plans/2026-07-14-downstream-sse-keepalive.md](../plans/2026-07-14-downstream-sse-keepalive.md)
+
+## 实现说明（回填）
+
+PoC 门禁已过（read/idle 型确认，`exp/downstream-keepalive-timeout/`）。核心全部落地:配置 Override/Resolved 双类型、两阶段策略、bytes-safe frame normalizer、幂等 StreamLease、sse_keepalive 组合子（持久 task）、DownstreamSSESurface 枚举、`all_litellm_params` 防泄漏、按 surface 的 committed error 帧（含 HTTPException post-commit 转 `event: error`）、create_response 三方竞速 + 慢路径提交、三面 surface 接线 + global/deployment 配置解析。新代码集中在 `litellm/proxy/common_utils/{stream_keepalive_config,sse_keepalive,sse_frame_normalizer}.py`；改动集中在 `common_request_processing.py` 的 `create_response`。**实现期偏离**（均已在 plan / BACKLOG 记录）:①bytes-normalizer 独立成模块，未改 `proxy_server` 的 str 版旧路径（类型不同，合并增险）;②未给 `GenericLiteLLMParams` 加 typed 字段（避免 types→proxy 循环导入），改在 resolver 消费边界用 `parse_override` 校验，符合 CLAUDE.md「调用方校验」;③加载期 fail-fast 校验 + 启动 warning + 可观测性指标延后（BACKLOG），当前 resolver 请求期对非法配置降级 off + warn。
+
+
 
 ## 修订说明（两轮评审吸收）
 

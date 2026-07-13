@@ -1,5 +1,7 @@
 # 下游 SSE 保活 Implementation Plan
 
+> **状态: 已实现（2026-07-14，本会话内联 TDD，Task 1-11 全绿）。** 偏离项见各 Task 注与 spec 实现说明 / BACKLOG。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给 litellm 代理三个下游 SSE 面（anthropic_messages / chat / responses）的真实上游流式路径注入周期性保活字节，防止上游 github_copilot 沉默时下游 Claude Code 客户端因 idle/read 超时断连。
