@@ -95,7 +95,7 @@ def get_cached_pairs(
 def resolve_endpoints(
     model: str,
     *,
-    model_info: Mapping[str, object],
+    model_info: "Optional[Mapping[str, object]]",
     api_base: Optional[str],
 ) -> "frozenset[CopilotEndpoint]":
     bare = strip_copilot_prefix(model)
@@ -105,16 +105,16 @@ def resolve_endpoints(
             hit = next((eps for m, eps in cached if m == bare), None)
             if hit:
                 return hit
-    raw = model_info.get("supported_endpoints")
+    raw = model_info.get("supported_endpoints") if model_info else None
     if isinstance(raw, (list, tuple)):
         return normalize_endpoints(tuple(str(x) for x in raw))
     return frozenset()
 
 
 def forced_mode(
-    model_info: Mapping[str, object],
+    model_info: "Optional[Mapping[str, object]]",
 ) -> "Optional[Literal['anthropic', 'responses', 'chat']]":
-    mode = model_info.get("mode")
+    mode = model_info.get("mode") if model_info else None
     if mode == "anthropic":
         return "anthropic"
     if mode == "responses":
@@ -127,7 +127,7 @@ def forced_mode(
 def route_supports_messages(
     model: str,
     *,
-    model_info: Mapping[str, object],
+    model_info: "Optional[Mapping[str, object]]",
     api_base: Optional[str],
 ) -> bool:
     mode = forced_mode(model_info)
@@ -141,7 +141,7 @@ def route_supports_messages(
 def route_supports_responses(
     model: str,
     *,
-    model_info: Mapping[str, object],
+    model_info: "Optional[Mapping[str, object]]",
     api_base: Optional[str],
 ) -> bool:
     mode = forced_mode(model_info)
@@ -150,6 +150,13 @@ def route_supports_responses(
     if mode in ("chat", "anthropic"):
         return False
     return "responses" in resolve_endpoints(model, model_info=model_info, api_base=api_base)
+
+
+def raw_model_info(model: str) -> "Optional[Mapping[str, object]]":
+    import litellm
+
+    entry = litellm.model_cost.get(f"github_copilot/{strip_copilot_prefix(model)}")
+    return entry if isinstance(entry, dict) else None
 
 
 def copilot_api_base(explicit: Optional[str] = None) -> Optional[str]:

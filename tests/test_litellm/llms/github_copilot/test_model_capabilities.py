@@ -196,3 +196,28 @@ def test_refresh_default_capabilities_no_base_is_noop():
     mc._CAP_CACHE.flush_cache()
     mc.refresh_default_capabilities(api_key="k", api_base=None, client=_FakeClient(_FakeResp(200, _MODELS_PAYLOAD)))
     assert mc.get_cached_pairs("https://b") is None
+
+
+def test_raw_model_info_reads_supported_endpoints():
+    import litellm
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    litellm.register_model({
+        "github_copilot/probe-model-xyz": {
+            "mode": "chat",
+            "supported_endpoints": ["/v1/chat/completions", "/v1/messages"],
+        }
+    })
+    info = mc.raw_model_info("github_copilot/probe-model-xyz")
+    assert info is not None
+    assert info.get("mode") == "chat"
+    assert info.get("supported_endpoints") == ["/v1/chat/completions", "/v1/messages"]
+
+
+def test_resolver_none_model_info_safe():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    assert mc.resolve_endpoints("x", model_info=None, api_base=None) == frozenset()
+    assert mc.route_supports_messages("x", model_info=None, api_base=None) is False
+    assert mc.route_supports_responses("x", model_info=None, api_base=None) is False
