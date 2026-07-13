@@ -545,9 +545,7 @@ async def _create_response_with_keepalive(
         async def _fast_body() -> AsyncGenerator[str, None]:
             yield first_frame
             async for frame in _committed_error_guard(
-                sse_keepalive(
-                    framed, strategy, keepalive.interval, lease, seen_message_start=seen_message_start
-                ),
+                sse_keepalive(framed, strategy, keepalive.interval, lease, seen_message_start=seen_message_start),
                 surface,
             ):
                 yield frame
@@ -1834,9 +1832,7 @@ class ProxyBaseLLMRequestProcessing:
                             proxy_logging_obj=proxy_logging_obj,
                             request=request,
                         )
-                        _ka, _surface = _resolve_downstream_keepalive(
-                            route_type, response, llm_router, self.data
-                        )
+                        _ka, _surface = _resolve_downstream_keepalive(route_type, response, llm_router, self.data)
                         return await create_response(
                             generator=selected_data_generator,
                             media_type="text/event-stream",
@@ -1870,9 +1866,7 @@ class ProxyBaseLLMRequestProcessing:
                                 user_api_key_dict=user_api_key_dict,
                             )
                         )
-                    _ka_sdg, _surface_sdg = _resolve_downstream_keepalive(
-                        route_type, response, llm_router, self.data
-                    )
+                    _ka_sdg, _surface_sdg = _resolve_downstream_keepalive(route_type, response, llm_router, self.data)
                     return await create_response(
                         generator=selected_data_generator,
                         media_type="text/event-stream",

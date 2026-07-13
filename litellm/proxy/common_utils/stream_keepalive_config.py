@@ -30,9 +30,7 @@ class StreamKeepaliveOverride(BaseModel):
         if v is None:
             return v
         if not math.isfinite(v) or v < KEEPALIVE_MIN_INTERVAL_SECONDS:
-            raise ValueError(
-                f"stream_keepalive.interval must be finite and >= {KEEPALIVE_MIN_INTERVAL_SECONDS}"
-            )
+            raise ValueError(f"stream_keepalive.interval must be finite and >= {KEEPALIVE_MIN_INTERVAL_SECONDS}")
         return v
 
 
@@ -66,9 +64,5 @@ def resolve(merged: StreamKeepaliveOverride) -> ResolvedStreamKeepaliveConfig:
     """Apply defaults exactly once at the end."""
     return ResolvedStreamKeepaliveConfig(
         enabled=merged.enabled if merged.enabled is not None else True,
-        interval=(
-            merged.interval
-            if merged.interval is not None
-            else KEEPALIVE_DEFAULT_INTERVAL_SECONDS
-        ),
+        interval=(merged.interval if merged.interval is not None else KEEPALIVE_DEFAULT_INTERVAL_SECONDS),
     )

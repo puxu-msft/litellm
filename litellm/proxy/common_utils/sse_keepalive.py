@@ -201,5 +201,5 @@ def committed_error_frame(surface: DownstreamSSESurface, error_obj: dict) -> str
             payload = json.dumps({"type": "error", "error": error_obj})
             return f"event: error\ndata: {payload}\n\n"
         case DownstreamSSESurface.OPENAI_CHAT | DownstreamSSESurface.OPENAI_RESPONSES:
-            return f'data: {json.dumps({"error": error_obj})}\n\n'
+            return f"data: {json.dumps({'error': error_obj})}\n\n"
     assert_never(surface)

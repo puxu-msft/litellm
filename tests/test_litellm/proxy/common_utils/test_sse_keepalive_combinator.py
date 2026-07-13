@@ -27,9 +27,7 @@ async def test_idle_emits_comment_then_forwards_real_frame():
     out = []
 
     async def drive():
-        async for f in sse_keepalive(
-            real, CommentOnlyKeepaliveStrategy(), interval=0.05, lease=lease
-        ):
+        async for f in sse_keepalive(real, CommentOnlyKeepaliveStrategy(), interval=0.05, lease=lease):
             out.append(f)
 
     task = asyncio.ensure_future(drive())
@@ -48,12 +46,7 @@ async def test_fast_stream_emits_no_keepalive():
 
     g = fast()
     lease = StreamLease(inner=g)
-    out = [
-        f
-        async for f in sse_keepalive(
-            g, CommentOnlyKeepaliveStrategy(), interval=10, lease=lease
-        )
-    ]
+    out = [f async for f in sse_keepalive(g, CommentOnlyKeepaliveStrategy(), interval=10, lease=lease)]
     assert out == [b"a\n\n", b"b\n\n"]
 
 
@@ -68,9 +61,7 @@ async def test_producer_task_not_cancelled_across_pings():
     out = []
 
     async def drive():
-        async for f in sse_keepalive(
-            real, CommentOnlyKeepaliveStrategy(), interval=0.03, lease=lease
-        ):
+        async for f in sse_keepalive(real, CommentOnlyKeepaliveStrategy(), interval=0.03, lease=lease):
             out.append(f)
 
     t = asyncio.ensure_future(drive())
@@ -89,12 +80,7 @@ async def test_same_tick_prefers_real_frame_over_ping():
 
     g = resolves_immediately()
     lease = StreamLease(inner=g)
-    out = [
-        f
-        async for f in sse_keepalive(
-            g, CommentOnlyKeepaliveStrategy(), interval=0.001, lease=lease
-        )
-    ]
+    out = [f async for f in sse_keepalive(g, CommentOnlyKeepaliveStrategy(), interval=0.001, lease=lease)]
     assert out == [b"x\n\n"]
 
 
@@ -112,9 +98,7 @@ async def test_anthropic_phase2_only_after_message_start_no_ping_on_that_frame()
     out = []
 
     async def drive():
-        async for f in sse_keepalive(
-            g, AnthropicKeepaliveStrategy(), interval=0.04, lease=lease
-        ):
+        async for f in sse_keepalive(g, AnthropicKeepaliveStrategy(), interval=0.04, lease=lease):
             out.append(f)
 
     t = asyncio.ensure_future(drive())

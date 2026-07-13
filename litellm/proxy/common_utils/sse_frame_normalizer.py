@@ -35,9 +35,7 @@ def find_frame_delimiter(buf: bytes) -> int:
     multi-byte delimiter (e.g. ``\\r\\n\\r\\n``).
     """
     candidates = tuple(
-        (idx, len(delimiter))
-        for delimiter in SSE_FRAME_DELIMITERS
-        if (idx := buf.find(delimiter)) != -1
+        (idx, len(delimiter)) for delimiter in SSE_FRAME_DELIMITERS if (idx := buf.find(delimiter)) != -1
     )
     if not candidates:
         return -1
@@ -64,9 +62,7 @@ async def normalize_anthropic_sse_frames(
             buffer = buffer[end:]
             end = find_frame_delimiter(buffer)
         if len(buffer) > max_unterminated_bytes:
-            raise ValueError(
-                f"SSE frame exceeded {max_unterminated_bytes} bytes without a delimiter"
-            )
+            raise ValueError(f"SSE frame exceeded {max_unterminated_bytes} bytes without a delimiter")
     if buffer:
         verbose_proxy_logger.debug(
             "normalize_anthropic_sse_frames: flushing %d trailing bytes without delimiter at EOF",

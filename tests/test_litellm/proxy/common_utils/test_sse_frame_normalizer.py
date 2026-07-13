@@ -77,9 +77,4 @@ async def test_no_trailing_flush_when_clean_boundary():
 async def test_unterminated_over_limit_raises():
     chunks = [b"x" * 10]
     with pytest.raises(ValueError):
-        [
-            f
-            async for f in normalize_anthropic_sse_frames(
-                _aiter(chunks), max_unterminated_bytes=4
-            )
-        ]
+        [f async for f in normalize_anthropic_sse_frames(_aiter(chunks), max_unterminated_bytes=4)]

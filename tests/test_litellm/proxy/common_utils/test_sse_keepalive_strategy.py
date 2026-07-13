@@ -52,9 +52,7 @@ def test_anthropic_observe_advances_only_on_message_start():
 def test_strategy_for_surface():
     assert isinstance(strategy_for(DownstreamSSESurface.ANTHROPIC), AnthropicKeepaliveStrategy)
     assert isinstance(strategy_for(DownstreamSSESurface.OPENAI_CHAT), CommentOnlyKeepaliveStrategy)
-    assert isinstance(
-        strategy_for(DownstreamSSESurface.OPENAI_RESPONSES), CommentOnlyKeepaliveStrategy
-    )
+    assert isinstance(strategy_for(DownstreamSSESurface.OPENAI_RESPONSES), CommentOnlyKeepaliveStrategy)
 
 
 def test_only_anthropic_needs_normalizer():
