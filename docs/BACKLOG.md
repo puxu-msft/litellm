@@ -26,8 +26,8 @@
 
 来源: 2026-07-14 「配置下游超时 / SSE 保活」spec + 实现（`docs/superpowers/specs/2026-07-14-downstream-sse-keepalive-design.md`、`plans/2026-07-14-downstream-sse-keepalive.md`）。核心功能已实现（三面注入、面 1 延迟提交、面 2 组合子、bytes-safe normalizer、StreamLease、按 surface 的 committed error 帧、`all_litellm_params` 防泄漏、global+deployment 配置解析）。以下为有意延后项:
 
-- **上游超时依赖门槛 + 启动 warning**: 保活「只跟随上游存活」，其「上游真挂死」的兜底是既有上游 httpx 默认 read 超时（`COMPLETION_HTTP_FALLBACK_SECONDS=600`），关联 upstream http_client spec（尚未实现）会提供更细的 read gap + total deadline。待办: `enabled=true` 且检测不到有效上游 read/total 超时时在 proxy 启动打一次明确 warning（当前仅在请求期 resolver 对**非法**配置降级并 warn，不覆盖「无上游超时」这一条）
-- **可观测性指标**: active keepalive streams / ping count / stream age / timeout termination 计数，用于观测 half-open 资源占用。当前无指标
-- **加载期 fail-fast 校验**: 全局 `litellm_settings.stream_keepalive` 目前在**请求期**由 resolver 校验（非法 → 降级 off + warn）；未在 proxy 加载边界（`proxy_server.py` 应用 litellm_settings 处）做 fail-fast 校验。低风险，属 DX 改进
+- **上游超时依赖门槛 + 启动 warning**: 保活「只跟随上游存活」，其「上游真挂死」的兜底是既有上游 httpx 默认 read 超时（`COMPLETION_HTTP_FALLBACK_SECONDS=600`），关联 upstream http_client spec（尚未实现）会提供更细的 read gap + total deadline。~~待办: `enabled=true` 且检测不到有效上游 read/total 超时时在 proxy 启动打一次明确 warning~~ **已实现**（2026-07-14）：加载期 `should_advise_missing_upstream_timeout` 在 enabled 且未显式配 `request_timeout` 时打 advisory
+- **可观测性指标**: active keepalive streams / ping count / stream age / timeout termination 计数，用于观测 half-open 资源占用。当前无指标（需先定 Prometheus/指标口径，属带设计决策项，未做）
+- ~~**加载期 fail-fast 校验**~~ **已实现**（2026-07-14）：全局 `litellm_settings.stream_keepalive` 现在在 proxy 加载边界由 `validate_global_config` fail-fast 校验（非法 → error 日志 + 禁用），不再只靠请求期 resolver 降级
 - **部署链路外部固定 deadline**: ingress / LB / NAT 若另设固定绝对 deadline（非 idle 型），保活字节绕不过（PoC `exp/downstream-keepalive-timeout/` 已明确不覆盖）。如需覆盖需在部署层调 idle 超时，非代码可解
 - **面 1 message_start 前原生 ping**（非门禁）: 默认面 1 仅发 SSE 注释。若 PoC 验证「message_start 前发 `event: ping`」被 Claude Code 接受，可把面 1 升级为注释 + 原生 ping。当前保守只发注释
