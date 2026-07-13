@@ -8003,6 +8003,22 @@ class ProviderConfigManager:
         model: str,
         provider: LlmProviders,
     ) -> Optional[BaseAnthropicMessagesConfig]:
+        if litellm.LlmProviders.GITHUB_COPILOT == provider:
+            from litellm.llms.github_copilot.model_capabilities import (
+                copilot_api_base,
+                raw_model_info,
+                route_supports_messages,
+            )
+
+            if route_supports_messages(
+                model, model_info=raw_model_info(model), api_base=copilot_api_base()
+            ):
+                from litellm.llms.github_copilot.messages.transformation import (
+                    GithubCopilotAnthropicMessagesConfig,
+                )
+
+                return GithubCopilotAnthropicMessagesConfig()
+            return None
         return ProviderConfigManager._get_provider_anthropic_messages_config_cached(model=model, provider=provider)
 
     @staticmethod
@@ -8052,13 +8068,6 @@ class ProviderConfigManager:
             )
 
             return TencentAnthropicMessagesConfig()
-        elif litellm.LlmProviders.GITHUB_COPILOT == provider:
-            if "claude" in model_lower:
-                from litellm.llms.github_copilot.messages.transformation import (
-                    GithubCopilotAnthropicMessagesConfig,
-                )
-
-                return GithubCopilotAnthropicMessagesConfig()
 
         from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 

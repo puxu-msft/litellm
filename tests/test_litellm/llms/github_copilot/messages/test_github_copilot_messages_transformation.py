@@ -227,10 +227,19 @@ def test_github_copilot_anthropic_messages_supported_params():
 
 
 def test_provider_config_manager_dispatches_claude_to_copilot_messages_config():
-    """ProviderConfigManager must return the Copilot Anthropic Messages config
-    for Claude models served via github_copilot."""
+    """ProviderConfigManager returns the Copilot Anthropic Messages config for a
+    github_copilot model whose capability data advertises the ``/v1/messages``
+    endpoint (as Claude deployments do)."""
+    import litellm
     from litellm.types.utils import LlmProviders
     from litellm.utils import ProviderConfigManager
+
+    litellm.register_model({
+        "github_copilot/claude-haiku-4.5": {
+            "mode": "chat",
+            "supported_endpoints": ["/v1/chat/completions", "/v1/messages"],
+        }
+    })
 
     config = ProviderConfigManager.get_provider_anthropic_messages_config(
         model="github_copilot/claude-haiku-4.5",
@@ -334,3 +343,31 @@ def test_github_copilot_messages_config_probes_capabilities_under_copilot_namesp
     ``anthropic`` namespace and ignored the exact ``github_copilot/claude-*``
     cost-map entries."""
     assert GithubCopilotAnthropicMessagesConfig().custom_llm_provider == "github_copilot"
+
+
+class TestGithubCopilotMessagesConfigSelection:
+    def _select(self, model):
+        from litellm.utils import ProviderConfigManager
+        from litellm.types.utils import LlmProviders
+
+        return ProviderConfigManager.get_provider_anthropic_messages_config(
+            model=model, provider=LlmProviders.GITHUB_COPILOT
+        )
+
+    def test_non_claude_but_messages_capable_selects_messages_config(self, monkeypatch):
+        import litellm.llms.github_copilot.model_capabilities as mc
+        from litellm.llms.github_copilot.messages.transformation import (
+            GithubCopilotAnthropicMessagesConfig,
+        )
+
+        monkeypatch.setattr(mc, "route_supports_messages", lambda *a, **k: True)
+        assert isinstance(self._select("gpt-weird-msgcap"), GithubCopilotAnthropicMessagesConfig)
+
+    def test_claude_named_but_not_messages_capable_not_selected(self, monkeypatch):
+        import litellm.llms.github_copilot.model_capabilities as mc
+        from litellm.llms.github_copilot.messages.transformation import (
+            GithubCopilotAnthropicMessagesConfig,
+        )
+
+        monkeypatch.setattr(mc, "route_supports_messages", lambda *a, **k: False)
+        assert not isinstance(self._select("claude-responses-only-xyz"), GithubCopilotAnthropicMessagesConfig)
