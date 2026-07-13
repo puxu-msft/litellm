@@ -371,3 +371,38 @@ class TestGithubCopilotMessagesConfigSelection:
 
         monkeypatch.setattr(mc, "route_supports_messages", lambda *a, **k: False)
         assert not isinstance(self._select("claude-responses-only-xyz"), GithubCopilotAnthropicMessagesConfig)
+
+
+class TestPerDeploymentModeOverride:
+    """The per-request deployment model_info must drive messages selection so
+    that two aliases sharing one backend key don't leak each other's mode."""
+
+    def _select(self, model_info):
+        from litellm.utils import ProviderConfigManager
+        from litellm.types.utils import LlmProviders
+
+        return ProviderConfigManager.get_provider_anthropic_messages_config(
+            model="github_copilot/shared-backend-probe",
+            provider=LlmProviders.GITHUB_COPILOT,
+            model_info=model_info,
+        )
+
+    def test_mode_anthropic_forces_messages_regardless_of_registry(self, monkeypatch):
+        import litellm.llms.github_copilot.model_capabilities as mc
+        from litellm.llms.github_copilot.messages.transformation import (
+            GithubCopilotAnthropicMessagesConfig,
+        )
+
+        monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: None)
+        cfg = self._select({"mode": "anthropic"})
+        assert isinstance(cfg, GithubCopilotAnthropicMessagesConfig)
+
+    def test_mode_responses_blocks_messages_regardless_of_registry(self, monkeypatch):
+        import litellm.llms.github_copilot.model_capabilities as mc
+        from litellm.llms.github_copilot.messages.transformation import (
+            GithubCopilotAnthropicMessagesConfig,
+        )
+
+        monkeypatch.setattr(mc, "copilot_api_base", lambda *a, **k: None)
+        cfg = self._select({"mode": "responses", "supported_endpoints": ["/v1/messages"]})
+        assert not isinstance(cfg, GithubCopilotAnthropicMessagesConfig)

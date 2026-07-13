@@ -8002,6 +8002,7 @@ class ProviderConfigManager:
     def get_provider_anthropic_messages_config(
         model: str,
         provider: LlmProviders,
+        model_info: Optional[Mapping[str, object]] = None,
     ) -> Optional[BaseAnthropicMessagesConfig]:
         if litellm.LlmProviders.GITHUB_COPILOT == provider:
             from litellm.llms.github_copilot.model_capabilities import (
@@ -8010,9 +8011,8 @@ class ProviderConfigManager:
                 route_supports_messages,
             )
 
-            if route_supports_messages(
-                model, model_info=raw_model_info(model), api_base=copilot_api_base()
-            ):
+            resolved_info = model_info if model_info is not None else raw_model_info(model)
+            if route_supports_messages(model, model_info=resolved_info, api_base=copilot_api_base()):
                 from litellm.llms.github_copilot.messages.transformation import (
                     GithubCopilotAnthropicMessagesConfig,
                 )

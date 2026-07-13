@@ -496,6 +496,7 @@ def anthropic_messages_handler(
         anthropic_messages_provider_config = ProviderConfigManager.get_provider_anthropic_messages_config(
             model=model,
             provider=litellm.LlmProviders(custom_llm_provider),
+            model_info=kwargs.get("model_info"),
         )
     if anthropic_messages_provider_config is None and _deployment_passes_through_anthropic_messages(
         kwargs.get("model_info")
