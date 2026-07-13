@@ -1,5 +1,7 @@
 # GitHub Copilot `/v1/messages` 动态原生端点路由 Implementation Plan
 
+> 状态：**已实现（2026-07-13）**。9 个 Task 全部落地并 TDD 通过；相关测试 161 passed。实现细节相对本计划的偏差（均已核实、非降级）：① 定时刷新改用无条件的 `asyncio.create_task(periodic_capability_refresh_loop())`（不挂 prisma-gated 的 AsyncIOScheduler，DB 无关）；② 冷启动兜底读**原始 `litellm.model_cost`**（`_cached_get_model_info_helper` 会丢 supported_endpoints）；③ 缓存**直接存 tuple 对象**并 `delete+set` 续期 TTL（InMemoryCache.get_cache 会 json.loads，不能存 json 串）；④ HTTP client 直接类型标注为 `HTTPHandler`（Protocol 与其松签名结构不匹配），边界用 Pydantic/TypeAdapter 校验；⑤ 刷新写入键与路由读取键统一为 `copilot_api_base()`（避免 cache miss）。真实验证：用真实上游 `/models`（40 模型）确认 claude→messages、gpt-5.5/5.6→responses、gpt-5.4→responses、gpt-4o/gemini→chat 全部正确。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让经 litellm `/v1/messages` 进来的 `github_copilot/<model>` 请求，按该模型**动态获取的** `supported_endpoints`（定时拉上游 `/models` 并缓存）三向分流到 Copilot 原生端点，叠加 operator 的 `mode` 硬 override，无任何 hardcode 端点表。
