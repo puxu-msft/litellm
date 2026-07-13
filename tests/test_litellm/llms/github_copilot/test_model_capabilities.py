@@ -80,3 +80,40 @@ def test_fetch_endpoint_pairs_malformed_raises():
     client = _FakeClient(_FakeResp(200, {"unexpected": "shape"}))
     with pytest.raises(Exception):
         fetch_endpoint_pairs("k", "https://api.githubcopilot.com", client)
+
+
+def test_refresh_and_get_cached():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    client = _FakeClient(_FakeResp(200, _MODELS_PAYLOAD))
+    pairs = mc.refresh_capabilities("k", "https://api.githubcopilot.com", client)
+    assert dict(pairs)["gpt-5.5"] == frozenset({"responses"})
+    cached = mc.get_cached_pairs("https://api.githubcopilot.com")
+    assert cached is not None
+    assert dict(cached)["gpt-5.5"] == frozenset({"responses"})
+
+
+def test_refresh_replaces_stale_value():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    first = {"data": [{"id": "gpt-5.5", "supported_endpoints": ["/responses"]}]}
+    second = {"data": [{"id": "gpt-5.5", "supported_endpoints": ["/chat/completions"]}]}
+    mc.refresh_capabilities("k", "https://b", _FakeClient(_FakeResp(200, first)))
+    mc.refresh_capabilities("k", "https://b", _FakeClient(_FakeResp(200, second)))
+    assert dict(mc.get_cached_pairs("https://b"))["gpt-5.5"] == frozenset({"chat"})
+
+
+def test_refresh_failure_returns_empty_no_raise():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    assert mc.refresh_capabilities("k", "https://b", _FakeClient(_FakeResp(500, {"e": 1}))) == ()
+
+
+def test_get_cached_miss_returns_none():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    assert mc.get_cached_pairs("https://unseen.example") is None

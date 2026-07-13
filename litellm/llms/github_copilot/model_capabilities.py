@@ -1,7 +1,9 @@
-from typing import Literal, Mapping, Protocol
+from typing import Literal, Mapping, Optional, Protocol
 
 from pydantic import BaseModel, TypeAdapter
 
+from litellm._logging import verbose_logger
+from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.llms.github_copilot.common_utils import get_copilot_default_headers
 
 CopilotEndpoint = Literal["messages", "responses", "chat"]
@@ -50,8 +52,6 @@ class _ModelsResponse(BaseModel):
 
 _MODELS_ADAPTER = TypeAdapter(_ModelsResponse)
 
-EndpointPairs = tuple
-
 
 def fetch_endpoint_pairs(
     api_key: str,
@@ -65,3 +65,28 @@ def fetch_endpoint_pairs(
         raise RuntimeError(f"github_copilot /models HTTP {resp.status_code}: {resp.text[:200]}")
     parsed = _MODELS_ADAPTER.validate_python(resp.json())
     return tuple((entry.id, normalize_endpoints(entry.supported_endpoints)) for entry in parsed.data)
+
+
+_CAP_CACHE = InMemoryCache(max_size_in_memory=64, default_ttl=300)
+
+
+def refresh_capabilities(
+    api_key: str,
+    api_base: str,
+    client: _HTTPGetClient,
+) -> "tuple[tuple[str, frozenset[CopilotEndpoint]], ...]":
+    try:
+        pairs = fetch_endpoint_pairs(api_key=api_key, api_base=api_base, client=client)
+    except Exception as e:
+        verbose_logger.debug("github_copilot refresh_capabilities failed for %s: %s", api_base, e)
+        return ()
+    _CAP_CACHE.delete_cache(api_base)
+    _CAP_CACHE.set_cache(api_base, pairs, ttl=300)
+    return pairs
+
+
+def get_cached_pairs(
+    api_base: str,
+) -> "Optional[tuple[tuple[str, frozenset[CopilotEndpoint]], ...]]":
+    cached = _CAP_CACHE.get_cache(api_base)
+    return cached if isinstance(cached, tuple) else None
