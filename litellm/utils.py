@@ -8341,6 +8341,12 @@ class ProviderConfigManager:
             return VLLMModelInfo()
         elif LlmProviders.LEMONADE == provider:
             return litellm.LemonadeChatConfig()
+        elif LlmProviders.GITHUB_COPILOT == provider:
+            from litellm.llms.github_copilot.count_tokens import (
+                GitHubCopilotModelInfo,
+            )
+
+            return GitHubCopilotModelInfo()
         elif LlmProviders.CLARIFAI == provider:
             return litellm.ClarifaiConfig()
         elif LlmProviders.BEDROCK == provider:

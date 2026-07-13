@@ -452,6 +452,17 @@ class LiteLLMAnthropicMessagesAdapter:
                                             )
                                             self._add_cache_control_if_applicable(content, tool_result, model)
                                             tool_message_list.append(tool_result)  # type: ignore[arg-type]
+                                        else:
+                                            # Unknown block type (e.g. tool_reference):
+                                            # still emit an (empty) tool message so the tool_result is not dropped and
+                                            # its paired tool_use is not orphaned.
+                                            tool_result = ChatCompletionToolMessage(
+                                                role="tool",
+                                                tool_call_id=content.get("tool_use_id", ""),
+                                                content="",
+                                            )
+                                            self._add_cache_control_if_applicable(content, tool_result, model)
+                                            tool_message_list.append(tool_result)  # type: ignore[arg-type]
                                 else:
                                     # For multiple content items, combine into a single tool message
                                     # with list content to preserve all items while having one tool_use_id
@@ -486,15 +497,22 @@ class LiteLLMAnthropicMessagesAdapter:
                                                             ),
                                                         )
                                                     )
-                                    # Create a single tool message with combined content
-                                    if combined_content_parts:
-                                        tool_result = ChatCompletionToolMessage(
-                                            role="tool",
-                                            tool_call_id=content.get("tool_use_id", ""),
-                                            content=combined_content_parts,  # type: ignore
-                                        )
-                                        self._add_cache_control_if_applicable(content, tool_result, model)
-                                        tool_message_list.append(tool_result)  # type: ignore[arg-type]
+                                    # Create a single tool message. Always emit
+                                    # one even when no text/image parts were
+                                    # extracted (e.g. content is only unknown
+                                    # block types like ``tool_reference``);
+                                    # otherwise the tool_result is silently
+                                    # dropped and the paired tool_use becomes an
+                                    # orphan, which the backend rejects with
+                                    # "tool_use ids were found without tool_result
+                                    # blocks immediately after".
+                                    tool_result = ChatCompletionToolMessage(
+                                        role="tool",
+                                        tool_call_id=content.get("tool_use_id", ""),
+                                        content=combined_content_parts if combined_content_parts else "",  # type: ignore
+                                    )
+                                    self._add_cache_control_if_applicable(content, tool_result, model)
+                                    tool_message_list.append(tool_result)  # type: ignore[arg-type]
 
             if len(tool_message_list) > 0:
                 new_messages.extend(tool_message_list)
