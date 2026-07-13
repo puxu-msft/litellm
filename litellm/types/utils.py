@@ -3123,6 +3123,7 @@ all_litellm_params = (
         "rpm",
         "tpm",
         "max_parallel_requests",
+        "stream_keepalive",
         "input_cost_per_token",
         "output_cost_per_token",
         "input_cost_per_second",
