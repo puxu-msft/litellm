@@ -15,7 +15,9 @@ strategy objects are frozen and pure.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from typing import AsyncGenerator, Optional
 
 SSEFrame = str | bytes
 
@@ -66,3 +68,44 @@ class AnthropicKeepaliveStrategy(KeepaliveStrategy):
 
     def observe_advances_to_phase2(self, frame: SSEFrame) -> bool:
         return frame_is_anthropic_message_start(frame)
+
+
+class StreamLease:
+    """Sole, idempotent response-level owner of the streaming resources.
+
+    Holds the pending ``__anext__`` task (if any) and the innermost producer
+    generator. A single ``close()`` — safe to call concurrently and more than
+    once — cancels the pending task, awaits it (shielded) so the cancellation
+    reaches the producer's disconnect/refund path exactly once, then closes the
+    producer. The mandatory order (cancel -> await -> aclose) avoids
+    ``RuntimeError: aclose(): asynchronous generator is already running`` that
+    would arise from closing a producer whose ``__anext__`` is still in flight.
+    """
+
+    def __init__(
+        self,
+        inner: "AsyncGenerator[SSEFrame, None]",
+        pending_task: "Optional[asyncio.Task[SSEFrame]]" = None,
+    ) -> None:
+        self._inner = inner
+        self._pending_task = pending_task
+        self._closed = False
+
+    def set_pending_task(self, task: "asyncio.Task[SSEFrame]") -> None:
+        self._pending_task = task
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True  # set before any await so a concurrent close() short-circuits
+        task = self._pending_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.shield(task)
+            except BaseException:  # noqa: BLE001 - swallow cancellation/errors; goal is delivery, not result
+                pass
+        try:
+            await self._inner.aclose()
+        except BaseException:  # noqa: BLE001
+            pass
