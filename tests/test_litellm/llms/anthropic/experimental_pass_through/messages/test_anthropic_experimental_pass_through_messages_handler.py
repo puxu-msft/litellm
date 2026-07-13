@@ -821,3 +821,34 @@ def test_gate_passthrough_skipped_when_only_chat_completions_supported(monkeypat
     assert result == "translated"
     assert translation_calls["count"] == 1
     assert "config" not in captured
+
+
+class TestShouldRouteToResponsesApiCopilot:
+    def _fn(self):
+        from litellm.llms.anthropic.experimental_pass_through.messages.handler import (
+            _should_route_to_responses_api,
+        )
+
+        return _should_route_to_responses_api
+
+    def test_openai_still_responses(self):
+        assert self._fn()("openai", model="gpt-5.5", model_info=None) is True
+
+    def test_copilot_responses_only(self, monkeypatch):
+        import litellm.llms.github_copilot.model_capabilities as mc
+
+        monkeypatch.setattr(mc, "route_supports_responses", lambda *a, **k: True)
+        assert self._fn()("github_copilot", model="gpt-5.5", model_info={}) is True
+
+    def test_copilot_chat_only(self, monkeypatch):
+        import litellm.llms.github_copilot.model_capabilities as mc
+
+        monkeypatch.setattr(mc, "route_supports_responses", lambda *a, **k: False)
+        assert self._fn()("github_copilot", model="gpt-4o", model_info={}) is False
+
+    def test_global_flag_forces_chat(self, monkeypatch):
+        import litellm
+
+        monkeypatch.setattr(litellm, "use_chat_completions_url_for_anthropic_messages", True)
+        assert self._fn()("github_copilot", model="gpt-5.5", model_info={}) is False
+        assert self._fn()("openai", model="gpt-5.5", model_info=None) is False

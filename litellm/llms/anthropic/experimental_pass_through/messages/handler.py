@@ -15,6 +15,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Mapping,
     Optional,
     Union,
     cast,
@@ -50,7 +51,11 @@ from .utils import AnthropicMessagesRequestUtils, mock_response
 _RESPONSES_API_PROVIDERS = frozenset({"openai"})
 
 
-def _should_route_to_responses_api(custom_llm_provider: Optional[str]) -> bool:
+def _should_route_to_responses_api(
+    custom_llm_provider: Optional[str],
+    model: Optional[str],
+    model_info: Optional[Mapping[str, object]],
+) -> bool:
     """Return True when the provider should use the Responses API path.
 
     Set ``litellm.use_chat_completions_url_for_anthropic_messages = True`` to
@@ -58,6 +63,17 @@ def _should_route_to_responses_api(custom_llm_provider: Optional[str]) -> bool:
     """
     if litellm.use_chat_completions_url_for_anthropic_messages:
         return False
+    if custom_llm_provider == "github_copilot":
+        if model is None:
+            return False
+        from litellm.llms.github_copilot.model_capabilities import (
+            copilot_api_base,
+            raw_model_info,
+            route_supports_responses,
+        )
+
+        info = model_info if model_info is not None else raw_model_info(model)
+        return route_supports_responses(model, model_info=info, api_base=copilot_api_base())
     return custom_llm_provider in _RESPONSES_API_PROVIDERS
 
 
@@ -512,7 +528,7 @@ def anthropic_messages_handler(
             custom_llm_provider=custom_llm_provider,
             **kwargs,
         )
-        if _should_route_to_responses_api(custom_llm_provider):
+        if _should_route_to_responses_api(custom_llm_provider, model=model, model_info=kwargs.get("model_info")):
             return LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(**_shared_kwargs)
 
         # The in-gateway context_management polyfill runs inside
