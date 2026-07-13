@@ -270,3 +270,50 @@ def test_resolver_none_model_info_safe():
     assert mc.resolve_endpoints("x", model_info=None, api_base=None) == frozenset()
     assert mc.route_supports_messages("x", model_info=None, api_base=None) is False
     assert mc.route_supports_responses("x", model_info=None, api_base=None) is False
+
+
+def test_non_interactive_api_key_empty_token_file_no_device_flow(tmp_path, monkeypatch):
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path))
+    (tmp_path / "access-token").write_text("")  # empty -> would trigger device flow via get_api_key
+
+    called = {"get_api_key": False}
+    import litellm.llms.github_copilot.authenticator as auth_mod
+
+    orig = auth_mod.Authenticator.get_api_key
+
+    def _tripwire(self):
+        called["get_api_key"] = True
+        return orig(self)
+
+    monkeypatch.setattr(auth_mod.Authenticator, "get_api_key", _tripwire)
+    assert mc._non_interactive_api_key() is None
+    assert called["get_api_key"] is False
+
+
+def test_non_interactive_api_key_missing_token_file_returns_none(tmp_path, monkeypatch):
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    monkeypatch.setenv("GITHUB_COPILOT_TOKEN_DIR", str(tmp_path / "empty"))
+    assert mc._non_interactive_api_key() is None
+
+
+def test_refresh_capabilities_malformed_json_returns_empty(monkeypatch):
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+
+    class _BadJSON:
+        status_code = 200
+        text = "not json"
+
+        def json(self):
+            raise ValueError("decode error")
+
+    class _BadClient:
+        def get(self, url, headers=None, timeout=None):
+            return _BadJSON()
+
+    assert mc.refresh_capabilities("k", "https://b", _BadClient()) == ()
+    assert mc.get_cached_pairs("https://b") is None

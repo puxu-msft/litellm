@@ -83,7 +83,7 @@ def refresh_capabilities(
 ) -> "tuple[tuple[str, frozenset[CopilotEndpoint]], ...]":
     try:
         pairs = fetch_endpoint_pairs(api_key=api_key, api_base=api_base, client=client)
-    except (httpx.HTTPError, RuntimeError, ValidationError) as e:
+    except (httpx.HTTPError, RuntimeError, ValidationError, ValueError) as e:
         verbose_logger.debug("github_copilot refresh_capabilities failed for %s: %s", api_base, e)
         return ()
     _CAP_CACHE.delete_cache(api_base)
@@ -226,8 +226,12 @@ def _non_interactive_api_key() -> Optional[str]:
     from litellm.llms.github_copilot.authenticator import Authenticator
 
     auth = Authenticator()
-    if not os.path.exists(auth.access_token_file):
-        verbose_logger.debug("github_copilot refresh: no oauth token file, skipping to avoid device flow")
+    try:
+        has_oauth_token = os.path.getsize(auth.access_token_file) > 0
+    except OSError:
+        has_oauth_token = False
+    if not has_oauth_token:
+        verbose_logger.debug("github_copilot refresh: no non-empty oauth token file, skipping to avoid device flow")
         return None
     try:
         return auth.get_api_key()
