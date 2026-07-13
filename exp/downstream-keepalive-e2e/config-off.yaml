@@ -1,0 +1,13 @@
+model_list:
+  - model_name: test-claude
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+      api_base: http://127.0.0.1:8790
+      api_key: dummy-not-used-by-mock
+
+litellm_settings:
+  stream_keepalive:
+    enabled: false
+
+general_settings:
+  master_key: sk-keepalive-test
