@@ -90,3 +90,63 @@ def get_cached_pairs(
 ) -> "Optional[tuple[tuple[str, frozenset[CopilotEndpoint]], ...]]":
     cached = _CAP_CACHE.get_cache(api_base)
     return cached if isinstance(cached, tuple) else None
+
+
+def resolve_endpoints(
+    model: str,
+    *,
+    model_info: Mapping[str, object],
+    api_base: Optional[str],
+) -> "frozenset[CopilotEndpoint]":
+    bare = strip_copilot_prefix(model)
+    if api_base is not None:
+        cached = get_cached_pairs(api_base)
+        if cached is not None:
+            hit = next((eps for m, eps in cached if m == bare), None)
+            if hit:
+                return hit
+    raw = model_info.get("supported_endpoints")
+    if isinstance(raw, (list, tuple)):
+        return normalize_endpoints(tuple(str(x) for x in raw))
+    return frozenset()
+
+
+def forced_mode(
+    model_info: Mapping[str, object],
+) -> "Optional[Literal['anthropic', 'responses', 'chat']]":
+    mode = model_info.get("mode")
+    if mode == "anthropic":
+        return "anthropic"
+    if mode == "responses":
+        return "responses"
+    if mode == "chat":
+        return "chat"
+    return None
+
+
+def route_supports_messages(
+    model: str,
+    *,
+    model_info: Mapping[str, object],
+    api_base: Optional[str],
+) -> bool:
+    mode = forced_mode(model_info)
+    if mode == "anthropic":
+        return True
+    if mode == "responses":
+        return False
+    return "messages" in resolve_endpoints(model, model_info=model_info, api_base=api_base)
+
+
+def route_supports_responses(
+    model: str,
+    *,
+    model_info: Mapping[str, object],
+    api_base: Optional[str],
+) -> bool:
+    mode = forced_mode(model_info)
+    if mode == "responses":
+        return True
+    if mode in ("chat", "anthropic"):
+        return False
+    return "responses" in resolve_endpoints(model, model_info=model_info, api_base=api_base)

@@ -117,3 +117,63 @@ def test_get_cached_miss_returns_none():
 
     mc._CAP_CACHE.flush_cache()
     assert mc.get_cached_pairs("https://unseen.example") is None
+
+
+def test_resolve_prefers_dynamic_cache():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    mc._CAP_CACHE.set_cache("https://b", (("gpt-5.5", frozenset({"responses"})),), ttl=300)
+    eps = mc.resolve_endpoints("github_copilot/gpt-5.5", model_info={}, api_base="https://b")
+    assert eps == frozenset({"responses"})
+
+
+def test_resolve_falls_back_to_raw_model_info():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    eps = mc.resolve_endpoints(
+        "gpt-x", model_info={"supported_endpoints": ["/responses"]}, api_base="https://b"
+    )
+    assert eps == frozenset({"responses"})
+
+
+def test_resolve_empty_when_nothing_known():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    assert mc.resolve_endpoints("mystery", model_info={}, api_base=None) == frozenset()
+
+
+def test_route_messages_mode_anthropic_forces():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    assert mc.route_supports_messages("m", model_info={"mode": "anthropic"}, api_base=None) is True
+    assert mc.route_supports_responses("m", model_info={"mode": "anthropic"}, api_base=None) is False
+
+
+def test_mode_chat_does_not_block_messages():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    info = {"mode": "chat", "supported_endpoints": ["/v1/chat/completions", "/v1/messages"]}
+    assert mc.route_supports_messages("claude-x", model_info=info, api_base=None) is True
+    assert mc.route_supports_responses("claude-x", model_info=info, api_base=None) is False
+
+
+def test_mode_responses_forces_responses():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    assert mc.route_supports_responses("m", model_info={"mode": "responses"}, api_base=None) is True
+    assert mc.route_supports_messages("m", model_info={"mode": "responses"}, api_base=None) is False
+
+
+def test_route_unset_mode_uses_endpoints():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    mc._CAP_CACHE.set_cache("https://b", (("gpt-5.5", frozenset({"responses"})),), ttl=300)
+    assert mc.route_supports_responses("gpt-5.5", model_info={}, api_base="https://b") is True
+    assert mc.route_supports_messages("gpt-5.5", model_info={}, api_base="https://b") is False
