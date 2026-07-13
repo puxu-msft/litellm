@@ -16,6 +16,7 @@ strategy objects are frozen and pure.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from enum import Enum
 from typing import AsyncGenerator, Optional
@@ -171,3 +172,22 @@ def strategy_for(surface: DownstreamSSESurface) -> KeepaliveStrategy:
 def needs_frame_normalizer(surface: DownstreamSSESurface) -> bool:
     """Only the Anthropic native passthrough forwards raw bytes needing framing."""
     return surface is DownstreamSSESurface.ANTHROPIC
+
+
+def committed_error_frame(surface: DownstreamSSESurface, error_obj: dict) -> str:
+    """Serialize an error as a client-recognizable SSE frame for a committed stream.
+
+    Once the 200 + headers have been sent (slow-commit / mid-stream), an error
+    can no longer become a JSON response — it must ride the SSE channel in a form
+    the downstream SDK actually surfaces. The Anthropic SDK only raises on
+    ``event: error`` frames whose payload ``type == "error"``; a bare
+    ``data: {"error": ...}`` frame is silently ignored. OpenAI chat / responses
+    SDKs recognize the bare ``data: {"error": ...}`` form.
+    """
+    match surface:
+        case DownstreamSSESurface.ANTHROPIC:
+            payload = json.dumps({"type": "error", "error": error_obj})
+            return f"event: error\ndata: {payload}\n\n"
+        case DownstreamSSESurface.OPENAI_CHAT | DownstreamSSESurface.OPENAI_RESPONSES:
+            return f'data: {json.dumps({"error": error_obj})}\n\n'
+    assert_never(surface)
