@@ -53,6 +53,11 @@ from litellm.proxy.common_utils.callback_utils import (
 from litellm.proxy.common_utils.sse_frame_normalizer import (
     normalize_anthropic_sse_frames,
 )
+from litellm.proxy.common_utils.keepalive_metrics import (
+    record_pings as keepalive_record_pings,
+    stream_ended as keepalive_stream_ended,
+    stream_started as keepalive_stream_started,
+)
 from litellm.proxy.common_utils.sse_keepalive import (
     DownstreamSSESurface,
     SSEFrame,
@@ -451,6 +456,30 @@ async def _committed_error_guard(
         yield committed_error_frame(surface, _error_obj_from_exception(exc))
 
 
+async def _metered_keepalive_body(
+    inner: AsyncGenerator[SSEFrame, None],
+    surface_value: str,
+) -> AsyncGenerator[SSEFrame, None]:
+    """Wrap a committed keepalive body with Prometheus stream lifecycle metrics:
+    active-stream gauge, stream duration, and termination reason. Upstream errors
+    are converted to frames by ``_committed_error_guard`` upstream of this, so they
+    surface here as normal completion; ``disconnect`` covers client teardown."""
+    keepalive_stream_started(surface_value)
+    start = time.monotonic()
+    reason = "completed"
+    try:
+        async for frame in inner:
+            yield frame
+    except (asyncio.CancelledError, GeneratorExit):
+        reason = "disconnect"
+        raise
+    except Exception:
+        reason = "error"
+        raise
+    finally:
+        keepalive_stream_ended(surface_value, reason, time.monotonic() - start)
+
+
 async def _create_response_with_keepalive(
     generator: AsyncGenerator[str, None],
     media_type: str,
@@ -549,16 +578,26 @@ async def _create_response_with_keepalive(
 
         seen_message_start = strategy.observe_advances_to_phase2(first_frame)
 
+        def _count_pings(n: int) -> None:
+            keepalive_record_pings(surface.value, n)
+
         async def _fast_body() -> AsyncGenerator[SSEFrame, None]:
             yield first_frame
             async for frame in _committed_error_guard(
-                sse_keepalive(framed, strategy, keepalive.interval, lease, seen_message_start=seen_message_start),
+                sse_keepalive(
+                    framed,
+                    strategy,
+                    keepalive.interval,
+                    lease,
+                    seen_message_start=seen_message_start,
+                    on_idle_frames=_count_pings,
+                ),
                 surface,
             ):
                 yield frame
 
         return _UpstreamClosingStreamingResponse(
-            cast("AsyncGenerator[str, None]", _fast_body()),
+            cast("AsyncGenerator[str, None]", _metered_keepalive_body(_fast_body(), surface.value)),
             media_type=media_type,
             headers=streaming_headers,
             status_code=default_status_code,
@@ -566,12 +605,17 @@ async def _create_response_with_keepalive(
         )
 
     # Timer fired first: slow upstream. Commit 200 and keepalive during the wait.
+    def _count_pings_slow(n: int) -> None:
+        keepalive_record_pings(surface.value, n)
+
     slow_body = _committed_error_guard(
-        sse_keepalive(framed, strategy, keepalive.interval, lease, initial_task=chunk_task),
+        sse_keepalive(
+            framed, strategy, keepalive.interval, lease, initial_task=chunk_task, on_idle_frames=_count_pings_slow
+        ),
         surface,
     )
     return _UpstreamClosingStreamingResponse(
-        cast("AsyncGenerator[str, None]", slow_body),
+        cast("AsyncGenerator[str, None]", _metered_keepalive_body(slow_body, surface.value)),
         media_type=media_type,
         headers=streaming_headers,
         status_code=default_status_code,

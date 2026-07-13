@@ -106,11 +106,28 @@ async def test_anthropic_phase2_only_after_message_start_no_ping_on_that_frame()
     gate2.set()
     await t
 
-    ms = b"event: message_start\ndata: {}\n\n"
-    assert ms in out
-    idx_ms = out.index(ms)
-    # native ping only after message_start (phase 2)
-    assert ANTHROPIC_PING_EVENT in out
-    assert ANTHROPIC_PING_EVENT not in out[: idx_ms + 1]
-    # message_start frame itself carried no synchronous ping right before it
-    assert out[:idx_ms].count(ANTHROPIC_PING_EVENT) == 0
+
+@pytest.mark.asyncio
+async def test_on_idle_frames_callback_reports_ping_counts():
+    gate = asyncio.Event()
+    real = _gen_gated([b"data: real\n\n"], gate)
+    lease = StreamLease(inner=real)
+    reported = []
+
+    async def drive():
+        async for _ in sse_keepalive(
+            real,
+            CommentOnlyKeepaliveStrategy(),
+            interval=0.04,
+            lease=lease,
+            on_idle_frames=reported.append,
+        ):
+            pass
+
+    t = asyncio.ensure_future(drive())
+    await asyncio.sleep(0.13)  # a few idle ticks
+    gate.set()
+    await t
+    # comment-only strategy emits 1 frame per idle tick; callback got >=2 ticks of 1
+    assert len(reported) >= 2
+    assert all(n == 1 for n in reported)

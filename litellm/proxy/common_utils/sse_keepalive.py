@@ -19,7 +19,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncGenerator, AsyncIterator, Optional
+from typing import AsyncGenerator, AsyncIterator, Callable, Optional
 
 from typing_extensions import assert_never
 
@@ -127,6 +127,7 @@ async def sse_keepalive(
     *,
     initial_task: "Optional[asyncio.Task[SSEFrame]]" = None,
     seen_message_start: bool = False,
+    on_idle_frames: Optional[Callable[[int], None]] = None,
 ) -> "AsyncGenerator[SSEFrame, None]":
     """Forward ``real_frames``, injecting keepalive frames during idle gaps.
 
@@ -152,8 +153,11 @@ async def sse_keepalive(
             done, _pending = await asyncio.wait({task}, timeout=interval)
             if done:
                 break
-            for frame in strategy.idle_frames(phase2):
+            idle = strategy.idle_frames(phase2)
+            for frame in idle:
                 yield frame
+            if on_idle_frames is not None:
+                on_idle_frames(len(idle))
         try:
             frame = task.result()
         except StopAsyncIteration:
