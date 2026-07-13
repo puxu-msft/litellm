@@ -19,3 +19,64 @@ def test_strip_only_copilot_prefix():
     assert strip_copilot_prefix("github_copilot/gpt-5.6-sol") == "gpt-5.6-sol"
     assert strip_copilot_prefix("claude-opus-4.8") == "claude-opus-4.8"
     assert strip_copilot_prefix("vendor/weird/model") == "vendor/weird/model"
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, payload: object):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = str(payload)
+
+    def json(self) -> object:
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, resp: _FakeResp):
+        self._resp = resp
+        self.calls: list = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append((url, timeout))
+        return self._resp
+
+
+_MODELS_PAYLOAD = {
+    "data": [
+        {"id": "claude-opus-4.8", "supported_endpoints": ["/v1/messages", "/chat/completions"]},
+        {"id": "gpt-5.5", "supported_endpoints": ["/responses", "ws:/responses"]},
+        {"id": "gpt-4o"},
+    ]
+}
+
+
+def test_fetch_endpoint_pairs_preserves_endpoints():
+    from litellm.llms.github_copilot.model_capabilities import fetch_endpoint_pairs
+
+    client = _FakeClient(_FakeResp(200, _MODELS_PAYLOAD))
+    pairs = fetch_endpoint_pairs("k", "https://api.githubcopilot.com", client)
+    as_map = dict(pairs)
+    assert as_map["claude-opus-4.8"] == frozenset({"messages", "chat"})
+    assert as_map["gpt-5.5"] == frozenset({"responses"})
+    assert as_map["gpt-4o"] == frozenset()
+    assert client.calls[0][0] == "https://api.githubcopilot.com/models"
+
+
+def test_fetch_endpoint_pairs_non_200_raises():
+    import pytest
+
+    from litellm.llms.github_copilot.model_capabilities import fetch_endpoint_pairs
+
+    client = _FakeClient(_FakeResp(401, {"error": "no auth"}))
+    with pytest.raises(RuntimeError):
+        fetch_endpoint_pairs("k", "https://api.githubcopilot.com", client)
+
+
+def test_fetch_endpoint_pairs_malformed_raises():
+    import pytest
+
+    from litellm.llms.github_copilot.model_capabilities import fetch_endpoint_pairs
+
+    client = _FakeClient(_FakeResp(200, {"unexpected": "shape"}))
+    with pytest.raises(Exception):
+        fetch_endpoint_pairs("k", "https://api.githubcopilot.com", client)
