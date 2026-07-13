@@ -1,7 +1,7 @@
 # 上游 HTTP client 细粒度配置（github_copilot）
 
-状态：设计修订中（已过两轮对抗性评审，本版转向丙-maximal，待终审 + 用户确认）
-日期：2026-07-13 初稿；2026-07-14 两轮评审后修订
+状态：设计已确认（三轮对抗性评审，终审判「修正两项 spec 语义后可进实现」，本版已冻结）
+日期：2026-07-13 初稿；2026-07-14 三轮评审后定稿
 分支：`ghc`
 
 ## 修订说明（本版依据）
@@ -51,10 +51,11 @@ GHC chat completion 经 `openai_compatible_providers` 进 `_complete_custom_open
 
 - **配置传输中立**：yaml 表达意图，connect/read/pool 经 `httpx.Timeout` 两 transport 通吃；total 用 litellm 层 asyncio deadline，与 transport 无关。不做 per-transport 配置（YAGNI）
 - **total = 单一 asyncio 绝对 deadline（丙-maximal，用户拍板）**：request-scope 起点算 `deadline = loop.time() + total_timeout`
-  - 非流式：`asyncio.timeout_at(deadline)`（或等价 deadline-aware wrapper）包住整个 SDK 调用——覆盖 SDK 重试 backoff 与建连全过程
-  - 流式：deadline 包裹下沉到**底层字节流迭代**（各面 iterator 之下），超时以普通 `TimeoutError` 进各面既有 `__anext__` 失败路径，复用 partial usage/成本回收/失败回调/异常映射；包裹层 shielded `aclose()` 显式关闭 `httpx.Response`；**不替换各面返回类型**（chat 靠 `isinstance(resp, CustomStreamWrapper)` 设 logging loop，见 `main.py:685-688`）
+  - 非流式：`asyncio.timeout_at(deadline)`（或等价 deadline-aware wrapper，见下 Python 兼容）包住整个 SDK 调用——覆盖 SDK 重试 backoff 与建连全过程
+  - 流式（**同一 deadline 两阶段**）：① `asyncio.timeout_at(deadline)` 包住「建立 stream / 取得外层 iterator」的初始 await——覆盖建连、等响应头、以及返回 iterator **之前**的 SDK 重试 backoff；② 初始 await 成功后，把**同一个** deadline 交给底层字节流迭代包裹（各面 iterator 之下），超时以普通 `TimeoutError` 进各面既有 `__anext__` 失败路径，复用 partial usage/成本回收/失败回调/异常映射；包裹层 shielded `aclose()` 显式关闭 `httpx.Response`；**不替换各面返回类型**（chat 靠 `isinstance(resp, CustomStreamWrapper)` 设 logging loop，见 `main.py:685-688`）。仅测慢 chunk 不足以证明整体封顶，须补「stream=True、首 attempt 失败、deadline 在 backoff 中到期」场景
   - `remaining = deadline - loop.time()` **`<= 0` 立即抛超时**，不依赖底层 timer
   - **不碰 aiohttp transport、不引 contextvar**——一套机制覆盖两 transport × 三面
+  - **Python 兼容**：`asyncio.timeout_at()` 为 3.11+，项目声明支持 3.10（`pyproject.toml`）→ 实现须提供版本兼容的统一 deadline helper（3.10 上用 `asyncio.wait_for(awaitable, remaining)`），并统一转换为同一公开 timeout 异常
 - **scope 起点冻结**：global/request 级配置在 API async 入口解析；per-deployment 配置在 **Router 选定 deployment、merge 参数之后**解析；deadline scope 在**同一 Router attempt 内、调用三面实际 async 函数之前**建立；direct SDK 调用绕过 Router 时由各面 async 入口用**同一 helper** 建立。跨 Router fallback 的预算语义：**每个 deployment attempt 独立起算 deadline**（fallback 不继承首个 deadline；如需全局封顶另行显式建模，记 BACKLOG）
 - **三面全覆盖**：chat/responses（含 completion bridge 分支）/messages 共享 http_client 解析、httpx.Timeout 应用与 deadline scope；顺带修 messages 不传 timeout + 错缓存键
 - **http_client 是正式 litellm 级参数，绝不泄漏上游**：进 `all_litellm_params`，provider 映射前消费；内部 resolved 值走不会再参与 provider 映射的 typed 通道；wire-level 测试断言上游 body 无 `http_client`
@@ -124,16 +125,17 @@ model_list:
 
 - **chat**：`supports_httpx_timeout()` 加 `"github_copilot"`，resolved timeout 送入现链路
 - **responses**：resolved `httpx.Timeout` 接入 native handler `post()`；**并覆盖 completion bridge 分支**（`responses/main.py:1054-1066`），使非 native-responses 模型也不丢配置
-- **messages**：修 bug——向 `.../messages/handler.py` 与 `llm_http_handler.py` 的 `post()` 传 resolved `httpx.Timeout`；缓存键从 `LlmProviders.ANTHROPIC` 改为 **`LlmProviders.GITHUB_COPILOT`**（timeout/deadline 是 per-request 数据，不发明 deployment 级 client 隔离）
+- **messages**：修 bug——向 `.../messages/handler.py` 与 `llm_http_handler.py` 的 `post()` 传 resolved `httpx.Timeout`；缓存键按**实际 `custom_llm_provider`** 构造（`LlmProviders(custom_llm_provider)`：GHC 路径为 `GITHUB_COPILOT`，真正的 Anthropic provider 仍为 `ANTHROPIC`，不无条件替换以免改动其它 provider 行为）。messages 的 `legacy_effective_timeout` 取现有 `_default_cached_client_timeout()` 语义（未显式配置 600s，显式 global timeout 则用该值）
 
 ### 4. total → 单一 asyncio 绝对 deadline（丙-maximal）
 
 - **scope 建立**：在 Router 选定 deployment + merge 后（direct 入口用同一 helper）算 `deadline = loop.time() + total_timeout`，随 request context 流入下面两处
 - **非流式**：`asyncio.timeout_at(deadline)` 包住 SDK 调用，覆盖重试 backoff
-- **流式**：deadline-aware 迭代包裹放在**底层字节流**（各面 iterator 之下，或统一到 `response.aiter_bytes()` 层）:
+- **流式（同一 deadline 两阶段）**：① `timeout_at(deadline)` 包住「取得外层 iterator」的初始 await（覆盖建连、响应头、返回前的 backoff）；② 同一 deadline 交给底层字节流迭代包裹（各面 iterator 之下，或统一到 `response.aiter_bytes()` 层）:
   - chat：OpenAI `AsyncStream` 与 `CustomStreamWrapper` 之间，超时以 `TimeoutError` 进 `__anext__`（`streaming_handler.py:1877-1952/2068-2129`）
-  - responses：`ResponsesAPIStreamingIterator.__anext__` 之下，仍触发其 `_handle_failure()`
-  - messages：`response.aiter_bytes()` 与 `PassThroughStreamingHandler.chunk_processor()` 之间，保其 `finally` 记录 partial chunks
+  - responses（native）：`response.aiter_bytes()` 与 SSE decoder 之间，仍触发 `ResponsesAPIStreamingIterator._handle_failure()`
+  - responses（completion bridge）：内部持 `CustomStreamWrapper`，**复用 chat 的底层 wrapper**，不套 native byte-stream 接缝
+  - messages：`response.aiter_bytes()` 与 `PassThroughStreamingHandler.chunk_processor()` 之间，保其 `finally` 记录 partial chunks。注意 direct SDK 消费 `litellm.anthropic_messages()` 时完整 failure hook 在 proxy 外层（`common_request_processing.py:2551-2577`）——验收须明确 failure logging 归属且**仅触发一次**，或限定为「partial spend logging + proxy failure hook」
   - 三面均：`remaining<=0` 立即抛；shielded `aclose()` 显式关闭 `httpx.Response`；不替换返回类型
 - **不修改 aiohttp transport，不引 contextvar**
 
@@ -151,6 +153,7 @@ model_list:
 - **deadline 扛重试（重点）**：注入 clock + 至少一次 SDK retry（含 backoff sleep），断言总耗时不超一个 total budget、超时确实在 backoff 期间触发（mutate 掉外层 `timeout_at` 应失败）
 - **deadline 过期立即失败**：`remaining<=0` 路径断言立即抛，不被底层 timer 吞
 - **httpx 流式 deadline（重点，三面各一）**：伪慢流断言到点抛 `Timeout`、各面失败日志/部分成本回收**仍执行**、`httpx.Response` 被关闭；快流不误杀
+- **流式建立阶段封顶（重点）**：`stream=True`、首 attempt 失败、deadline 在 SDK retry backoff 中到期，断言初始 await 被 `timeout_at` 覆盖并抛超时（仅测慢 chunk 证不出这点）
 - **未配置轴保各面语义**：responses 未配 read 时仍用其 6000s 语义而非 600
 - **三面端到端**：各配 http_client，断言分段 timeout 与 deadline 生效；messages 回归其原不传 timeout 的 bug
 - **自定义 client 告警**：注入 `aclient_session` + http_client 断言 warning
