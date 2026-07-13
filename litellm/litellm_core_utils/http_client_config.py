@@ -2,7 +2,7 @@
 timeouts, HTTP/2 reservation). See docs/superpowers/specs/2026-07-13-upstream-http-client-config-design.md.
 """
 
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,3 +32,15 @@ class HttpClientConfigDict(TypedDict, total=False):
     pool_timeout: Optional[float]
     total_timeout: Optional[float]
     http2: Optional[bool]
+
+
+def parse_http_client_config(
+    raw: Optional[Union["HttpClientConfig", HttpClientConfigDict, dict]],
+) -> Optional[HttpClientConfig]:
+    """Coerce a raw `http_client` value (None, dict/TypedDict from YAML or kwargs, or an
+    already-constructed HttpClientConfig) into a validated HttpClientConfig, or None."""
+    if raw is None:
+        return None
+    if isinstance(raw, HttpClientConfig):
+        return raw
+    return HttpClientConfig(**raw)

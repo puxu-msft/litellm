@@ -39,3 +39,38 @@ def test_http_client_config_rejects_non_positive_timeout_values(field_name, bad_
 def test_http_client_config_accepts_small_positive_timeout_values(field_name):
     cfg = HttpClientConfig(**{field_name: 0.001})
     assert getattr(cfg, field_name) == 0.001
+
+
+def test_parse_http_client_config_none_returns_none():
+    from litellm.litellm_core_utils.http_client_config import parse_http_client_config
+
+    assert parse_http_client_config(None) is None
+
+
+def test_parse_http_client_config_from_dict():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        parse_http_client_config,
+    )
+
+    parsed = parse_http_client_config({"connect_timeout": 5.0, "total_timeout": 30.0})
+    assert parsed == HttpClientConfig(connect_timeout=5.0, total_timeout=30.0)
+
+
+def test_parse_http_client_config_passthrough_for_existing_model():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        parse_http_client_config,
+    )
+
+    cfg = HttpClientConfig(read_timeout=2.0)
+    assert parse_http_client_config(cfg) is cfg
+
+
+def test_parse_http_client_config_rejects_unknown_keys():
+    from pydantic import ValidationError
+
+    from litellm.litellm_core_utils.http_client_config import parse_http_client_config
+
+    with pytest.raises(ValidationError):
+        parse_http_client_config({"not_a_real_field": 1})
