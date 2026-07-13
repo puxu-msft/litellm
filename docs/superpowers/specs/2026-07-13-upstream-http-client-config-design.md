@@ -72,7 +72,7 @@ GHC chat completion 经 `openai_compatible_providers` 进 `_complete_custom_open
 - **HTTP/2（缺口 C）**：单独 PoC（GHC 是否协商 h2、换 httpx+http2 后吞吐/稳定性），代码与结论留 `exp/http2-ghc/`。本次仅 schema 预留并校验 `http2` 键，不接线
 - 连接池大小等 aiohttp 连接器参数（已有 `AIOHTTP_CONNECTOR_LIMIT*` 等 env）
 - 全局跨 Router fallback 的统一预算封顶（本次每 attempt 独立起算，记 BACKLOG）
-- 改动 openai/azure 等其它 provider 既有超时行为
+- 改变**未配置 `http_client`** 的任何 provider 的既有超时行为——本功能为 **opt-in（用户已确认通用 opt-in，不做 GHC-only gate）**：配置了 `http_client` 的任意 provider 生效（含全局 `litellm_settings.http_client` 对所有 provider 生效），未配置则行为完全不变。因此「不改动 openai/azure」的语义是「不改动其未配置时的既有行为」，而非把功能限制到 GHC。为兑现通用 opt-in，`http_client` 解析出的 `httpx.Timeout` 须对其被配置的 provider 生效，chat 的 `supports_httpx_timeout` 降级不得把它剥掉（实践上把 `github_copilot` 加进白名单覆盖用户实际用量，并确保 http_client 来源的 `httpx.Timeout` 不被降级）
 - 重构 `supports_httpx_timeout` 硬编码白名单（记 BACKLOG）
 
 ## yaml 表面（单独命名空间，用户已选）
@@ -135,7 +135,7 @@ model_list:
   - chat：OpenAI `AsyncStream` 与 `CustomStreamWrapper` 之间，超时以 `TimeoutError` 进 `__anext__`（`streaming_handler.py:1877-1952/2068-2129`）
   - responses（native）：`response.aiter_bytes()` 与 SSE decoder 之间，仍触发 `ResponsesAPIStreamingIterator._handle_failure()`
   - responses（completion bridge）：内部持 `CustomStreamWrapper`，**复用 chat 的底层 wrapper**，不套 native byte-stream 接缝
-  - messages：`response.aiter_bytes()` 与 `PassThroughStreamingHandler.chunk_processor()` 之间，保其 `finally` 记录 partial chunks。注意 direct SDK 消费 `litellm.anthropic_messages()` 时完整 failure hook 在 proxy 外层（`common_request_processing.py:2551-2577`）——验收须明确 failure logging 归属且**仅触发一次**，或限定为「partial spend logging + proxy failure hook」
+  - messages：`response.aiter_bytes()` 与 `PassThroughStreamingHandler.chunk_processor()` 之间，保其 `finally` 记录 partial chunks。**failure hook 归属（已冻结，方案 b）**：direct SDK 消费 `litellm.anthropic_messages()` 返回 iterator 时**只记 partial spend、不触发 `failure_handler`**（与现有 `chunk_processor` 行为一致，不引入重复触发）；完整 failure hook 仍由 proxy 外层负责（`common_request_processing.py:2551-2577`）。验收断言「direct SDK 路径 failure_handler 触发 0 次、partial spend logging 触发 1 次」
   - 三面均：`remaining<=0` 立即抛；shielded `aclose()` 显式关闭 `httpx.Response`；不替换返回类型
 - **不修改 aiohttp transport，不引 contextvar**
 
