@@ -1,7 +1,7 @@
 # 在途请求可观测 + 优雅关停播报 + 关停时序加固
 
-状态：设计经两轮 GPT reviewer 对抗性评审（round-1 3 blocker/6 major/2 minor；round-2 复核确认 6 闭合、5 部分闭合含 2 blocker、并挖出 3 新 major，全程核对真实代码 + uvicorn/prisma SDK 源码），本版据 round-2 冻结记账排空拓扑与 quiesce 时序契约，待用户复核 gate
-日期：2026-07-14 初稿；同日 round-1 重写、round-2 再修订
+状态：设计经三轮 GPT reviewer 对抗性评审（round-1 3 blocker/6 major/2 minor；round-2 6 闭合/5 部分含 2 blocker/3 新 major；round-3 逐点核对真实调度拓扑后仅剩 1 blocker、本版补齐 LoggingWorker 联合 quiesce 契约，评审背书「可进入实施计划」），全程核对真实代码 + uvicorn/prisma SDK 源码 + 最小复现 + 跑现有测试，本版冻结全部契约，待用户复核 gate
+日期：2026-07-14 初稿；同日 round-1 重写、round-2、round-3 三次修订
 分支：`ghc`
 关联：现有 `GracefulShutdownManager`（[graceful_shutdown_manager.py](../../../litellm/proxy/shutdown/graceful_shutdown_manager.py)）、`InFlightRequestsMiddleware`（[in_flight_requests_middleware.py](../../../litellm/proxy/middleware/in_flight_requests_middleware.py)）、`LoggingWorker`（[logging_worker.py](../../../litellm/litellm_core_utils/logging_worker.py)，供 task supervisor 复用其 bounded-queue/running-task-set/flush-stop 模式）
 
@@ -103,15 +103,21 @@ class DrainingServer(uvicorn.Server):
 
 ### B. Managed task supervisor + work-lease（Phase 1，记账生命周期）
 
-**lease 绑到真实调度拓扑，不是替换表面 `asyncio.create_task`。** 记账主链是两级队列：wrapper 短命 task → `_client_async_logging_helper` enqueue 到 `GLOBAL_LOGGING_WORKER` → worker dequeue 建 processing task → `_ProxyDBLogger.async_log_success_event` 派生 `update_cache` + `_batch_database_updates`。故 lease 在**最早的 logging enqueue 边界**同步 acquire，把 `inflight_id` + once-only lease token 存入 `LoggingTask` queue item；该 item 被处理/拒收/丢弃/取消时统一 release，`LoggingWorker.flush()` 因而成为 accounting drain 的一环。
+**lease 绑到真实调度拓扑，不是替换表面 `asyncio.create_task`。** 记账主链是两级队列：wrapper 短命 task → `_client_async_logging_helper` enqueue 到 `GLOBAL_LOGGING_WORKER` → worker dequeue 建 processing task → `_ProxyDBLogger.async_log_success_event` 派生 `update_cache` + `_batch_database_updates`。故 lease 在**最早的 logging enqueue 边界**同步 acquire，把 `inflight_id` + once-only lease token 存入 `LoggingTask` queue item；该 item 被处理/拒收/丢弃/取消/loop-rebind 时统一 release，`LoggingWorker` 的关停 quiesce（见 C）因而成为 accounting drain 的一环。
+
+**不让通用 `LoggingWorker` 依赖 proxy 类型。** `LoggingTask` 从 mutable `TypedDict` 改为 `frozen dataclass(slots=True)`，新增可选中立字段 `token: CompletionToken | None`（`CompletionToken` 是中立 protocol，`token.settle(outcome)` 幂等；proxy 的 `AccountingLease` 实现它，纯 SDK 传 `None`）。`ensure_initialized_and_enqueue` 加 keyword-only `token=None`。worker 在唯一 `finally` settle 非空 token；`_schedule_delayed_enqueue_retry` 无 loop 直接 drop、`_retry_enqueue_task` 重试放弃、`_aggressively_clear_queue_async`、`_ensure_queue` 换 loop 丢旧 queue 等**每一条 drop/rebind 路径都必须 settle token**，否则 record 泄漏。SDK（`token=None`）路径行为完全不变，加纯 SDK 回归测试守此。
 
 `ManagedTaskSet`（抽出的极小共享件，组合非继承；标准 asyncio 语义：强引用 task 集 + done-callback 移除 + cancel-all + await-settlement + fixed-point empty 检查）被 `LoggingWorker` 与新 supervisor 共用；**不**合并二者高层 drain 语义（LoggingWorker 的 bounded queue/best-effort overflow 与 accounting 的 lease/admission/deadline outcome 各自持有）。
 
-`ManagedTaskSupervisor`（process-scoped）：
-- `spawn(coro, *, name, lease: AccountingLease) -> None`——建 task 入集合，`add_done_callback` 移除并 once-only release lease；task creation 失败须回滚已 acquire 的 lease、关闭未调度 coroutine
-- `async drain() -> DrainOutcome`——读单一 deadline，fixed-point 排空（queue 空 + running set 空 + 无 admission 中的 child 才算完成）；到期 cancel 全部 remaining 并 `gather(return_exceptions=True)` 等终止
+**admission 授权用不可伪造 scope，不靠 `ContextVar != None`。** 已登记 parent 持 `AccountingScope`；`spawn_child(scope, ...)` 同步临界段先 `admissions_in_progress += 1`、acquire child lease、入 set、末尾 `-= 1`。root admission 关闭后，只有携带**仍有效** parent scope 的 child 被接受（custom callback 即使 `current_inflight_id` 仍在、无有效 scope 也拒绝作新 root 并 settle/close coroutine）；parent 完成后其 scope 失效，防止 callback 在任意未来时刻再派生。
 
-work-lease 让 record 活过 ACCOUNTING：`InFlightRegistry` 每条持 transport + accounting 两类 lease（引用计数为登记表内唯一可变单元，封在方法内）。中间件入口 acquire transport lease、响应完成 release；**每个脱离父 coroutine 的 ownership boundary**（success / failure / pass-through logging / `update_cache` / `_batch_database_updates`）acquire 一个 accounting lease，awaited 的子调用（如 `_update_database_and_spend_counters`）不另取、由父 lease 覆盖。transport 已 release 而 accounting lease>0 时 registry 内部原子推进到 `ACCOUNTING`；全部 lease 为 0 才写 terminal reason 并 deregister。`ContextVar current_inflight_id` 用于入口，但 queue item **显式保存 `inflight_id`**，关键生命周期不只靠隐式 context。release 重复调用返回 typed invariant error，不把计数减成负。
+`ManagedTaskSupervisor`（process-scoped）：
+- `spawn_child(scope, coro, *, name) -> None`——建 task 入集合，`add_done_callback` 移除并 once-only settle lease；task creation 失败须回滚已 acquire 的 lease、关闭未调度 coroutine
+- `async drain() -> DrainOutcome`——读单一 deadline，fixed-point 稳定空判定 `root_queue_unfinished == 0 && accounting_tasks == 0 && admissions_in_progress == 0`（每轮从当前 snapshot await 后重读，让事件循环至少推进一轮）；到期 cancel 全部 remaining 并 `gather(return_exceptions=True)` 等终止
+
+**child 分类**：并非所有派生都是必须在 teardown 前完成的 accounting child。`update_cache` / `_batch_database_updates` 属 accounting（必须 drain）；`budget_alerts` / `async_set_cache_pipeline` / `failed_tracking_alert` / service logging hooks 属 telemetry（deadline 可直接取消）。规格按此分类，实现计划逐一落表。
+
+work-lease 让 record 活过 ACCOUNTING：`InFlightRegistry` 每条持 transport + accounting 两类 lease（引用计数为登记表内唯一可变单元，封在方法内）。中间件入口 acquire transport lease、响应完成 release；**每个脱离父 coroutine 的 ownership boundary**（success / failure / pass-through logging / `update_cache` / `_batch_database_updates`）acquire 一个 accounting lease，awaited 的子调用（如 `_update_database_and_spend_counters`）不另取、由父 lease 覆盖。transport 已 release 而 accounting lease>0 时 registry 内部原子推进到 `ACCOUNTING`；全部 lease 为 0 才写 terminal reason 并 deregister。`ContextVar current_inflight_id` 用于入口，但 queue item **显式保存 `inflight_id` + token**，关键生命周期不只靠隐式 context。release 重复调用返回 typed invariant error，不把计数减成负。
 
 关停记账边界返回 tagged union：`AccountingCompleted | AccountingSkippedDuringShutdown | AccountingFailed`，由边界 `match` 后单行记录，**不**在各 DB/redis primitive 里各自静默短路。
 
@@ -121,15 +127,17 @@ work-lease 让 record 活过 ACCOUNTING：`InFlightRegistry` 每条持 transport
 
 1. uvicorn 停接入、排空 HTTP transport
 2. lifespan 进入后**停非请求后台 producer 但暂不关其依赖**：cancel/await IAM token refresh loop、stop watchdog 周期 loop 与 engine watcher
-3. 封闭新的 root accounting admission，但**允许已登记 accounting task 派生 child**
-4. **flush 仍持 accounting lease 的 logging queue**，让顶层 success/failure callback 真正开始并完成或进入 supervisor
+3. 封闭新的 root accounting admission，但**允许持有效 scope 的已登记 accounting task 派生 child**
+4. **`LoggingWorker.quiesce()` flush 仍持 accounting lease 的 logging queue**，让顶层 success/failure callback 真正开始并完成或进入 supervisor
 5. supervisor **fixed-point** drain（先 flush 产出 work、再排空 child，方向不可反）
-6. deadline 到期 cancel 全部 remaining + `gather(return_exceptions=True)` 等 settlement
-7. 对每条未完 record 原子写 `shutdown_dropped`、释放 remaining lease
+6. deadline 到期 **联合** cancel：**LoggingWorker 的 queue item + 运行中 processing task + retry/aggressive-clear helper + supervisor child 全部**，再 `gather(return_exceptions=True)` 等 settlement
+7. 对每条未完 record 原子写 `shutdown_dropped`、settle remaining lease
 8. stop logging worker
 9. 关 shared aiohttp（须在 callback drain 之后，不能停在现位）、prisma、redis
 
-`drain()` 返回冻结 tagged outcome：`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`——仅返回整数不足以让 teardown 判断能否安全继续。`wait_for_drain` 计数口径改为 **transport lease 数**（不含 accounting）。
+**LoggingWorker 加独立 `quiesce(deadline, admission_policy) -> LoggingDrainOutcome`，不复用 `flush()`/`stop()`**（现有 `flush()` 只 `await queue.join()`、不冻结 admission、不取消；`stop()` 的取消路径会调 `clear_queue()`，可能在 deadline 后仍执行 queued coroutine，正是 round-2 blocker 复发点）。`quiesce` 契约：关闭 proxy root logging admission（SDK 非 proxy admission 是否续由调用方决定）；正常阶段等 queue join 让已登记 item 执行；deadline 后**不再执行 queued coroutine**，而是逐项 close coroutine、settle token、`task_done`；cancel worker processing/retry/aggressive-clear 并 await settlement；**禁止取消路径再调 `clear_queue()` 执行业务 callback**；fixed-point **联合**检查 LoggingWorker 与 supervisor（不只查 supervisor）。现有 `GLOBAL_LOGGING_WORKER.flush()` 全仓仅 3 处测试调用，故普通 `flush()` 语义保持不变、只新增 proxy quiesce 路径。
+
+`drain()`/`quiesce()` 返回冻结 tagged outcome：`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`——仅返回整数不足以让 teardown 判断能否安全继续。`wait_for_drain` 计数口径改为 **transport lease 数**（不含 accounting）。
 
 ### C2. watchdog + IAM refresh + redis（Phase 1）
 
@@ -171,6 +179,9 @@ work-lease 让 record 活过 ACCOUNTING：`InFlightRegistry` 每条持 transport
 - **redis**：注入 `ConnectionError` + shutdown，断言边界返回 `AccountingSkippedDuringShutdown`、单行日志（底层不再重复 error、failure-hook 不脱离）、`async_increment` 契约不变、不重抛
 - **control-plane 排除**：`/metrics`、`/health/in-flight`、`/health/in-flight/stream`、`/health/drain`、readiness/liveness/backlog 各断言是否登记；`root_path` 部署下路径规范化；非 HTTP scope 不登记
 - **registry 并发**：同一 record 上 `set_llm_context` 与 `advance_stage` 并发，断言无 lost-update、stage 不倒退、version/sequence 单调
+- **LoggingWorker quiesce**（core）：deadline 到期后，联合断言 queue 未 dequeue item / 运行中 processing task / retry / aggressive-clear helper **全部被取消并 settle token**，且取消路径**不**再执行 queued 业务 callback（不触 DB）；fixed-point 联合 LoggingWorker + supervisor 才判空
+- **纯 SDK 无侵入**：不设 registry/`inflight_id`（`token=None`）时 enqueue/flush/stop 行为与改动前完全一致；drop/rebind/retry 路径对 None token 不崩、对非空 token 必 settle
+- **admission scope**：root admission 关闭后，持有效 `AccountingScope` 的 child 被接受、无效 scope（含 `current_inflight_id` 仍在但 parent 已完成）作新 root 被拒并 settle/close
 - **SSE**：无 credential / 普通 key / admin viewer / proxy admin 四类身份 + 自定义 auth header；慢消费/队列溢出/GET+SSE 建连竞态/断线重连/shutdown 关闭；**保持一个 SSE client 打开 + 一条长业务请求 + SIGINT，断言 SSE 自动关闭、业务请求继续被播报、不被拖到超时**
 - **uvicorn 入口**（Phase 1 必做，真 subprocess signal E2E）：direct/reload/workers=2/`limit_max_requests` 四入口；捕获日志断言顺序 `graceful_shutdown_started → Waiting for connections to close → ≥1 条带明细 drain log → 请求结束或 deadline → 记账 settled/skipped → teardown`，且**不**出现 reconnect/`ClientNotConnectedError`/redis traceback；第二次 SIGINT force-exit 生效
 
@@ -195,7 +206,8 @@ work-lease 让 record 活过 ACCOUNTING：`InFlightRegistry` 每条持 transport
 - **`ManagedTaskSet`**：抽极小共享件、组合非继承、纯标准 asyncio；不合并 LoggingWorker 与 supervisor 的高层 drain 语义（见 B）
 - **单一 deadline**：复用 `GRACEFUL_SHUTDOWN_TIMEOUT`，首次 `start_shutdown` 冻结绝对 deadline，`DrainingServer.shutdown` 前映射到 `config.timeout_graceful_shutdown`，`wait_for_drain` 只数 transport lease（见 A/C）
 
-## 待评审重点（round-3，若开）
+## round-3 待评审点裁决（已落定，评审背书可进入实施计划）
 
-- quiesce 第 3 步「封 root admission 但允许已登记 task 派生 child」的 fixed-point 判定，在「child 又派生 child」的深度链下是否收敛、有无活锁
-- `LoggingWorker.flush()` 成为 accounting drain 一环后，对非 proxy（纯 SDK）调用方的 flush 语义有无副作用
+- **fixed-point 收敛**：核对真实派生链（`_ProxyDBLogger` → `update_cache`/`_batch_database_updates` → 各 helper，深度有限、无递归重入 accounting root），显式 `admissions_in_progress` 计数 + `AccountingScope` + 单一绝对 deadline 下会收敛，无结构性活锁（见 B）
+- **`LoggingWorker` 对纯 SDK 无副作用**：`LoggingTask` 加中立可选 `CompletionToken`（SDK 传 None、行为不变），proxy 走**新增 `quiesce()`** 而非改动普通 `flush()`；全仓 `flush()` 仅 3 处测试调用（[test_openai_batches_and_files.py:55](../../../tests/batches_tests/test_openai_batches_and_files.py#L55) / [test_tpm_rpm_routing_v2.py:562](../../../tests/local_testing/test_tpm_rpm_routing_v2.py#L562) / [test_no_duplicate_spend_logs.py:116](../../../tests/test_litellm/responses/test_no_duplicate_spend_logs.py#L116)），语义保持（见 C）
+
