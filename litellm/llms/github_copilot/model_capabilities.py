@@ -4,20 +4,16 @@ from pydantic import BaseModel, TypeAdapter
 
 from litellm._logging import verbose_logger
 from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.llms.github_copilot.common_utils import get_copilot_default_headers
 
 CopilotEndpoint = Literal["messages", "responses", "chat"]
 
 
-class _HTTPResponse(Protocol):
-    status_code: int
-    text: str
-
-    def json(self) -> object: ...
-
-
-class _HTTPGetClient(Protocol):
-    def get(self, url: str, headers: "Mapping[str, str]", timeout: float) -> _HTTPResponse: ...
+class _TTLCache(Protocol):
+    def get_cache(self, key: str) -> object: ...
+    def set_cache(self, key: str, value: object, *, ttl: int) -> None: ...
+    def delete_cache(self, key: str) -> None: ...
 
 
 _ALIASES: tuple[tuple[str, CopilotEndpoint], ...] = (
@@ -52,12 +48,17 @@ class _ModelsResponse(BaseModel):
 
 
 _MODELS_ADAPTER = TypeAdapter(_ModelsResponse)
+_PAIRS_ADAPTER: "TypeAdapter[tuple[tuple[str, frozenset[CopilotEndpoint]], ...]]" = TypeAdapter(
+    tuple[tuple[str, frozenset[CopilotEndpoint]], ...]
+)
+_ENDPOINTS_ADAPTER: "TypeAdapter[tuple[str, ...]]" = TypeAdapter(tuple[str, ...])
+_INFO_ADAPTER: "TypeAdapter[Mapping[str, object]]" = TypeAdapter(Mapping[str, object])
 
 
 def fetch_endpoint_pairs(
     api_key: str,
     api_base: str,
-    client: _HTTPGetClient,
+    client: HTTPHandler,
     timeout: float = 5.0,
 ) -> "tuple[tuple[str, frozenset[CopilotEndpoint]], ...]":
     url = f"{api_base.rstrip('/')}/models"
@@ -68,13 +69,13 @@ def fetch_endpoint_pairs(
     return tuple((entry.id, normalize_endpoints(entry.supported_endpoints)) for entry in parsed.data)
 
 
-_CAP_CACHE = InMemoryCache(max_size_in_memory=64, default_ttl=300)
+_CAP_CACHE: _TTLCache = InMemoryCache(max_size_in_memory=64, default_ttl=300)
 
 
 def refresh_capabilities(
     api_key: str,
     api_base: str,
-    client: _HTTPGetClient,
+    client: HTTPHandler,
 ) -> "tuple[tuple[str, frozenset[CopilotEndpoint]], ...]":
     try:
         pairs = fetch_endpoint_pairs(api_key=api_key, api_base=api_base, client=client)
@@ -90,7 +91,12 @@ def get_cached_pairs(
     api_base: str,
 ) -> "Optional[tuple[tuple[str, frozenset[CopilotEndpoint]], ...]]":
     cached = _CAP_CACHE.get_cache(api_base)
-    return cached if isinstance(cached, tuple) else None
+    if cached is None:
+        return None
+    try:
+        return _PAIRS_ADAPTER.validate_python(cached)
+    except Exception:
+        return None
 
 
 def resolve_endpoints(
@@ -107,9 +113,13 @@ def resolve_endpoints(
             if hit:
                 return hit
     raw = model_info.get("supported_endpoints") if model_info else None
-    if isinstance(raw, (list, tuple)):
-        return normalize_endpoints(tuple(str(x) for x in raw))
-    return frozenset()
+    if raw is None:
+        return frozenset()
+    try:
+        names = _ENDPOINTS_ADAPTER.validate_python(raw)
+    except Exception:
+        return frozenset()
+    return normalize_endpoints(names)
 
 
 def forced_mode(
@@ -157,7 +167,12 @@ def raw_model_info(model: str) -> "Optional[Mapping[str, object]]":
     import litellm
 
     entry = litellm.model_cost.get(f"github_copilot/{strip_copilot_prefix(model)}")
-    return entry if isinstance(entry, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    try:
+        return _INFO_ADAPTER.validate_python(entry)
+    except Exception:
+        return None
 
 
 def copilot_api_base(explicit: Optional[str] = None) -> Optional[str]:
@@ -177,9 +192,8 @@ def refresh_default_capabilities(
     *,
     api_key: Optional[str] = None,
     api_base: Optional[str] = None,
-    client: Optional[_HTTPGetClient] = None,
+    client: Optional[HTTPHandler] = None,
 ) -> None:
-    from litellm.llms.custom_httpx.http_handler import HTTPHandler
     from litellm.llms.github_copilot.authenticator import Authenticator
 
     base = copilot_api_base(api_base)
