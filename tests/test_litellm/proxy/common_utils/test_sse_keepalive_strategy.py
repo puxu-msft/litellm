@@ -5,7 +5,10 @@ from litellm.proxy.common_utils.sse_keepalive import (
     KEEPALIVE_COMMENT,
     AnthropicKeepaliveStrategy,
     CommentOnlyKeepaliveStrategy,
+    DownstreamSSESurface,
     frame_is_anthropic_message_start,
+    needs_frame_normalizer,
+    strategy_for,
 )
 
 
@@ -44,3 +47,17 @@ def test_anthropic_observe_advances_only_on_message_start():
     s = AnthropicKeepaliveStrategy()
     assert s.observe_advances_to_phase2(b"event: message_start\ndata: {}\n\n") is True
     assert s.observe_advances_to_phase2(b"event: ping\ndata: {}\n\n") is False
+
+
+def test_strategy_for_surface():
+    assert isinstance(strategy_for(DownstreamSSESurface.ANTHROPIC), AnthropicKeepaliveStrategy)
+    assert isinstance(strategy_for(DownstreamSSESurface.OPENAI_CHAT), CommentOnlyKeepaliveStrategy)
+    assert isinstance(
+        strategy_for(DownstreamSSESurface.OPENAI_RESPONSES), CommentOnlyKeepaliveStrategy
+    )
+
+
+def test_only_anthropic_needs_normalizer():
+    assert needs_frame_normalizer(DownstreamSSESurface.ANTHROPIC) is True
+    assert needs_frame_normalizer(DownstreamSSESurface.OPENAI_CHAT) is False
+    assert needs_frame_normalizer(DownstreamSSESurface.OPENAI_RESPONSES) is False

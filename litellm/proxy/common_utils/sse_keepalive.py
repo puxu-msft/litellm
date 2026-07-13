@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from enum import Enum
 from typing import AsyncGenerator, Optional
+
+from typing_extensions import assert_never
 
 SSEFrame = str | bytes
 
@@ -146,3 +149,25 @@ async def sse_keepalive(
         yield frame
         if not seen_message_start and strategy.observe_advances_to_phase2(frame):
             seen_message_start = True
+
+
+class DownstreamSSESurface(str, Enum):
+    """Which downstream SSE wire format a streaming response speaks."""
+
+    ANTHROPIC = "anthropic"
+    OPENAI_CHAT = "openai_chat"
+    OPENAI_RESPONSES = "openai_responses"
+
+
+def strategy_for(surface: DownstreamSSESurface) -> KeepaliveStrategy:
+    match surface:
+        case DownstreamSSESurface.ANTHROPIC:
+            return AnthropicKeepaliveStrategy()
+        case DownstreamSSESurface.OPENAI_CHAT | DownstreamSSESurface.OPENAI_RESPONSES:
+            return CommentOnlyKeepaliveStrategy()
+    assert_never(surface)
+
+
+def needs_frame_normalizer(surface: DownstreamSSESurface) -> bool:
+    """Only the Anthropic native passthrough forwards raw bytes needing framing."""
+    return surface is DownstreamSSESurface.ANTHROPIC
