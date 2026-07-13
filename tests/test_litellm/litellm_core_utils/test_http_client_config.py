@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -139,3 +140,85 @@ def test_merge_http_client_config_explicit_null_in_deployment_falls_back_to_glob
     merged = merge_http_client_config(glob, deployment)
     assert merged.connect_timeout == 7.0
     assert merged.read_timeout == 2.0
+
+
+def test_resolve_http_client_timeout_no_config_uses_legacy_float():
+    from litellm.litellm_core_utils.http_client_config import resolve_http_client_timeout
+
+    resolved = resolve_http_client_timeout(None, legacy_effective_timeout=600.0)
+    assert resolved.httpx_timeout == httpx.Timeout(600.0, connect=5.0)
+    assert resolved.total_timeout is None
+
+
+def test_resolve_http_client_timeout_no_config_passes_through_legacy_httpx_timeout_unchanged():
+    from litellm.litellm_core_utils.http_client_config import resolve_http_client_timeout
+
+    legacy = httpx.Timeout(600.0, connect=10.0, read=20.0, pool=30.0)
+    resolved = resolve_http_client_timeout(None, legacy_effective_timeout=legacy)
+    assert resolved.httpx_timeout == legacy
+    assert resolved.total_timeout is None
+
+
+def test_resolve_http_client_timeout_cfg_overrides_win_over_legacy_httpx_timeout_per_axis():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    legacy = httpx.Timeout(600.0, connect=10.0, read=20.0, pool=30.0)
+    cfg = HttpClientConfig(read_timeout=99.0)
+    resolved = resolve_http_client_timeout(cfg, legacy_effective_timeout=legacy)
+    assert resolved.httpx_timeout.read == 99.0
+    assert resolved.httpx_timeout.connect == 10.0
+    assert resolved.httpx_timeout.pool == 30.0
+
+
+def test_resolve_http_client_timeout_cfg_connect_override_falls_back_to_http_handler_default_not_legacy():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    legacy = httpx.Timeout(600.0, connect=None, read=20.0, pool=30.0)
+    resolved = resolve_http_client_timeout(HttpClientConfig(), legacy_effective_timeout=legacy)
+    assert resolved.httpx_timeout.connect == 5.0
+    assert resolved.httpx_timeout.read == 20.0
+    assert resolved.httpx_timeout.pool == 30.0
+
+
+def test_resolve_http_client_timeout_preserves_legacy_zero_connect_when_cfg_leaves_it_unset():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    legacy = httpx.Timeout(600.0, connect=0.0, read=20.0, pool=30.0)
+    cfg = HttpClientConfig(read_timeout=99.0)
+    resolved = resolve_http_client_timeout(cfg, legacy_effective_timeout=legacy)
+    assert resolved.httpx_timeout.connect == 0.0
+
+
+def test_resolve_http_client_timeout_partial_config_falls_back_per_component():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    cfg = HttpClientConfig(read_timeout=15.0)
+    resolved = resolve_http_client_timeout(cfg, legacy_effective_timeout=600.0)
+    assert resolved.httpx_timeout.read == 15.0
+    assert resolved.httpx_timeout.connect == 5.0
+    assert resolved.httpx_timeout.pool == 600.0
+    assert resolved.total_timeout is None
+
+
+def test_resolve_http_client_timeout_carries_total_timeout_through():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    cfg = HttpClientConfig(total_timeout=45.0)
+    resolved = resolve_http_client_timeout(cfg, legacy_effective_timeout=600.0)
+    assert resolved.total_timeout == 45.0
+    assert resolved.httpx_timeout.connect == 5.0

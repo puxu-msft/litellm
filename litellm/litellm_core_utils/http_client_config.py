@@ -2,9 +2,13 @@
 timeouts, HTTP/2 reservation). See docs/superpowers/specs/2026-07-13-upstream-http-client-config-design.md.
 """
 
+from dataclasses import dataclass
 from typing import Optional, TypedDict, Union
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
+
+from litellm.constants import HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS
 
 
 class HttpClientConfig(BaseModel):
@@ -69,3 +73,54 @@ def merge_http_client_config(
         else {}
     )
     return HttpClientConfig(**{**base_values, **override_values})
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedHttpClientTimeout:
+    httpx_timeout: httpx.Timeout
+    total_timeout: Optional[float]
+
+
+def resolve_http_client_timeout(
+    cfg: Optional[HttpClientConfig],
+    legacy_effective_timeout: Union[float, httpx.Timeout],
+) -> ResolvedHttpClientTimeout:
+    """Resolve a validated HttpClientConfig (or None) plus the caller's face-specific legacy
+    timeout into a concrete httpx.Timeout plus an optional absolute total_timeout.
+
+    Two-mode contract (review finding A): when `cfg` is None this is a pure passthrough -- an
+    already-constructed legacy httpx.Timeout is returned unmodified (same object), and a bare
+    legacy float is materialized into an httpx.Timeout using the connect-default constant. When
+    `cfg` is non-None, every axis is merged with `is not None` checks (never `or`): a field cfg
+    sets wins on its own axis; an axis cfg leaves unset falls back to legacy's own value for
+    that axis. `total_timeout` is only ever populated from cfg."""
+    if cfg is None:
+        if isinstance(legacy_effective_timeout, httpx.Timeout):
+            return ResolvedHttpClientTimeout(httpx_timeout=legacy_effective_timeout, total_timeout=None)
+        return ResolvedHttpClientTimeout(
+            httpx_timeout=httpx.Timeout(legacy_effective_timeout, connect=HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS),
+            total_timeout=None,
+        )
+
+    if isinstance(legacy_effective_timeout, httpx.Timeout):
+        legacy_connect = legacy_effective_timeout.connect
+        legacy_read = legacy_effective_timeout.read
+        legacy_pool = legacy_effective_timeout.pool
+        legacy_write = legacy_effective_timeout.write
+    else:
+        legacy_connect = None
+        legacy_read = legacy_effective_timeout
+        legacy_pool = legacy_effective_timeout
+        legacy_write = legacy_effective_timeout
+
+    connect = (
+        cfg.connect_timeout
+        if cfg.connect_timeout is not None
+        else (legacy_connect if legacy_connect is not None else HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS)
+    )
+    read = cfg.read_timeout if cfg.read_timeout is not None else legacy_read
+    pool = cfg.pool_timeout if cfg.pool_timeout is not None else legacy_pool
+    return ResolvedHttpClientTimeout(
+        httpx_timeout=httpx.Timeout(legacy_write, connect=connect, read=read, pool=pool),
+        total_timeout=cfg.total_timeout,
+    )
