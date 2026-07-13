@@ -212,8 +212,14 @@ model_list:
 
 ## PoC（进 plan 前）
 
-- **Claude Code 超时类型（门禁）**：真实 E2E——上游首字节延迟超原失败阈值，确认无 keepalive 断开、启用后成功；固定 total deadline 对照确认不在承诺内。**结果写回 spec 再进 plan**
-- **面 1 原生 ping 兼容**（非门禁，默认只发注释）：验证「message_start 前发 `event: ping`」是否被 Claude Code 接受；安全则面 1 可升级注释 + ping
+**已执行,结论:read/idle 型,功能成立**（`exp/downstream-keepalive-timeout/`,锁定版源码核对 + `probe.py` 实测 `PASS`）:
+
+- httpx 无 `total` 轴,`read` 是 inactivity 型,任意字节重置
+- Claude Code `2.1.207` 用内嵌 TS SDK + Fetch(非 Python SDK),结论一致:无「持续收字节仍按请求起点强制终止 body」的固定 total deadline
+- 两计时器:`API_TIMEOUT_MS`(默认 600s,等响应头,头返回即清除 → **面 1**)+ `API_FORCE_IDLE_TIMEOUT`(默认 300s,body 空闲 watchdog,收字节即重置 → **面 2**)。**直接验证面 1 必要性**:body 保活救不了尚未返回响应头阶段的 `API_TIMEOUT_MS`,必须尽早发响应头
+- 15s 默认 interval 舒适低于 300s/600s 及中间代理常见 60s idle 超时
+- **未覆盖**:部署链路 ingress/LB/NAT 若另设固定绝对 deadline,保活绕不过(记 BACKLOG)
+- **面 1 原生 ping 兼容**（非门禁,默认只发注释）：验证「message_start 前发 `event: ping`」是否被 Claude Code 接受；安全则面 1 可升级注释 + ping
 
 ## 测试（能被 mutate 时失败，>90% kill）
 
