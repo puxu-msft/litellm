@@ -177,3 +177,22 @@ def test_route_unset_mode_uses_endpoints():
     mc._CAP_CACHE.set_cache("https://b", (("gpt-5.5", frozenset({"responses"})),), ttl=300)
     assert mc.route_supports_responses("gpt-5.5", model_info={}, api_base="https://b") is True
     assert mc.route_supports_messages("gpt-5.5", model_info={}, api_base="https://b") is False
+
+
+def test_refresh_default_capabilities_di_writes_cache():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    client = _FakeClient(_FakeResp(200, _MODELS_PAYLOAD))
+    mc.refresh_default_capabilities(api_key="k", api_base="https://b", client=client)
+    cached = mc.get_cached_pairs("https://b")
+    assert cached is not None
+    assert dict(cached)["gpt-5.5"] == frozenset({"responses"})
+
+
+def test_refresh_default_capabilities_no_base_is_noop():
+    import litellm.llms.github_copilot.model_capabilities as mc
+
+    mc._CAP_CACHE.flush_cache()
+    mc.refresh_default_capabilities(api_key="k", api_base=None, client=_FakeClient(_FakeResp(200, _MODELS_PAYLOAD)))
+    assert mc.get_cached_pairs("https://b") is None

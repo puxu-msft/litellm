@@ -1044,6 +1044,18 @@ async def proxy_startup_event(app: FastAPI):
             _ar._state_loaded = True
     asyncio.create_task(_adaptive_router_flusher_loop())
 
+    _copilot_configured = llm_router is not None and any(
+        isinstance(d.get("litellm_params"), dict)
+        and str(d["litellm_params"].get("model", "")).startswith("github_copilot/")
+        for d in (llm_router.get_model_list() or ())
+    )
+    if _copilot_configured:
+        from litellm.llms.github_copilot.model_capabilities import (
+            periodic_capability_refresh_loop,
+        )
+
+        asyncio.create_task(periodic_capability_refresh_loop())
+
     ## [Optional] Initialize dd tracer
     ProxyStartupEvent._init_dd_tracer()
 

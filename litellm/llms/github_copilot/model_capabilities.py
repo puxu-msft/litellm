@@ -150,3 +150,49 @@ def route_supports_responses(
     if mode in ("chat", "anthropic"):
         return False
     return "responses" in resolve_endpoints(model, model_info=model_info, api_base=api_base)
+
+
+def copilot_api_base(explicit: Optional[str] = None) -> Optional[str]:
+    from litellm.llms.github_copilot.authenticator import Authenticator
+
+    if explicit:
+        return explicit.rstrip("/")
+    try:
+        base = Authenticator().get_api_base()
+    except Exception as e:
+        verbose_logger.debug("github_copilot copilot_api_base failed: %s", e)
+        return None
+    return base.rstrip("/") if base else None
+
+
+def refresh_default_capabilities(
+    *,
+    api_key: Optional[str] = None,
+    api_base: Optional[str] = None,
+    client: Optional[_HTTPGetClient] = None,
+) -> None:
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+    from litellm.llms.github_copilot.authenticator import Authenticator
+
+    base = copilot_api_base(api_base)
+    if base is None:
+        return
+    key = api_key
+    if key is None:
+        try:
+            key = Authenticator().get_api_key()
+        except Exception as e:
+            verbose_logger.debug("github_copilot refresh_default_capabilities: no api key (%s)", e)
+            return
+    refresh_capabilities(key, base, client if client is not None else HTTPHandler())
+
+
+async def periodic_capability_refresh_loop(interval_seconds: float = 300.0) -> None:
+    import asyncio
+
+    while True:
+        try:
+            refresh_default_capabilities()
+        except Exception as e:
+            verbose_logger.debug("github_copilot periodic refresh error: %s", e)
+        await asyncio.sleep(interval_seconds)
