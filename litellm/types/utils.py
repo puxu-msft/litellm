@@ -3139,6 +3139,7 @@ all_litellm_params = (
         "no-log",
         "base_model",
         "stream_timeout",
+        "http_client",
         "supports_system_message",
         "region_name",
         "allowed_model_region",

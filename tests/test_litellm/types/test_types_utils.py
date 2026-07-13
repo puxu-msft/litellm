@@ -416,3 +416,10 @@ def test_message_accepts_thinking_block_with_null_signature():
     )
     assert choice.message.thinking_blocks is not None
     assert choice.message.thinking_blocks[0]["signature"] is None
+
+
+def test_http_client_excluded_from_non_default_completion_params():
+    from litellm.utils import get_non_default_completion_params
+
+    kwargs = {"model": "gpt-4", "messages": [], "http_client": {"connect_timeout": 1.0}}
+    assert "http_client" not in get_non_default_completion_params(kwargs)
