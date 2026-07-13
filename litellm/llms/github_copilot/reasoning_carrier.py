@@ -10,6 +10,7 @@ next request.
 This module is pure: no litellm request/response machinery. Failures are modeled
 as values via the ``DecodeResult`` tagged union rather than raised.
 """
+
 from __future__ import annotations
 
 import base64
@@ -55,7 +56,8 @@ class UnsupportedCarrierVersion:
 DecodeResult = Union[DecodedCarrier, NotOurCarrier, InvalidCarrier, UnsupportedCarrierVersion]
 
 
-def _serialize(env: ReasoningReplayEnvelope) -> str:
+def serialize_envelope(env: ReasoningReplayEnvelope) -> str:
+    """Serialize an envelope into the ``ghc-rsn:v<N>:<b64(json)>`` carrier token."""
     payload = {
         "id": env.reasoning_item_id,
         "ec": env.encrypted_content,
@@ -79,7 +81,7 @@ def encode_carrier(env: ReasoningReplayEnvelope, carrier: _Carrier) -> tuple[dic
     carrying the envelope in ``data``, preceded by a display ``thinking`` block
     when a summary is present (two independent content blocks).
     """
-    token = _serialize(env)
+    token = serialize_envelope(env)
     summary = _summary_text(env)
     if carrier == "signature":
         return ({"type": "thinking", "thinking": summary, "signature": token},)

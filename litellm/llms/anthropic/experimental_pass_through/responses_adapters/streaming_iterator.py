@@ -3,10 +3,49 @@
 import json
 import traceback
 from collections import deque
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Union
 
 from litellm import verbose_logger
 from litellm._uuid import uuid
+
+
+def _poc_reasoning_signature_delta(item: Any, block_idx: int) -> Union[Dict[str, Any], None]:
+    """PoC (behind ``GHC_REASONING_POC=1``): build a ``signature_delta`` carrying
+    the reasoning replay envelope for a completed reasoning item.
+
+    Returns None when the flag is off or the item is not a reasoning item, so the
+    normal path is completely unchanged. This is the streaming instrumentation for
+    spec block 1 phase 0 (the path a real Claude Code gpt session hits).
+    """
+    import os
+
+    if os.environ.get("GHC_REASONING_POC") != "1" or item is None:
+        return None
+    item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+    if item_type != "reasoning":
+        return None
+
+    from litellm.llms.github_copilot.reasoning_carrier import (
+        ReasoningReplayEnvelope,
+        serialize_envelope,
+    )
+
+    def _get(obj: Any, key: str) -> Any:
+        return getattr(obj, key, None) or (obj.get(key) if isinstance(obj, dict) else None)
+
+    summary_raw = _get(item, "summary") or ()
+    summary_parts = tuple(t for t in (_get(s, "text") or "" for s in summary_raw) if t)
+    env = ReasoningReplayEnvelope(
+        reasoning_item_id=_get(item, "id") or "",
+        encrypted_content=_get(item, "encrypted_content") or "",
+        summary_parts=summary_parts,
+        origin_model=None,
+    )
+    return {
+        "type": "content_block_delta",
+        "index": block_idx,
+        "delta": {"type": "signature_delta", "signature": serialize_envelope(env)},
+    }
 
 
 class AnthropicResponsesStreamWrapper:
@@ -207,6 +246,9 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
+            poc_delta = _poc_reasoning_signature_delta(item, block_idx)
+            if poc_delta is not None:
+                self._chunk_queue.append(poc_delta)
             self._chunk_queue.append(
                 {
                     "type": "content_block_stop",
