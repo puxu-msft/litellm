@@ -1,6 +1,6 @@
 # GPT reasoning ↔ Anthropic thinking 全保真转换 · 设计/规格
 
-状态: **草案 v2（已吸收 2026-07-14 GPT 对抗评审的 2 blocker + 8 major + 3 minor），待评审**
+状态: **草案 v3（已吸收 GPT 对抗评审两轮: 轮1 的 2 blocker + 8 major + 3 minor、轮2 的 4 major + 2 minor 全部冻结），待你终审**
 日期: 2026-07-14
 范围: Anthropic ↔ GPT 全保真格式转换的 **block 1**（reasoning↔thinking）。block 2/3/4 见 `docs/BACKLOG.md`。
 适用: 私有 fork 的 `github_copilot` provider，gpt-* 模型经 `/v1/messages` 路由到 Responses API。
@@ -37,6 +37,8 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 
 - 协议信封问题（block 2），除非双 `message_start` 经 phase 0 证实会阻断 block 1（见 §7、§9-R）。
 - 工具保真（block 3）、流式畸形主动改写（block 4）、claude 路 `fix_thinking`。
+- **强制 chat bridge 路径**（`litellm.use_chat_completions_url_for_anthropic_messages=True`，[handler.py:61-65](litellm/llms/anthropic/experimental_pass_through/messages/handler.py#L61-L65)）**不承诺全保真**: 该开关关闭 direct Responses 路由、退回 chat bridge 时，carrier **不发射**、退化为当前行为，并打一条可观测 warning（`reasoning fidelity disabled: forced chat bridge`）。全保真只保证 direct Responses route。
+- **per-request 覆盖**（top-level `reasoning_carrier`/`reasoning_summary` 直接进 `/v1/messages` 请求体）不在 block 1，延后（见 §4.5）。
 
 ### 术语澄清（评审 #12）
 
@@ -44,7 +46,7 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 
 ## 3. 验收标准（可测）
 
-1. **响应侧可见**: 触发 reasoning 的 gpt 流式请求，客户端收到的 thinking 块含非空 `thinking` 文本（=summary）与非空 carrier，不再空壳。
+1. **响应侧可见**: 触发 reasoning 的 gpt 流式请求，客户端收到的 thinking 块: 当 `reasoning_summary ∈ {auto,concise,detailed}` 时含**非空** `thinking` 文本（=summary）且 carrier 非空; 当 `reasoning_summary=off` 时允许无 thinking 文本，但 carrier **必须非空且跨轮精确回放**（评审 v2-#6）。两种都不再是「空壳且无 carrier」。
 2. **envelope 往返精确**: carrier decode 出的 `id`/`encrypted_content`/`summary` 与响应侧 encode 进去的**逐字节一致**（单测）。仅保 encrypted_content、丢 id 视为不达标。
 3. **跨轮连续性**: 两轮真实 gpt 会话，第二轮请求侧把回放 carrier 还原成**带原始 id** 的 Responses reasoning item、后端 200 接受（live）。
 4. **配置切换**: `reasoning_carrier` 切 A/B，响应产对应块、请求对应 decode，往返测试通过。
@@ -60,7 +62,7 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 
 **carrier codec**（两实现，配置选）: 把 envelope 序列化进 Anthropic 块字段:
 - A（`signature`）: `thinking{thinking: summary_text, signature: NS(envelope)}`。
-- B（`redacted_thinking`）: `redacted_thinking{data: NS(envelope)}`; 若有 summary，并排一个 `thinking{thinking: summary_text}` **展示块**。
+- B（`redacted_thinking`）: **两个独立 content block**——若有 summary，先一个 `thinking{thinking: summary_text}` **展示块**，再一个独立 `redacted_thinking{data: NS(envelope)}` **载体块**; 无 summary 则只发 redacted 载体块。`redacted_thinking` 的 `data` 只能出现在它自己的 `content_block_start` 里，不能作为 delta 注入已打开的 thinking 块（评审 v2-新1，见 §4.2 流式序列）。
 - `NS(...)` = 命名空间化、版本化、带必填校验（可选 checksum）的编码，**非**「前缀 + 裸 base64」（评审 #11）。
 
 **block renderer**: 把 codec 产物拼成 Anthropic content 块 / 流式 SSE 事件序列。
@@ -72,7 +74,10 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 ### 4.2 响应侧（gpt → Claude Code）· direct adapter
 
 - **非流式** [responses_adapters/transformation.py:~392-491](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py)（丢失点 410-420）: 对 `ResponseReasoningItem`，用 `item.id`/`item.encrypted_content`/`item.summary` 构 envelope → codec/renderer 产 carrier 块，替换现在的空壳。
-- **流式** [responses_adapters/streaming_iterator.py:~67-276](litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py): `output_item.added` 开 thinking 块、`reasoning_summary_text.delta*` 发 summary 文本、**`output_item.done` 时先发 `signature_delta`（A）或发 `redacted_thinking`（B）再 `content_block_stop`**——因为 `encrypted_content` 在 `output_item.done` 才齐（评审 #3、#8）。注意 affinity `litellm_enc:` 包装发生在 [responses/streaming_iterator.py:198-219](litellm/responses/streaming_iterator.py#L198-L219)，envelope 要搬**包装后**上游实际给的 encrypted_content 值。
+- **流式** [responses_adapters/streaming_iterator.py:~67-276](litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py): `encrypted_content` 在 `output_item.done` 才齐（评审 #3、#8），故冻结每载体的完整 SSE 序列与 index 递增:
+  - **A**: `content_block_start(thinking)@i` → `reasoning_summary_text.delta*` 映射为 thinking 文本 delta → `output_item.done` 时发 `signature_delta`（signature = NS(envelope)）→ `content_block_stop@i`。单块。
+  - **B**: 若有 summary，先 `content_block_start(thinking)@i` → summary delta* → `content_block_stop@i`; 再**新起** `content_block_start(redacted_thinking, data=NS(envelope))@i+1` → `content_block_stop@i+1`（data 在 start 事件里，无 delta）。无 summary 则只发 redacted 块（占一个 index）。后续块 index 相应顺延。
+  - 参照既有 thinking+signature_delta 机制 [agentic_streaming_iterator.py:59-102](litellm/llms/anthropic/experimental_pass_through/messages/agentic_streaming_iterator.py#L59-L102)。注意 affinity `litellm_enc:` 包装在 [responses/streaming_iterator.py:198-219](litellm/responses/streaming_iterator.py#L198-L219)，envelope 搬**包装后**上游实际给的 encrypted_content 值。
 
 ### 4.3 请求侧（Claude Code → gpt）· direct adapter
 
@@ -81,23 +86,26 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 - 识别到的 carrier 块 → **只**生成 Responses `reasoning` item（`id`+`encrypted_content`+`summary` 从 envelope 还原），**不生成 `output_text`**。
 - B 版与 carrier 配对的 summary thinking 块是**展示副本**，也不生成 `output_text`（消费/去重，评审 #4）。
 - 多 reasoning item / 多 summary part / reasoning 与 tool call 交错时，保持原始 item 顺序。
-- 未识别的真 claude thinking（`NotOurCarrier`）当前目标为 gpt 时的处置（丢弃/转文本/保留）**须明确定义并测试**。
+- **未识别的真 claude thinking（`NotOurCarrier`）当前目标为 gpt 时: 冻结为「丢弃该块 + 观测计数」**（评审 v2-新4）。三样例都丢: 有文本 thinking、空 thinking、纯 redacted_thinking。理由: claude 的不透明推理无有效 gpt reasoning-item 表示，且 assistant 的**实际回复文本另在 text 块**、丢 thinking 不损用户可见内容; 这正是正常跨模型会话里 gpt 看前序 assistant 轮的样子（不含他模型内部推理）。**未采纳**「降级为 output_text」——那会把他模型内部推理当可见 assistant 文本注入、污染 gpt 上下文。
 
 ### 4.4 Responses 请求补 summary
 
 落点 [responses_adapters/transformation.py:~250-284](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L250-L284) + [handler.py:~22-113](litellm/llms/anthropic/experimental_pass_through/responses_adapters/handler.py)（**不是** `github_copilot/responses/transformation.py`，评审 #6）。两层枚举:
 - 部署配置 `reasoning_summary: off | auto | concise | detailed`。
 - wire 映射: `off -> 省略 summary 字段`; 其余原样进 `reasoning.summary`（wire 合法值只有 `auto|concise|detailed`，无 `off`）。
-- 与现有 `litellm.reasoning_auto_summary` 的**优先级/兼容/弃用**须明确，避免同一请求被两机制双重覆盖。
+- **冻结优先级**（评审 v2-新2，block 1 direct `/v1/messages` 路径）: ①deployment resolved config `reasoning_summary`（控制项）> ②global `litellm.reasoning_auto_summary=True` 映射为 `detailed`（deployment 未设时的回退）> ③默认 `auto`。
+- 现有 per-request alias `reasoning_summary`/`reasoningSummary`（[utils.py:9157-9190](litellm/utils.py#L9157-L9190)、[main.py:5310-5343](litellm/main.py#L5310-L5343)）是 chat surface 的机制; block 1 在 `/v1/messages` **不支持**它作为控制项——若出现则忽略（文档说明），per-request 覆盖延后（§4.5、BACKLOG）。避免两 surface 语义分叉。
 
 ### 4.5 配置解析与传播合同（评审 #7）
 
-现状: `_ADAPTER` 是 module-global 实例，`translate_response()` 只收 response，`AnthropicResponsesStreamWrapper` 只收 stream+model——**没有配置参数入口**。故不能只说「走已有通道」。冻结:
+现状: `_ADAPTER` 是 module-global 实例，`translate_response()` 只收 response，`AnthropicResponsesStreamWrapper` 只收 stream+model——**没有配置参数入口**。故不能只说「走已有通道」。**冻结如下**（评审 v2-新3）:
 
-- 字段位置: `model_info`（extra 允许）还是 `litellm_params`——实现时二选一并固定; deployment `model_info` 已由 [handler.py:~495-533](litellm/llms/anthropic/experimental_pass_through/messages/handler.py) 读到，可承载。
-- 优先级: global < model group < deployment < per-request; null/unset 语义明确。
-- 非 github_copilot provider: 忽略（不报错）。
-- 解析失败: tagged error。
+- **字段位置**: deployment `model_info` 下的命名空间键 `github_copilot_reasoning: {carrier, summary}`。选 `model_info` 而非 `litellm_params`: 它是**元数据**、不是会被转发进 provider 请求体的调用参数，已由 [handler.py:~495-533](litellm/llms/anthropic/experimental_pass_through/messages/handler.py) 按 deployment 读到，且 `ModelInfo` 允许 extra 字段（[types/router.py:124-155](litellm/types/router.py#L124-L155)）。
+- **入口与优先级**: deployment `model_info` config > 全局内置默认（`carrier="signature"`, `summary="auto"`）。model group 经 alias 指向的 deployment 的 `model_info` 承载（同机制，无独立 group 层）。**per-request 覆盖 block 1 不支持**（延后），从而彻底规避 top-level 未注册参数泄漏进 copilot `extra_body` 的风险（[types/utils.py:3054-3072](litellm/types/utils.py#L3054-L3072)）。
+- **null/unset**: deployment 未设 → 继承全局默认。
+- **unknown 值**: `InvalidConfig` tagged error，resolve 时**fail loud**，不静默回退。
+- **非 github_copilot provider**: resolver 返回 no-op 默认，忽略。
+- **防泄漏**: config 只经 model_info 读取、产出 frozen config，**绝不注入** Responses 请求体。
 - 用 **frozen dataclass/Pydantic** 表示 resolved config，**同时**传入 request adapter、non-stream response adapter、stream wrapper（需新增 plumbing，不再传裸 `dict[str, Any]`）。
 
 ### 4.6 跨模型矩阵（评审 #5，新增）
@@ -105,7 +113,7 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 | 历史 origin | 当前目标 | 要求 |
 |---|---|---|
 | claude-origin | claude | 原样透传（现状） |
-| claude-origin | gpt | 真 claude 签名无我们 NS → `NotOurCarrier` → 按 §4.3 未识别处置 |
+| claude-origin | gpt | 真 claude 签名无我们 NS → `NotOurCarrier` → **丢弃该 thinking 块 + 观测**（§4.3 冻结） |
 | gpt-origin | gpt | carrier decode → 重建 reasoning item（核心正路） |
 | **gpt-origin** | **claude** | **进入原生 Anthropic 路由前，剥离/降级私有 carrier**——绝不把伪签名发往 Claude 后端（否则 400）。若保 summary 可见，降级为普通 text，且不把伪 thinking 块留在 latest assistant message |
 
@@ -161,3 +169,11 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 ## 10. 评审吸收记录（2026-07-14 GPT 对抗评审）
 
 代码核实的 2 blocker + 8 major + 3 minor 全部吸收（见 v2 变更提要与各节内嵌）。本人复核关键 blocker: [handler.py:532](litellm/llms/anthropic/experimental_pass_through/messages/handler.py#L532) 确走 `LiteLLMMessagesToResponsesAPIHandler`; [responses_adapters/transformation.py:410-420](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L410-L420) 确只用 summary、丢 id/encrypted_content。**未采纳/降级**: 无——评审均为事实性或与用户价值一致的加固，全采。评审建议的 encode 三层拆分采纳但保持最小（A/B 两真实消费者）。
+
+**轮2 复审（v2→v3）**: 0 blocker（两 blocker 确认 resolved），提出 4 major + 2 minor，均为「spec 把公开行为/配置合同留成实现时再定」+ 一个 B 流式序列技术错误。全部冻结:
+1. B 流式序列改为**两个独立 content block**（summary thinking 块 + 独立 redacted_thinking 载体块），§4.1/§4.2 已改（原写法把 redacted 注入已开 thinking 块，Anthropic 无此事件）。
+2. `NotOurCarrier`（claude-origin→gpt）冻结为**丢弃 + 观测**，§4.3；未采纳「降级 output_text」（污染上下文）。
+3. 配置字段位置冻结为 deployment `model_info.github_copilot_reasoning`、per-request 延后、unknown→InvalidConfig fail loud、防泄漏，§4.5。
+4. `reasoning_summary` 优先级冻结（deployment > global auto_summary > 默认 auto），既有 per-request alias 在 `/v1/messages` 不支持，§4.4。
+5. 验收标准 1 改为区分 `off`（允许无文本、carrier 必非空），§3。
+6. 强制 chat bridge 明确列为**非目标**（不发 carrier + warning），§2。
