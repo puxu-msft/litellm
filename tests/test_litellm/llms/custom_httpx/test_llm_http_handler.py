@@ -1364,3 +1364,20 @@ async def test_realtime_backend_open_does_not_retry_auth_failure(rejection):
         await BaseLLMHTTPHandler._open_realtime_backend_ws(fake, "wss://backend.example/live", {}, None)
 
     assert fake.attempts == 1
+
+
+def test_handle_error_reraises_deadline_exceeded_without_wrapping():
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+
+    handler = BaseLLMHTTPHandler()
+    original = DeadlineExceeded("simulated")
+
+    with pytest.raises(DeadlineExceeded) as exc_info:
+        handler._handle_error(e=original, provider_config=MagicMock())
+
+    assert exc_info.value is original
