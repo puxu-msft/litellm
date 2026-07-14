@@ -4274,11 +4274,14 @@ class PrismaClient:
         (scheduled as a task).
 
         ``term_signal`` is the signal that terminated the engine, when known
-        (only the waitpid detector can read it). A SIGINT/SIGTERM there means the
-        engine was killed by the same shutdown signal that hit the process group,
-        which the decision uses to suppress the reconnect deterministically --
-        without depending on the shutdown flag being set in time (under a local
-        Ctrl+C the flag lands ~200ms after the engine already died).
+        (only the waitpid detector can read it). A SIGINT there means the engine
+        was killed by the terminal's Ctrl+C to the process group, which the
+        decision uses to suppress the reconnect deterministically -- without
+        depending on the shutdown flag being set in time (under a local Ctrl+C
+        the flag lands ~200ms after the engine already died). SIGTERM is not
+        deterministic (see ``_reconnect_after_engine_death``): it suppresses only
+        when the shutdown flag is also set, so an individually-killed engine on a
+        healthy proxy still reconnects.
         """
         if self._engine_confirmed_dead or dead_pid != self._engine_pid:
             return
