@@ -964,7 +964,9 @@ def run_server(
                 ) from e
         else:
             try:
-                import uvicorn
+                from litellm.proxy.shutdown.uvicorn_runner import (
+                    run_uvicorn_with_draining_server,
+                )
             except Exception:
                 raise ImportError("uvicorn, gunicorn needs to be imported. Run - `pip install 'litellm[proxy]'`")
 
@@ -1261,8 +1263,8 @@ def run_server(
             if reload:
                 ProxyInitializationHelpers._configure_dev_reload(uvicorn_args, config)
 
-            uvicorn.run(
-                **uvicorn_args,
+            run_uvicorn_with_draining_server(
+                uvicorn_args,
                 workers=num_workers,
             )
         elif run_gunicorn is True:
