@@ -32,6 +32,37 @@ from litellm.types.llms.anthropic_messages.anthropic_response import (
 from litellm.types.llms.openai import ResponsesAPIResponse
 
 
+def _poc_reasoning_enabled() -> bool:
+    import os
+
+    return os.environ.get("GHC_REASONING_POC") == "1"
+
+
+def _poc_reasoning_input_item(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Behind ``GHC_REASONING_POC``: decode a carrier thinking/redacted_thinking
+    block into a Responses ``reasoning`` input item (original id + encrypted_content),
+    so gpt regains its reasoning state across turns.
+
+    Returns None when the flag is off or the block is not our carrier -- the caller
+    then drops it for the gpt/Responses target instead of leaking another model's
+    reasoning as assistant output_text (spec block 1 §4.3/§4.6).
+    """
+    if not _poc_reasoning_enabled():
+        return None
+    from litellm.llms.github_copilot.reasoning_carrier import DecodedCarrier, decode_carrier
+
+    result = decode_carrier(block)
+    if not isinstance(result, DecodedCarrier):
+        return None
+    env = result.envelope
+    return {
+        "type": "reasoning",
+        "id": env.reasoning_item_id,
+        "encrypted_content": env.encrypted_content,
+        "summary": [{"type": "summary_text", "text": s} for s in env.summary_parts],
+    }
+
+
 class LiteLLMAnthropicToResponsesAPIAdapter:
     """
     Converts Anthropic /v1/messages requests to OpenAI Responses API format and
@@ -158,10 +189,21 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                                     "arguments": json.dumps(block.get("input", {})),
                                 }
                             )
-                        elif btype == "thinking":
-                            thinking_text = block.get("thinking", "")
-                            if thinking_text:
-                                asst_parts.append({"type": "output_text", "text": thinking_text})
+                        elif btype in ("thinking", "redacted_thinking"):
+                            reasoning_item = _poc_reasoning_input_item(block)
+                            if reasoning_item is not None:
+                                # reconstruct the Responses reasoning item (top-level),
+                                # carrying the original id + encrypted_content back to gpt
+                                input_items.append(reasoning_item)
+                            elif _poc_reasoning_enabled():
+                                # flag on but not our carrier (real Claude thinking / invalid)
+                                # -> drop for the gpt target; never leak another model's
+                                # reasoning as assistant output_text (spec §4.3/§4.6)
+                                pass
+                            elif btype == "thinking":
+                                thinking_text = block.get("thinking", "")
+                                if thinking_text:
+                                    asst_parts.append({"type": "output_text", "text": thinking_text})
                     if asst_parts:
                         input_items.append(
                             {

@@ -129,3 +129,64 @@ def test_malformed_summary_does_not_crash_and_still_carries(monkeypatch):
     res = decode_carrier({"type": "thinking", "thinking": "", "signature": sig[0]["delta"]["signature"]})
     assert isinstance(res, DecodedCarrier)
     assert res.envelope.summary_parts == ()
+
+
+# ---- Phase 4: request-side carrier -> Responses reasoning item ----
+import json  # noqa: E402
+
+from litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation import (  # noqa: E402
+    LiteLLMAnthropicToResponsesAPIAdapter,
+)
+from litellm.llms.github_copilot.reasoning_carrier import (  # noqa: E402
+    ReasoningReplayEnvelope,
+    encode_carrier,
+)
+
+_ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
+
+
+def _carrier_block(item_id="rs_r", ec="ENC-REPLAY==", summary=("think a",)):
+    env = ReasoningReplayEnvelope(item_id, ec, summary, "gpt-5.6-sol")
+    (block,) = encode_carrier(env, "signature")
+    return block, env
+
+
+def test_request_side_carrier_becomes_reasoning_item(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    block, env = _carrier_block()
+    msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [block, {"type": "text", "text": "answer"}]},
+        {"role": "user", "content": "follow up"},
+    ]
+    items = _ADAPTER.translate_messages_to_responses_input(msgs)
+    reasoning = [it for it in items if it.get("type") == "reasoning"]
+    assert len(reasoning) == 1
+    r = reasoning[0]
+    assert r["id"] == env.reasoning_item_id
+    assert r["encrypted_content"] == env.encrypted_content
+    assert r["summary"] == [{"type": "summary_text", "text": "think a"}]
+    # the reconstructed reasoning item must precede the assistant answer message
+    types = [it.get("type") for it in items]
+    assert types.index("reasoning") < types.index("message", types.index("reasoning"))
+    # the real answer survives
+    assert "answer" in json.dumps(items)
+
+
+def test_request_side_real_claude_thinking_dropped_for_gpt(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    claude_block = {"type": "thinking", "thinking": "claude internal reasoning", "signature": "EqoBrealclaudesig=="}
+    msgs = [{"role": "assistant", "content": [claude_block, {"type": "text", "text": "hi"}]}]
+    items = _ADAPTER.translate_messages_to_responses_input(msgs)
+    assert not any(it.get("type") == "reasoning" for it in items)
+    joined = json.dumps(items)
+    assert "claude internal reasoning" not in joined  # dropped, not leaked as output_text
+    assert "hi" in joined  # the actual answer survives
+
+
+def test_request_side_flag_off_no_reasoning_item(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_POC", raising=False)
+    block, _ = _carrier_block()
+    msgs = [{"role": "assistant", "content": [block]}]
+    items = _ADAPTER.translate_messages_to_responses_input(msgs)
+    assert not any(it.get("type") == "reasoning" for it in items)
