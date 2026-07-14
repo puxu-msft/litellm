@@ -25,6 +25,7 @@ from litellm.completion_extras.litellm_responses_transformation.transformation i
 )
 from litellm.constants import request_timeout
 from litellm.litellm_core_utils.asyncify import run_async_function
+from litellm.litellm_core_utils.http_client_config import establish_request_deadline
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     update_responses_input_with_model_file_ids,
@@ -462,6 +463,11 @@ async def aresponses(
         # can apply them to local_vars without re-invoking the hook.
         #########################################################
         litellm_logging_obj = kwargs.get("litellm_logging_obj", None)
+        assert litellm_logging_obj is not None, (
+            "aresponses() is always wrapped by litellm.utils.client's wrapper_async, which "
+            "asserts logging_obj is not None and injects it into kwargs before this point runs"
+        )
+        litellm_logging_obj.set_http_client_deadline(establish_request_deadline(kwargs, now=loop.time))
         prompt_id = cast(Optional[str], kwargs.get("prompt_id", None))
         prompt_variables = cast(Optional[dict], kwargs.get("prompt_variables", None))
         original_model = model
