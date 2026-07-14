@@ -28,9 +28,14 @@ import litellm.types
 import litellm.types.utils
 from litellm._logging import _redact_string, verbose_logger
 from litellm.anthropic_beta_headers_manager import update_headers_with_filtered_beta
-from litellm.constants import REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
+from litellm.constants import DEFAULT_REQUEST_TIMEOUT_SECONDS, REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
 from litellm.litellm_core_utils.asyncify import run_async_function
 from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+from litellm.litellm_core_utils.http_client_config import (
+    merge_http_client_config,
+    parse_http_client_config,
+    resolve_http_client_timeout,
+)
 from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
 from litellm.llms.base_llm.anthropic_messages.transformation import (
@@ -2508,10 +2513,16 @@ class BaseLLMHTTPHandler:
         else:
             async_httpx_client = client
 
+        # http_client is litellm's own transport-layer config -- never a provider-facing field.
+        # Build one filtered copy (never mutate litellm_params in place) and pass it to every
+        # call that reaches provider transform/sign code; the merge/resolve step below keeps
+        # reading the *original*, unfiltered litellm_params (the one place that needs it).
+        provider_facing_litellm_params = litellm_params.model_copy(update={"http_client": None})
+
         headers = responses_api_provider_config.validate_environment(
             headers=response_api_optional_request_params.get("extra_headers", {}) or {},
             model=model,
-            litellm_params=litellm_params,
+            litellm_params=provider_facing_litellm_params,
         )
 
         if extra_headers:
@@ -2522,14 +2533,14 @@ class BaseLLMHTTPHandler:
 
         api_base = responses_api_provider_config.get_complete_url(
             api_base=litellm_params.api_base,
-            litellm_params=dict(litellm_params),
+            litellm_params=provider_facing_litellm_params.model_dump(exclude={"http_client"}),
         )
 
         data = responses_api_provider_config.transform_responses_api_request(
             model=model,
             input=input,
             response_api_optional_request_params=response_api_optional_request_params,
-            litellm_params=litellm_params,
+            litellm_params=provider_facing_litellm_params,
             headers=headers,
         )
         data = BaseResponsesAPIConfig.normalize_responses_api_request_dict(data)
@@ -2560,7 +2571,7 @@ class BaseLLMHTTPHandler:
 
         headers, signed_body = responses_api_provider_config.sign_request(
             headers=headers,
-            optional_params=dict(litellm_params),
+            optional_params=provider_facing_litellm_params.model_dump(exclude={"http_client"}),
             request_data=data,
             api_base=api_base,
             api_key=litellm_params.api_key,
@@ -2581,12 +2592,31 @@ class BaseLLMHTTPHandler:
             },
         )
 
+        # Merge global + deployment http_client (reads the ORIGINAL, unfiltered litellm_params)
+        # and resolve into the httpx.Timeout used by both post() call sites below.
+        merged_http_client_cfg = merge_http_client_config(
+            parse_http_client_config(getattr(litellm, "http_client", None)),
+            parse_http_client_config(litellm_params.http_client),
+        )
+        # Pre-existing bug fixed in passing: the old expression's final fallback was a bare
+        # float(..., 0), i.e. an unconditional 0s timeout whenever both `timeout` and the
+        # per-request "timeout" optional param were unset. DEFAULT_REQUEST_TIMEOUT_SECONDS is the
+        # correct final fallback and is what feeds resolve_http_client_timeout.
+        legacy_effective_timeout = (
+            timeout
+            or float(response_api_optional_request_params.get("timeout", 0))
+            or DEFAULT_REQUEST_TIMEOUT_SECONDS
+        )
+        resolved_timeout = resolve_http_client_timeout(
+            merged_http_client_cfg, legacy_effective_timeout=legacy_effective_timeout
+        ).httpx_timeout
+
         try:
             if is_stream_request:
                 response = await async_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    timeout=resolved_timeout,
                     stream=stream,
                     **body_kwargs,
                 )
@@ -2618,7 +2648,7 @@ class BaseLLMHTTPHandler:
                 response = await async_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    timeout=timeout or float(response_api_optional_request_params.get("timeout", 0)),
+                    timeout=resolved_timeout,
                     **body_kwargs,
                 )
 
