@@ -7316,6 +7316,17 @@ class Router:
         """
         try:
             litellm_params: LiteLLM_Params = LiteLLM_Params(**_litellm_params)
+            from litellm.litellm_core_utils.http_client_config import (
+                warn_if_legacy_timeout_coexists_with_http_client,
+            )
+
+            warn_if_legacy_timeout_coexists_with_http_client(
+                legacy_timeout=(
+                    litellm_params.timeout if isinstance(litellm_params.timeout, (int, float)) else None
+                ),
+                http_client=litellm_params.http_client,
+                context=f"deployment '{_model_name}'",
+            )
             deployment = Deployment(
                 **deployment_info,
                 model_name=_model_name,

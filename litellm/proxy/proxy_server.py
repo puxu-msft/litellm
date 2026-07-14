@@ -4311,12 +4311,18 @@ class ProxyConfig:
                 elif key == "http_client":
                     from litellm.litellm_core_utils.http_client_config import (
                         parse_http_client_config,
+                        warn_if_legacy_timeout_coexists_with_http_client,
                     )
 
                     try:
                         parsed_http_client = parse_http_client_config(cast("Optional[dict]", value))
                     except Exception as e:
                         raise ValueError(f"Invalid `http_client` setting in litellm_settings: {e}") from e
+                    warn_if_legacy_timeout_coexists_with_http_client(
+                        legacy_timeout=litellm_settings.get("request_timeout"),
+                        http_client=parsed_http_client,
+                        context="global litellm_settings",
+                    )
                     verbose_proxy_logger.debug("setting litellm.http_client=%s", parsed_http_client)
                     setattr(litellm, key, parsed_http_client)
                 elif key == "json_logs" and value is True:

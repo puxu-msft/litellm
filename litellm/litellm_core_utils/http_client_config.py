@@ -8,6 +8,7 @@ from typing import Optional, TypedDict, Union
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from litellm._logging import verbose_logger
 from litellm.constants import HTTP_HANDLER_CONNECT_TIMEOUT_SECONDS
 
 
@@ -123,4 +124,25 @@ def resolve_http_client_timeout(
     return ResolvedHttpClientTimeout(
         httpx_timeout=httpx.Timeout(legacy_write, connect=connect, read=read, pool=pool),
         total_timeout=cfg.total_timeout,
+    )
+
+
+def warn_if_legacy_timeout_coexists_with_http_client(
+    *,
+    legacy_timeout: Optional[float],
+    http_client: Optional[HttpClientConfig],
+    context: str,
+) -> None:
+    """Log a load-time warning when both the legacy `timeout` field and the new `http_client`
+    config are set on the same scope (global litellm_settings, or a single deployment's
+    litellm_params). `http_client` always wins in practice (see resolve_http_client_timeout /
+    merge_http_client_config) -- this only surfaces that precedence so operators are not
+    silently confused about which setting is actually in effect."""
+    if legacy_timeout is None or http_client is None:
+        return
+    verbose_logger.warning(
+        "%s: both the legacy `timeout=%s` and `http_client` are configured; "
+        "`http_client` takes priority and `timeout` will be ignored for the axes it covers.",
+        context,
+        legacy_timeout,
     )

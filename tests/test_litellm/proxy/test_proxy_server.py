@@ -9139,3 +9139,37 @@ async def test_load_config_accepts_valid_global_http_client(tmp_path):
         assert litellm.http_client == HttpClientConfig(connect_timeout=3.0)
     finally:
         litellm.http_client = original_http_client
+
+
+@pytest.mark.asyncio
+async def test_load_config_warns_on_global_timeout_http_client_coexistence(tmp_path):
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    test_config = {
+        "model_list": [],
+        "litellm_settings": {"request_timeout": 600, "http_client": {"connect_timeout": 3.0}},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(test_config))
+
+    proxy_config = ProxyConfig()
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        await proxy_config.load_config(router=MagicMock(), config_file_path=str(config_file))
+    mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_load_config_silent_when_only_global_http_client_set(tmp_path):
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    test_config = {
+        "model_list": [],
+        "litellm_settings": {"http_client": {"connect_timeout": 3.0}},
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(test_config))
+
+    proxy_config = ProxyConfig()
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        await proxy_config.load_config(router=MagicMock(), config_file_path=str(config_file))
+    mock_logger.warning.assert_not_called()

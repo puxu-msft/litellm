@@ -222,3 +222,68 @@ def test_resolve_http_client_timeout_carries_total_timeout_through():
     resolved = resolve_http_client_timeout(cfg, legacy_effective_timeout=600.0)
     assert resolved.total_timeout == 45.0
     assert resolved.httpx_timeout.connect == 5.0
+
+
+def test_warn_if_legacy_timeout_coexists_with_http_client_warns_when_both_set():
+    from unittest.mock import patch
+
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        warn_if_legacy_timeout_coexists_with_http_client,
+    )
+
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        warn_if_legacy_timeout_coexists_with_http_client(
+            legacy_timeout=600.0,
+            http_client=HttpClientConfig(connect_timeout=1.0),
+            context="global litellm_settings",
+        )
+    mock_logger.warning.assert_called_once()
+    warning_text = mock_logger.warning.call_args[0][0] % mock_logger.warning.call_args[0][1:]
+    assert "http_client" in warning_text
+    assert "global litellm_settings" in warning_text
+
+
+def test_warn_if_legacy_timeout_coexists_with_http_client_silent_when_only_timeout_set():
+    from unittest.mock import patch
+
+    from litellm.litellm_core_utils.http_client_config import (
+        warn_if_legacy_timeout_coexists_with_http_client,
+    )
+
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        warn_if_legacy_timeout_coexists_with_http_client(
+            legacy_timeout=600.0, http_client=None, context="irrelevant"
+        )
+    mock_logger.warning.assert_not_called()
+
+
+def test_warn_if_legacy_timeout_coexists_with_http_client_silent_when_only_http_client_set():
+    from unittest.mock import patch
+
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        warn_if_legacy_timeout_coexists_with_http_client,
+    )
+
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        warn_if_legacy_timeout_coexists_with_http_client(
+            legacy_timeout=None,
+            http_client=HttpClientConfig(connect_timeout=1.0),
+            context="irrelevant",
+        )
+    mock_logger.warning.assert_not_called()
+
+
+def test_warn_if_legacy_timeout_coexists_with_http_client_silent_when_neither_set():
+    from unittest.mock import patch
+
+    from litellm.litellm_core_utils.http_client_config import (
+        warn_if_legacy_timeout_coexists_with_http_client,
+    )
+
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        warn_if_legacy_timeout_coexists_with_http_client(
+            legacy_timeout=None, http_client=None, context="irrelevant"
+        )
+    mock_logger.warning.assert_not_called()

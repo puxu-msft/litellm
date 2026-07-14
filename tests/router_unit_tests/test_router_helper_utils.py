@@ -2497,3 +2497,42 @@ def test_upsert_deployment_clears_stale_budget_config(monkeypatch):
 
     router.upsert_deployment(deployment=unbudgeted)
     assert budget_limiter._get_budget_config_for_deployment(model_id) is None
+
+
+def test_create_deployment_warns_on_timeout_http_client_coexistence(model_list):
+    from unittest.mock import patch
+
+    router = Router(model_list=model_list)
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        router._create_deployment(
+            deployment_info={},
+            _model_name="gpt-5-mini",
+            _litellm_params={
+                "model": "gpt-5-mini",
+                "api_key": "test",
+                "custom_llm_provider": "openai",
+                "timeout": 600,
+                "http_client": {"connect_timeout": 3.0},
+            },
+            _model_info={"id": "coexistence-test-id"},
+        )
+    mock_logger.warning.assert_called_once()
+
+
+def test_create_deployment_silent_when_only_http_client_set(model_list):
+    from unittest.mock import patch
+
+    router = Router(model_list=model_list)
+    with patch("litellm.litellm_core_utils.http_client_config.verbose_logger") as mock_logger:
+        router._create_deployment(
+            deployment_info={},
+            _model_name="gpt-5-mini",
+            _litellm_params={
+                "model": "gpt-5-mini",
+                "api_key": "test",
+                "custom_llm_provider": "openai",
+                "http_client": {"connect_timeout": 3.0},
+            },
+            _model_info={"id": "coexistence-test-id-2"},
+        )
+    mock_logger.warning.assert_not_called()
