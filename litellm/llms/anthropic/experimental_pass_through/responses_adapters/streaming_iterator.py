@@ -18,9 +18,9 @@ def _poc_reasoning_signature_delta(item: object, block_idx: int) -> Union[Dict[s
     normal path is unchanged and we never emit a valid-looking but unreplayable
     carrier. This is the streaming instrumentation for spec block 1 phase 0.
     """
-    import os
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
 
-    if os.environ.get("GHC_REASONING_POC") != "1" or item is None:
+    if not reasoning_bridge_enabled() or item is None:
         return None
 
     def _get(obj: object, key: str) -> object:

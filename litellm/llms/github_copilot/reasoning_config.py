@@ -5,6 +5,7 @@ Deployment config lives in ``model_info.github_copilot_reasoning: {carrier, summ
 into a frozen, typed ``ResolvedReasoningConfig`` and fails loud (as a value) on
 unknown values.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -64,3 +65,15 @@ def summary_wire_value(summary: Summary) -> Union[str, None]:
     ``off`` -> None (omit the field); ``auto``/``concise``/``detailed`` -> as-is.
     """
     return None if summary == "off" else summary
+
+
+def reasoning_bridge_enabled() -> bool:
+    """Whether the gpt reasoning<->thinking carrier bridge is active.
+
+    On by default (full fidelity is the goal); set ``GHC_REASONING_DISABLE=1`` as a
+    kill switch. Per-deployment carrier/summary selection is separate
+    (``resolve_reasoning_config``).
+    """
+    import os
+
+    return os.environ.get("GHC_REASONING_DISABLE") != "1"

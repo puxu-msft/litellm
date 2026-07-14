@@ -1,4 +1,5 @@
 """Tests for the GitHub Copilot reasoning config resolver."""
+
 from __future__ import annotations
 
 from litellm.llms.github_copilot.reasoning_config import (
@@ -52,3 +53,17 @@ def test_summary_wire_value_off_is_omitted():
     assert summary_wire_value("auto") == "auto"
     assert summary_wire_value("concise") == "concise"
     assert summary_wire_value("detailed") == "detailed"
+
+
+def test_bridge_enabled_by_default(monkeypatch):
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
+
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    assert reasoning_bridge_enabled() is True
+
+
+def test_bridge_kill_switch(monkeypatch):
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
+
+    monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
+    assert reasoning_bridge_enabled() is False

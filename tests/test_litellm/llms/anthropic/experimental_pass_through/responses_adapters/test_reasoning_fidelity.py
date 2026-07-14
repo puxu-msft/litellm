@@ -1,7 +1,7 @@
 """Phase 2 PoC: streaming reasoning carrier emission.
 
 Drives ``AnthropicResponsesStreamWrapper._process_event`` with constructed
-Responses events and asserts that, behind the ``GHC_REASONING_POC`` flag, a
+Responses events and asserts that, on by default (kill switch ``GHC_REASONING_DISABLE``), a
 ``signature_delta`` carrying the reasoning replay envelope is emitted right
 before ``content_block_stop`` on ``response.output_item.done`` for a reasoning
 item. This is the streaming path a real Claude Code gpt session hits.
@@ -36,7 +36,7 @@ def _drive_reasoning(w: AnthropicResponsesStreamWrapper) -> list:
 
 
 def test_poc_streaming_reasoning_done_emits_signature_delta(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     chunks = _drive_reasoning(_wrapper())
 
     sig = [c for c in chunks if c.get("delta", {}).get("type") == "signature_delta"]
@@ -54,7 +54,7 @@ def test_poc_streaming_reasoning_done_emits_signature_delta(monkeypatch):
 
 
 def test_poc_off_by_default_no_signature_delta(monkeypatch):
-    monkeypatch.delenv("GHC_REASONING_POC", raising=False)
+    monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
     chunks = _drive_reasoning(_wrapper())
     assert not any(c.get("delta", {}).get("type") == "signature_delta" for c in chunks)
 
@@ -64,7 +64,7 @@ def _sig_deltas(chunks):
 
 
 def test_no_carrier_when_encrypted_content_empty(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     w = _wrapper()
     w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_e"}})
     w._process_event(
@@ -77,7 +77,7 @@ def test_no_carrier_when_encrypted_content_empty(monkeypatch):
 
 
 def test_no_carrier_when_id_missing(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     w = _wrapper()
     w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_x"}})
     w._process_event(
@@ -87,7 +87,7 @@ def test_no_carrier_when_id_missing(monkeypatch):
 
 
 def test_signature_delta_index_equals_reasoning_block_start(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     chunks = _drive_reasoning(_wrapper())
     start = next(
         c
@@ -99,7 +99,7 @@ def test_signature_delta_index_equals_reasoning_block_start(monkeypatch):
 
 
 def test_unmapped_done_id_does_not_inject_carrier_into_other_block(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     w = _wrapper()
     # reasoning block opened for rs_s, then a text/message block opened
     w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_s"}})
@@ -115,7 +115,7 @@ def test_unmapped_done_id_does_not_inject_carrier_into_other_block(monkeypatch):
 
 
 def test_malformed_summary_does_not_crash_and_still_carries(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     w = _wrapper()
     w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_m"}})
     w._process_event(
@@ -152,7 +152,7 @@ def _carrier_block(item_id="rs_r", ec="ENC-REPLAY==", summary=("think a",)):
 
 
 def test_request_side_carrier_becomes_reasoning_item(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     block, env = _carrier_block()
     msgs = [
         {"role": "user", "content": "q"},
@@ -173,42 +173,32 @@ def test_request_side_carrier_becomes_reasoning_item(monkeypatch):
     assert "answer" in json.dumps(items)
 
 
-def test_request_side_real_claude_thinking_dropped_for_gpt(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
+def test_request_side_non_carrier_thinking_kept_as_output_text(monkeypatch):
+    # non-carrier (real Claude) thinking on a gpt request keeps litellm's default
+    # behavior: preserved as visible output_text, not reconstructed as a reasoning item
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     claude_block = {"type": "thinking", "thinking": "claude internal reasoning", "signature": "EqoBrealclaudesig=="}
     msgs = [{"role": "assistant", "content": [claude_block, {"type": "text", "text": "hi"}]}]
     items = _ADAPTER.translate_messages_to_responses_input(msgs)
-    assert not any(it.get("type") == "reasoning" for it in items)
+    assert not any(it.get("type") == "reasoning" for it in items)  # not our carrier -> no reasoning item
     joined = json.dumps(items)
-    assert "claude internal reasoning" not in joined  # dropped, not leaked as output_text
-    assert "hi" in joined  # the actual answer survives
+    assert "claude internal reasoning" in joined  # preserved as output_text (litellm default)
+    assert "hi" in joined
 
 
-def test_request_side_flag_off_no_reasoning_item(monkeypatch):
-    monkeypatch.delenv("GHC_REASONING_POC", raising=False)
+def test_request_side_disabled_no_reasoning_item(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
     block, _ = _carrier_block()
     msgs = [{"role": "assistant", "content": [block]}]
     items = _ADAPTER.translate_messages_to_responses_input(msgs)
     assert not any(it.get("type") == "reasoning" for it in items)
 
 
-# ---- Phase 5: request reasoning.summary so gpt reasoning is visible ----
-
-def test_summary_requested_auto_when_flag_on(monkeypatch):
-    monkeypatch.setenv("GHC_REASONING_POC", "1")
-    monkeypatch.setattr(
-        "litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation.is_reasoning_auto_summary_enabled",
-        lambda: False,
-    )
-    r = LiteLLMAnthropicToResponsesAPIAdapter.translate_thinking_to_reasoning(
-        {"type": "enabled", "budget_tokens": 1024}
-    )
-    assert r is not None
-    assert r["summary"] == "auto"
+# ---- summary follows litellm default (visible summary is a config opt-in, not forced) ----
 
 
-def test_summary_not_forced_when_flag_off(monkeypatch):
-    monkeypatch.delenv("GHC_REASONING_POC", raising=False)
+def test_summary_not_forced_by_default(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     monkeypatch.setattr(
         "litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation.is_reasoning_auto_summary_enabled",
         lambda: False,

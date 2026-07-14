@@ -33,9 +33,9 @@ from litellm.types.llms.openai import ResponsesAPIResponse
 
 
 def _poc_reasoning_enabled() -> bool:
-    import os
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
 
-    return os.environ.get("GHC_REASONING_POC") == "1"
+    return reasoning_bridge_enabled()
 
 
 def _poc_reasoning_input_item(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -192,15 +192,13 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                         elif btype in ("thinking", "redacted_thinking"):
                             reasoning_item = _poc_reasoning_input_item(block)
                             if reasoning_item is not None:
-                                # reconstruct the Responses reasoning item (top-level),
-                                # carrying the original id + encrypted_content back to gpt
+                                # our carrier -> reconstruct the Responses reasoning item
+                                # (top-level), carrying id + encrypted_content back to gpt
                                 input_items.append(reasoning_item)
-                            elif _poc_reasoning_enabled():
-                                # flag on but not our carrier (real Claude thinking / invalid)
-                                # -> drop for the gpt target; never leak another model's
-                                # reasoning as assistant output_text (spec §4.3/§4.6)
-                                pass
                             elif btype == "thinking":
+                                # non-carrier thinking -> keep litellm's default behavior
+                                # (preserve visible reasoning text). gpt-origin carriers are
+                                # stripped before a Claude backend by handler.py (§4.6).
                                 thinking_text = block.get("thinking", "")
                                 if thinking_text:
                                     asst_parts.append({"type": "output_text", "text": thinking_text})
@@ -323,10 +321,6 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             result["summary"] = summary
         elif auto_summary:
             result["summary"] = "detailed"
-        elif _poc_reasoning_enabled():
-            # spec block 1 §4.4 default: request a summary so gpt's reasoning is
-            # visible as thinking text (and rides alongside the carrier)
-            result["summary"] = "auto"
         return result
 
     def translate_request(
