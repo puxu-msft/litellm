@@ -5328,3 +5328,91 @@ def test_generic_litellm_params_rejects_invalid_http_client_keys():
 
     with pytest.raises(ValidationError):
         GenericLiteLLMParams(http_client={"bogus_key": 1})
+
+
+@pytest.mark.asyncio
+async def test_router_acompletion_forwards_http_client_from_deployment_litellm_params():
+    from unittest.mock import patch
+
+    from litellm import Router
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "gh-copilot",
+                "litellm_params": {
+                    "model": "github_copilot/gpt-4",
+                    "http_client": {"connect_timeout": 3.0, "total_timeout": 30.0},
+                },
+            }
+        ]
+    )
+    captured_kwargs = []
+
+    async def _fake_acompletion(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("litellm.router.litellm.acompletion", side_effect=_fake_acompletion):
+        await router.acompletion(model="gh-copilot", messages=[{"role": "user", "content": "hi"}])
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["http_client"] == {"connect_timeout": 3.0, "total_timeout": 30.0}
+
+
+@pytest.mark.asyncio
+async def test_router_aresponses_forwards_http_client_from_deployment_litellm_params():
+    from unittest.mock import MagicMock, patch
+
+    from litellm import Router
+
+    captured_kwargs = []
+
+    async def _fake_aresponses(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return MagicMock()
+
+    # router.aresponses captures litellm.aresponses at construction (factory_function), so patch
+    # before constructing the router.
+    with patch("litellm.router.litellm.aresponses", side_effect=_fake_aresponses):
+        router = Router(
+            model_list=[
+                {
+                    "model_name": "gh-copilot",
+                    "litellm_params": {"model": "github_copilot/gpt-4", "http_client": {"total_timeout": 45.0}},
+                }
+            ]
+        )
+        await router.aresponses(model="gh-copilot", input="hi")
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["http_client"] == {"total_timeout": 45.0}
+
+
+@pytest.mark.asyncio
+async def test_router_anthropic_messages_forwards_http_client_from_deployment_litellm_params():
+    from unittest.mock import MagicMock, patch
+
+    from litellm import Router
+
+    captured_kwargs = []
+
+    async def _fake_anthropic_messages(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return MagicMock()
+
+    with patch("litellm.router.litellm.anthropic_messages", side_effect=_fake_anthropic_messages):
+        router = Router(
+            model_list=[
+                {
+                    "model_name": "claude-messages",
+                    "litellm_params": {"model": "anthropic/claude-3-haiku", "http_client": {"connect_timeout": 5.0}},
+                }
+            ]
+        )
+        await router.anthropic_messages(
+            model="claude-messages", messages=[{"role": "user", "content": "hi"}], max_tokens=100
+        )
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["http_client"] == {"connect_timeout": 5.0}
