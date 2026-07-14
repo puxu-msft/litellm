@@ -7,6 +7,7 @@ import httpx
 
 import litellm
 from litellm._logging import _ENABLE_SECRET_REDACTION, _redact_string, verbose_logger
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
 from litellm.litellm_core_utils.secret_redaction import redact_string
 from litellm.types.utils import LlmProviders
 
@@ -2230,6 +2231,18 @@ def exception_type(  # type: ignore
             ################################################################################
             #################### Start of Provider Exception mapping ####################
             ################################################################################
+
+            # Map the unified asyncio total_timeout deadline to the public Timeout contract so
+            # Router's isinstance(exc, litellm.Timeout) retry classification works. This branch
+            # sits inside the enclosing `if model:` block; every call site passes a real model.
+            if isinstance(original_exception, DeadlineExceeded):
+                exception_mapping_worked = True
+                raise Timeout(
+                    message=f"AsyncioDeadlineExceeded - {error_str}",
+                    model=model,
+                    llm_provider=custom_llm_provider,
+                    litellm_debug_info=extra_information,
+                )
 
             if (
                 "Request Timeout Error" in error_str

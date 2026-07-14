@@ -626,3 +626,21 @@ def test_replicate_422_maps_to_unprocessable_entity():
         )
 
     assert excinfo.value.llm_provider == "replicate"
+
+
+def test_exception_type_maps_deadline_exceeded_to_litellm_timeout():
+    from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+    from litellm.litellm_core_utils.exception_mapping_utils import exception_type
+
+    original = DeadlineExceeded("http_client total_timeout deadline exceeded (remaining was -0.01s)")
+
+    with pytest.raises(litellm.Timeout) as exc_info:
+        exception_type(
+            model="github_copilot/claude-opus-4.8",
+            original_exception=original,
+            custom_llm_provider="github_copilot",
+        )
+
+    assert "AsyncioDeadlineExceeded" in str(exc_info.value)
+    assert exc_info.value.model == "github_copilot/claude-opus-4.8"
+    assert exc_info.value.llm_provider == "github_copilot"
