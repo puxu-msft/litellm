@@ -2979,3 +2979,42 @@ async def test_stream_chunk_builder_raise_and_usage_recovery_failure_does_not_cr
             chunks = [c async for c in response]
 
     assert len(chunks) > 0
+
+
+@pytest.mark.asyncio
+async def test_custom_stream_wrapper_deadline_exceeded_wraps_into_mid_stream_fallback_error():
+    """3rd-round review finding C (chat half): a mid-stream DeadlineExceeded (Task 8a maps to
+    litellm.Timeout, status_code 408) must be wrapped into MidStreamFallbackError so Router's
+    cross-deployment fallback gets a chance -- not raised bare as a permanent 4xx client error."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    import litellm
+    from litellm.exceptions import MidStreamFallbackError
+    from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+
+    async def _chunks():
+        # raise on the first fetch: _handle_stream_fallback_error's routing decision is identical
+        # whether the deadline fires on chunk 1 or N, and a bare MagicMock chunk is not
+        # processable by chunk_creator (would IndexError before the deadline is reached).
+        raise DeadlineExceeded("http_client total_timeout deadline exceeded (remaining was -0.01s)")
+        yield  # pragma: no cover - makes this an async generator
+
+    logging_obj = MagicMock()
+    logging_obj.http_client_deadline = None
+    # the failure path does asyncio.create_task(logging_obj.async_failure_handler(...)), which
+    # needs a real coroutine
+    logging_obj.async_failure_handler = AsyncMock()
+
+    wrapper = CustomStreamWrapper(
+        completion_stream=_chunks(),
+        model="github_copilot/gpt-4",
+        logging_obj=logging_obj,
+        custom_llm_provider="github_copilot",
+    )
+
+    with pytest.raises(MidStreamFallbackError) as exc_info:
+        async for _ in wrapper:
+            pass
+
+    assert isinstance(exc_info.value.original_exception, litellm.Timeout)

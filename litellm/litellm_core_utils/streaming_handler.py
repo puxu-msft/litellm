@@ -27,6 +27,7 @@ from pydantic import BaseModel
 import litellm
 from litellm import verbose_logger
 from litellm._uuid import uuid
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineBoundAsyncIterator
 from litellm.litellm_core_utils.model_response_utils import (
     is_model_response_stream_empty,
 )
@@ -59,6 +60,14 @@ TOOL_CALLS_ATTRIBUTE = "tool_calls"
 FUNCTION_CALL_ATTRIBUTE = "function_call"
 
 _SYNC_ITER_EXHAUSTED = object()
+
+# 408 (Request Timeout), like 429 (rate limit), is a transient condition a different
+# deployment might resolve -- unlike permanent 400/401/403/404 client errors. Carved out per
+# 3rd-round review finding C: Task 8a's DeadlineExceeded -> litellm.Timeout mapping defaults
+# status_code to 408 (Timeout.__init__'s `exception_status_code or 408`), which would otherwise
+# collide with the skip-fallback range and misclassify a mid-stream total_timeout expiry as a
+# permanent client error.
+_STATUS_CODES_ELIGIBLE_FOR_MIDSTREAM_FALLBACK = frozenset({408, 429})
 
 _GCHUNK_FIELDS: frozenset = frozenset(GChunk.__annotations__)
 
@@ -126,7 +135,7 @@ class CustomStreamWrapper:
         self.make_call = make_call
         self.custom_llm_provider = custom_llm_provider
         self.logging_obj: LiteLLMLoggingObject = logging_obj
-        self.completion_stream = completion_stream
+        self.completion_stream = self._maybe_wrap_completion_stream_with_deadline(completion_stream)
         self.sent_first_chunk = False
         self.sent_last_chunk = False
         self._stream_created_time: float = time.time()
@@ -242,6 +251,20 @@ class CustomStreamWrapper:
                         "CustomStreamWrapper.aclose: error closing completion_stream: %s",
                         e,
                     )
+
+    def _maybe_wrap_completion_stream_with_deadline(self, completion_stream):
+        """Wrap an async-iterable completion_stream so each chunk fetch is bound to this
+        request's http_client total_timeout deadline (streaming phase②). Sync/boto3-style
+        providers pass non-async iterables and are left untouched. The timeout-close callback
+        targets the wrapping DeadlineBoundAsyncIterator directly (whose aclose() delegates to
+        the raw connection-owning stream), not CustomStreamWrapper.aclose() (review finding #6)."""
+        deadline = getattr(self.logging_obj, "http_client_deadline", None)
+        if deadline is None or not hasattr(completion_stream, "__anext__"):
+            return completion_stream
+        wrapped: "DeadlineBoundAsyncIterator" = DeadlineBoundAsyncIterator(
+            completion_stream, deadline, on_timeout_close=lambda: wrapped.aclose()
+        )
+        return wrapped
 
     def check_send_stream_usage(self, stream_options: Optional[dict]):
         return stream_options is not None and stream_options.get("include_usage", False) is True
@@ -2173,9 +2196,17 @@ class CustomStreamWrapper:
         # Raise non-retriable client errors directly (skip fallback).
         # Exception: 429 (rate-limit) IS retriable/transient — allow it
         # through so the Router can switch to a different model group.
-        if mapped_status_code is not None and 400 <= mapped_status_code < 500 and mapped_status_code != 429:
+        if (
+            mapped_status_code is not None
+            and 400 <= mapped_status_code < 500
+            and mapped_status_code not in _STATUS_CODES_ELIGIBLE_FOR_MIDSTREAM_FALLBACK
+        ):
             raise mapped_exception
-        if original_status_code is not None and 400 <= original_status_code < 500 and original_status_code != 429:
+        if (
+            original_status_code is not None
+            and 400 <= original_status_code < 500
+            and original_status_code not in _STATUS_CODES_ELIGIBLE_FOR_MIDSTREAM_FALLBACK
+        ):
             raise mapped_exception
 
         raise MidStreamFallbackError(
