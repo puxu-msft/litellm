@@ -1081,3 +1081,33 @@ def test_get_async_streaming_response_iterator_passes_http_client_deadline():
         )
 
     assert mock_chunk_processor.call_args.kwargs.get("_http_client_deadline") == 12345.0
+
+
+@pytest.mark.asyncio
+async def test_async_anthropic_messages_handler_warns_when_custom_client_bypasses_http_client_config(caplog):
+    import logging
+
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+    from litellm.types.router import GenericLiteLLMParams
+
+    handler = BaseLLMHTTPHandler()
+    fake_client = MagicMock(spec=AsyncHTTPHandler)
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        try:
+            await handler.async_anthropic_messages_handler(
+                model="claude-3-haiku",
+                messages=[{"role": "user", "content": "hi"}],
+                anthropic_messages_provider_config=MagicMock(),
+                anthropic_messages_optional_request_params={},
+                custom_llm_provider="anthropic",
+                litellm_params=GenericLiteLLMParams(http_client={"connect_timeout": 2.0}),
+                logging_obj=MagicMock(http_client_deadline=None),
+                client=fake_client,
+            )
+        except Exception:
+            pass  # request construction beyond client selection is out of scope here
+
+    assert any(
+        "http_client" in record.message and "custom client" in record.message.lower() for record in caplog.records
+    )

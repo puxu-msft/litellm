@@ -35,6 +35,7 @@ from litellm.litellm_core_utils.http_client_config import (
     merge_http_client_config,
     parse_http_client_config,
     resolve_http_client_timeout,
+    warn_if_custom_client_bypasses_http_client_config,
 )
 from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.litellm_core_utils.url_utils import encode_url_path_segment
@@ -1961,6 +1962,12 @@ class BaseLLMHTTPHandler:
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(llm_provider=litellm.LlmProviders(custom_llm_provider))
         else:
+            warn_if_custom_client_bypasses_http_client_config(
+                has_custom_client=True,
+                http_client_config_present=bool(litellm_params.http_client)
+                or getattr(litellm, "http_client", None) is not None,
+                context="anthropic messages (AsyncHTTPHandler)",
+            )
             async_httpx_client = client
 
         # Prepare headers
@@ -2528,6 +2535,12 @@ class BaseLLMHTTPHandler:
                 shared_session=shared_session,
             )
         else:
+            warn_if_custom_client_bypasses_http_client_config(
+                has_custom_client=True,
+                http_client_config_present=bool(litellm_params.http_client)
+                or getattr(litellm, "http_client", None) is not None,
+                context="responses API (AsyncHTTPHandler)",
+            )
             async_httpx_client = client
 
         # http_client is litellm's own transport-layer config -- never a provider-facing field.
@@ -2620,9 +2633,7 @@ class BaseLLMHTTPHandler:
         # per-request "timeout" optional param were unset. DEFAULT_REQUEST_TIMEOUT_SECONDS is the
         # correct final fallback and is what feeds resolve_http_client_timeout.
         legacy_effective_timeout = (
-            timeout
-            or float(response_api_optional_request_params.get("timeout", 0))
-            or DEFAULT_REQUEST_TIMEOUT_SECONDS
+            timeout or float(response_api_optional_request_params.get("timeout", 0)) or DEFAULT_REQUEST_TIMEOUT_SECONDS
         )
         resolved_timeout = resolve_http_client_timeout(
             merged_http_client_cfg, legacy_effective_timeout=legacy_effective_timeout

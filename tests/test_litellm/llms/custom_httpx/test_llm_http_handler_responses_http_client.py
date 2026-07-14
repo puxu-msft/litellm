@@ -117,3 +117,34 @@ async def test_aresponses_strips_http_client_before_provider_calls():
     # the caller's object must be untouched (filter builds a copy, never mutates in place)
     assert litellm_params.http_client is not None
     assert litellm_params.http_client.connect_timeout == 2.0
+
+
+@pytest.mark.asyncio
+async def test_async_response_api_handler_warns_when_custom_client_bypasses_http_client_config(caplog):
+    import logging
+    from unittest.mock import MagicMock
+
+    handler = BaseLLMHTTPHandler()
+    fake_client = MagicMock(spec=AsyncHTTPHandler)
+    fake_client.post = AsyncMock(
+        return_value=MagicMock(json=MagicMock(return_value={}), headers={}, status_code=200)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        try:
+            await handler.async_response_api_handler(
+                model="github_copilot/gpt-4",
+                input="hi",
+                responses_api_provider_config=_make_provider_config(),
+                response_api_optional_request_params={},
+                custom_llm_provider="github_copilot",
+                litellm_params=GenericLiteLLMParams(http_client={"connect_timeout": 2.0}),
+                logging_obj=MagicMock(http_client_deadline=None),
+                client=fake_client,
+            )
+        except Exception:
+            pass  # response-shape handling beyond client selection is out of scope here
+
+    assert any(
+        "http_client" in record.message and "custom client" in record.message.lower() for record in caplog.records
+    )

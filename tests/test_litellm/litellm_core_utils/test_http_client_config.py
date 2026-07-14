@@ -364,3 +364,18 @@ def test_warn_if_custom_client_bypasses_http_client_config_silent_otherwise(capl
         )
 
     assert not any("will be ignored" in record.message for record in caplog.records)
+
+
+def test_http2_field_parses_but_is_not_consumed_by_resolve_http_client_timeout():
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    cfg = HttpClientConfig(http2=True, connect_timeout=1.0)
+    resolved = resolve_http_client_timeout(cfg, legacy_effective_timeout=600.0)
+    # httpx.Timeout has no http2 concept at all -- this assertion simply documents that
+    # resolve_http_client_timeout's return type structurally cannot carry http2 forward,
+    # so any future accidental wiring would have to be an explicit, visible type change
+    assert not hasattr(resolved, "http2")
+    assert not hasattr(resolved.httpx_timeout, "http2")
