@@ -15,6 +15,7 @@ Each subdirectory under `tests/e2e/` is one suite, scoped to an endpoint family 
 - `models_mgmt/` - model-management routes (add/update, tpm persistence)
 - `logging/` - logging-integration delivery (datadog and friends)
 - `security/` - secret handling and log-leak protection
+- `shutdown/` - process-level graceful shutdown: spawns its own proxy subprocess and sends real SIGINT/SIGTERM (own `spawned_proxy_e2e` marker, not the live-proxy `e2e` marker)
 - `router/` - routing and reliability behavior (rate limits, fallbacks, cooldowns)
 - `gateway/` - proxy configuration only (`litellm-config.yml`); no tests
 
