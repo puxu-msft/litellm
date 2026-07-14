@@ -105,6 +105,9 @@ async def test_poll_missing_process_triggers_reconnect(engine_client) -> None:
 
     with patch("os.kill", side_effect=ProcessLookupError):
         await engine_client._poll_engine_proc()
+    # Poll funnels through _handle_engine_death, which defers the reconnect to a
+    # task; drain it so attempt_db_reconnect is awaited.
+    await asyncio.sleep(0)
 
     engine_client.attempt_db_reconnect.assert_awaited_once_with(
         reason="engine_process_death",

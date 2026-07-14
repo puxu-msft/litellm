@@ -385,6 +385,9 @@ async def test_poll_engine_proc_detects_death_and_reconnects(
     prisma_client._cleanup_engine_watcher = MagicMock()
 
     await prisma_client._poll_engine_proc()
+    # Poll funnels through _handle_engine_death, which defers the reconnect
+    # decision to a task; drain it so attempt_db_reconnect is awaited.
+    await asyncio.sleep(0)
     pinned = {
         "reconnect_count": prisma_client.attempt_db_reconnect.await_count,
         "cleanup_count": prisma_client._cleanup_engine_watcher.call_count,
@@ -702,3 +705,133 @@ async def test_poll_engine_proc_planned_death_skips_reconnect(
         "cleanup_called": 1,
         "confirmed_dead": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Engine death during proxy shutdown (regression).
+#
+# Under a local Ctrl+C, SIGINT reaches the whole foreground process group, so
+# the prisma-query-engine child dies *before* the lifespan runs
+# ``stop_db_health_watchdog_task``. The still-armed watcher used to misread
+# that intentional death as a crash and spawn a fresh engine mid-shutdown,
+# logging a misleading ERROR + "triggering reconnect". Every detector must now
+# treat a death observed while shutting down as expected: no reconnect, no
+# ERROR line.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_waitpid_death_during_shutdown_skips_reconnect(
+    prisma_client: PrismaClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: True
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    with caplog.at_level("ERROR", logger="LiteLLM Proxy"):
+        prisma_client._on_engine_death_from_thread(7777)
+        await asyncio.sleep(0)
+
+    pinned = {
+        "reconnect_called": prisma_client.attempt_db_reconnect.await_count,
+        "cleanup_called": prisma_client._cleanup_engine_watcher.call_count,
+        "confirmed_dead": prisma_client._engine_confirmed_dead,
+        "error_logs": [r.getMessage() for r in caplog.records if r.levelname == "ERROR"],
+    }
+    assert pinned == {
+        "reconnect_called": 0,
+        "cleanup_called": 1,
+        "confirmed_dead": True,
+        "error_logs": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_pidfd_death_during_shutdown_skips_reconnect(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prisma_client._engine_pid = 4321
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: True
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    prisma_client._cleanup_engine_watcher = MagicMock()
+
+    prisma_client._on_pidfd_readable()
+    await asyncio.sleep(0)
+
+    assert prisma_client.attempt_db_reconnect.await_count == 0
+    assert prisma_client._engine_confirmed_dead is True
+
+
+@pytest.mark.asyncio
+async def test_poll_death_during_shutdown_skips_reconnect(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prisma_client._engine_pid = 555
+    prisma_client._watching_engine = True
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: True
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr("os.kill", MagicMock(side_effect=ProcessLookupError()))
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    prisma_client._cleanup_engine_watcher = MagicMock()
+
+    await prisma_client._poll_engine_proc()
+    await asyncio.sleep(0)
+
+    assert prisma_client.attempt_db_reconnect.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_decision_reads_shutdown_flag_at_task_time(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Ctrl+C race: the death callback can run *before* the lifespan marks
+    shutdown. Because the reconnect decision is deferred to an async task, a
+    shutdown flag that flips True after the synchronous callback (but before
+    the task runs) must still suppress the reconnect."""
+    shutting_down = {"value": False}
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: shutting_down["value"]
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777)  # flag still False here
+    shutting_down["value"] = True  # lifespan start_shutdown() lands next
+    await asyncio.sleep(0)  # reconnect task runs now, sees True
+
+    assert prisma_client.attempt_db_reconnect.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_waitpid_death_during_shutdown_via_real_shutdown_manager(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end wiring: the default ``_is_shutting_down`` reads the real
+    ``GracefulShutdownManager`` state set by the lifespan shutdown."""
+    from litellm.proxy.shutdown.graceful_shutdown_manager import (
+        GracefulShutdownManager,
+    )
+
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    # Do NOT override _is_shutting_down: exercise the constructor default.
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    try:
+        GracefulShutdownManager.start_shutdown()
+        prisma_client._on_engine_death_from_thread(7777)
+        await asyncio.sleep(0)
+        assert prisma_client.attempt_db_reconnect.await_count == 0
+    finally:
+        GracefulShutdownManager.reset()
