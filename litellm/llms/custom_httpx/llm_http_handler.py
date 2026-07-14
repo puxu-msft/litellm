@@ -30,7 +30,7 @@ from litellm._logging import _redact_string, verbose_logger
 from litellm.anthropic_beta_headers_manager import update_headers_with_filtered_beta
 from litellm.constants import DEFAULT_REQUEST_TIMEOUT_SECONDS, REALTIME_WEBSOCKET_MAX_MESSAGE_SIZE_BYTES
 from litellm.litellm_core_utils.asyncify import run_async_function
-from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded, with_deadline
 from litellm.litellm_core_utils.http_client_config import (
     merge_http_client_config,
     parse_http_client_config,
@@ -2613,12 +2613,15 @@ class BaseLLMHTTPHandler:
 
         try:
             if is_stream_request:
-                response = await async_httpx_client.post(
-                    url=api_base,
-                    headers=headers,
-                    timeout=resolved_timeout,
-                    stream=stream,
-                    **body_kwargs,
+                response = await with_deadline(
+                    logging_obj.http_client_deadline,
+                    async_httpx_client.post(
+                        url=api_base,
+                        headers=headers,
+                        timeout=resolved_timeout,
+                        stream=stream,
+                        **body_kwargs,
+                    ),
                 )
 
                 if fake_stream is True:
@@ -2645,11 +2648,14 @@ class BaseLLMHTTPHandler:
                     call_type=CallTypes.responses.value,
                 )
             else:
-                response = await async_httpx_client.post(
-                    url=api_base,
-                    headers=headers,
-                    timeout=resolved_timeout,
-                    **body_kwargs,
+                response = await with_deadline(
+                    logging_obj.http_client_deadline,
+                    async_httpx_client.post(
+                        url=api_base,
+                        headers=headers,
+                        timeout=resolved_timeout,
+                        **body_kwargs,
+                    ),
                 )
 
         except Exception as e:

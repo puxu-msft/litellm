@@ -54,7 +54,7 @@ async def test_aresponses_resolves_deployment_http_client_into_wire_timeout():
         response_api_optional_request_params={},
         custom_llm_provider="openai",
         litellm_params=GenericLiteLLMParams(api_key="sk-test", http_client={"connect_timeout": 2.0, "read_timeout": 9.0}),
-        logging_obj=Mock(),
+        logging_obj=Mock(http_client_deadline=None),
         client=client,
     )
 
@@ -80,7 +80,7 @@ async def test_aresponses_merges_global_http_client_with_deployment_override():
             response_api_optional_request_params={},
             custom_llm_provider="openai",
             litellm_params=GenericLiteLLMParams(api_key="sk-test", http_client={"connect_timeout": 2.0}),
-            logging_obj=Mock(),
+            logging_obj=Mock(http_client_deadline=None),
             client=client,
         )
     finally:
@@ -105,7 +105,7 @@ async def test_aresponses_strips_http_client_before_provider_calls():
         response_api_optional_request_params={},
         custom_llm_provider="openai",
         litellm_params=litellm_params,
-        logging_obj=Mock(),
+        logging_obj=Mock(http_client_deadline=None),
         client=client,
     )
 
