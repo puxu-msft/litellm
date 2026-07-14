@@ -1074,15 +1074,13 @@ async def proxy_startup_event(app: FastAPI):
     GracefulShutdownManager.start_shutdown()
     await GracefulShutdownManager.wait_for_drain()
 
-    # Shutdown event - close shared aiohttp session
-    if shared_aiohttp_session is not None:
-        try:
-            await shared_aiohttp_session.close()
-            verbose_proxy_logger.info("SESSION REUSE: Closed shared aiohttp session")
-        except Exception as e:
-            verbose_proxy_logger.error(f"Error closing shared aiohttp session: {e}")
-
-    # Shutdown event - stop RDS IAM token refresh background task
+    # Shutdown event - stop background producers that could otherwise touch a
+    # half-closed dependency later in this teardown. Moved ahead of the shared
+    # aiohttp session close (and prisma/cache teardown in proxy_shutdown_event)
+    # so the IAM token-refresh loop and the DB health watchdog are quiesced
+    # before the resources they use are torn down. The Task 4/5 is_shutting_down
+    # guards already make these no-ops during shutdown; stopping them here as
+    # well keeps their task lifecycle clean.
     if (
         prisma_client is not None
         and hasattr(prisma_client, "db")
@@ -1093,12 +1091,19 @@ async def proxy_startup_event(app: FastAPI):
         except Exception as e:
             verbose_proxy_logger.error(f"Error stopping token refresh task: {e}")
 
-    # Shutdown event - stop Prisma DB health watchdog task
     if prisma_client is not None and hasattr(prisma_client, "stop_db_health_watchdog_task"):
         try:
             await prisma_client.stop_db_health_watchdog_task()
         except Exception as e:
             verbose_proxy_logger.error(f"Error stopping DB health watchdog task: {e}")
+
+    # Shutdown event - close shared aiohttp session
+    if shared_aiohttp_session is not None:
+        try:
+            await shared_aiohttp_session.close()
+            verbose_proxy_logger.info("SESSION REUSE: Closed shared aiohttp session")
+        except Exception as e:
+            verbose_proxy_logger.error(f"Error closing shared aiohttp session: {e}")
 
     await proxy_shutdown_event()  # type: ignore[reportGeneralTypeIssues]
 
