@@ -508,3 +508,30 @@ git commit -m "test(github_copilot): property-based carrier decode safety (never
 - **Spec 覆盖**: §3 验收 1↔Phase2/3、验收 2↔Task3+Phase3/4、验收 3↔Phase4/6+PoC、验收 4↔Phase5、验收 5(跨模型)↔Phase4/6、验收 6(tagged union)↔Task3、验收 7(mutation)↔各 phase mutation oracle。§4.1 codec↔Phase1；§4.2 响应↔Phase3；§4.3 请求↔Phase4；§4.4 summary↔Phase5；§4.5 config↔Phase5；§4.6 矩阵↔Phase4/6；§5 PoC↔Phase2；§7 双 start↔Phase2-oracle8 + 门禁分支。无未覆盖 spec 项。
 - **占位扫描**: Phase 1/2 无占位、含真实代码与命令。Phase 3-6 为**有意 gated 的 task/接口级合同**（非 TODO 占位），已注明门禁后展开的依据与接口签名。
 - **类型一致**: `ReasoningReplayEnvelope`/`encode_carrier`/`decode_carrier`/`DecodeResult`/`ResolvedReasoningConfig` 跨 task 命名一致；`carrier` 取值 `"signature"|"redacted_thinking"` 全程一致；`summary` 取值 `off|auto|concise|detailed` 全程一致。
+
+---
+
+## 实施进度（2026-07-14，live 验证）
+
+**核心已交付、默认开、live 证实。** 提交范围 `44e8d5e17a..b4edda1fe8`。
+
+| Phase | 状态 | 证据/提交 |
+|---|---|---|
+| 1 codec | ✅ | 硬化后 26 测试、basedpyright 0、变异验证；`add4c92706` |
+| 2 门禁 R1 | ✅ PASSED | gpt-souls 子代理 transcript 146 载体逐字节存活、ec 完好 |
+| 4 请求侧重建 | ✅ | live 差分: valid→200 / 篡改 ec→400；`ec2fbab672` |
+| 5 config resolver | ✅（建成+测试） | `reasoning_config.py`；`53f9a2e9a4` |
+| 6 跨模型剥离 | ✅ | gpt 载体不外泄 claude 后端；`b04a2fbd1b` |
+| 转正 default-on | ✅ | flag→`reasoning_bridge_enabled()`，kill switch `GHC_REASONING_DISABLE`；`b4edda1fe8` |
+
+### 与 spec 的偏离（record-not-adopted，均为「不回退 litellm 契约」的保守化）
+
+1. **§4.3/§4.6 非载体 thinking「丢弃」→ 改为保留 `output_text`**（litellm 默认）。理由: 「丢弃」会回退既有 litellm 契约测试 `test_assistant_thinking_block_becomes_output_text`；gpt 容忍非载体 thinking（不 400）；跨模型 gpt→claude 的**安全**由 handler.py 的 strip 单独保证（未受影响）。故 §4.3 的「丢弃」是洁癖选择而非正确性要求，保留 output_text 更稳。
+2. **§4.4 summary 默认 `auto`（可见）→ 改为「不强制、按 litellm 既有默认」**。理由: 强制 summary=auto 回退 8 个 `TestTranslateThinkingToReasoning` 契约测试 + 增加 token。**可见 summary 降级为 per-deployment 配置项**（`reasoning_config.summary`），默认不开。
+
+### 剩余（refinement，非阻塞；核心功能已全通）
+
+- **per-deployment 配置 plumbing 未接线**: `resolve_reasoning_config`（A/B carrier、summary）已建成+测试，但尚未 plumb 进 `translate_thinking_to_reasoning`（summary）/ streaming wrapper（carrier A/B）。当前 carrier 恒 A（默认）、summary 走 litellm 默认。要 per-deployment 切 A/B + 可见 summary，需把 resolved config 从 `async_anthropic_messages_handler`（`model_info` 在 kwargs）threads 进请求构建链（`_build_responses_kwargs`→`translate_request`→`translate_thinking_to_reasoning`）+ stream wrapper（加 config 参数，替换 module-global `_ADAPTER`）。
+- **B carrier 流式序列**（spec §4.2 两独立块）未实现（默认 A；配置若选 B 目前无效）。
+- **非流式响应侧发载体**未实现（Claude Code 恒流式，非流式罕见）。
+- 线上复验 default-on（需重启加载 `b4edda1fe8`）。
