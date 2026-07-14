@@ -240,8 +240,12 @@ def test_warn_if_legacy_timeout_coexists_with_http_client_warns_when_both_set():
         )
     mock_logger.warning.assert_called_once()
     warning_text = mock_logger.warning.call_args[0][0] % mock_logger.warning.call_args[0][1:]
-    assert "http_client" in warning_text
-    assert "global litellm_settings" in warning_text
+    # Assert the fully-rendered message verbatim so string/format-arg mutations are all killed
+    # (including dropping the legacy_timeout value, which must render as `timeout=600.0`).
+    assert warning_text == (
+        "global litellm_settings: both the legacy `timeout=600.0` and `http_client` are configured; "
+        "`http_client` takes priority and `timeout` will be ignored for the axes it covers."
+    )
 
 
 def test_warn_if_legacy_timeout_coexists_with_http_client_silent_when_only_timeout_set():
@@ -340,10 +344,13 @@ def test_warn_if_custom_client_bypasses_http_client_config_warns_when_both_prese
         )
 
     assert any(
-        "http_client" in record.message
-        and "custom client" in record.message.lower()
-        and "will be ignored" in record.message
-        and "unit test context" in record.message
+        record.message
+        == (
+            "A custom client was supplied for unit test context together with `http_client` config; "
+            "the caller-supplied client's own transport governs connect/read/pool timeouts, so "
+            "those http_client fields will be ignored for this request. The `total_timeout` "
+            "asyncio-level deadline still applies regardless of which client is used."
+        )
         for record in caplog.records
     )
 
@@ -379,3 +386,48 @@ def test_http2_field_parses_but_is_not_consumed_by_resolve_http_client_timeout()
     # so any future accidental wiring would have to be an explicit, visible type change
     assert not hasattr(resolved, "http2")
     assert not hasattr(resolved.httpx_timeout, "http2")
+
+
+def test_establish_request_deadline_uses_global_only_total_timeout(monkeypatch):
+    """When only the *global* litellm.http_client carries total_timeout (no per-deployment
+    http_client in kwargs), the deadline must come from that global value -- this pins the
+    global-config read so mutating it to None/wrong-attr is caught."""
+    import litellm
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        establish_request_deadline,
+    )
+
+    monkeypatch.setattr(litellm, "http_client", HttpClientConfig(total_timeout=45.0))
+    assert establish_request_deadline({"model": "gpt-4"}, now=lambda: 1000.0) == 1045.0
+
+
+def test_resolve_http_client_timeout_float_legacy_fills_read_pool_write_when_cfg_partial():
+    """cfg sets only connect; a bare-float legacy must fill read/pool/write from the float, so
+    mutating any of those legacy_* assignments to None is caught on its own axis."""
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    resolved = resolve_http_client_timeout(HttpClientConfig(connect_timeout=3.0), legacy_effective_timeout=600.0)
+    assert resolved.httpx_timeout.connect == 3.0
+    assert resolved.httpx_timeout.read == 600.0
+    assert resolved.httpx_timeout.pool == 600.0
+    assert resolved.httpx_timeout.write == 600.0
+
+
+def test_resolve_http_client_timeout_preserves_legacy_write_axis_from_httpx_timeout():
+    """cfg overrides read only; the legacy httpx.Timeout's write axis (600) must survive to the
+    resulting httpx.Timeout, catching mutations that drop legacy_write or the Timeout default arg."""
+    import httpx
+
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        resolve_http_client_timeout,
+    )
+
+    legacy = httpx.Timeout(600.0, connect=10.0, read=20.0, pool=30.0)
+    assert legacy.write == 600.0
+    resolved = resolve_http_client_timeout(HttpClientConfig(read_timeout=9.0), legacy_effective_timeout=legacy)
+    assert resolved.httpx_timeout.write == 600.0
