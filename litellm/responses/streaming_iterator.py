@@ -18,6 +18,7 @@ from litellm.constants import (
     STREAM_SSE_DONE_STRING,
 )
 from litellm.litellm_core_utils.asyncify import run_async_function
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineBoundAsyncIterator
 from litellm.litellm_core_utils.core_helpers import process_response_headers
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.llm_response_utils.get_api_base import get_api_base
@@ -575,6 +576,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         custom_llm_provider: Optional[str] = None,
         request_data: Optional[Dict[str, Any]] = None,
         call_type: Optional[str] = None,
+        _http_client_deadline: Optional[float] = None,
     ):
         super().__init__(
             response,
@@ -586,7 +588,13 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             request_data,
             call_type,
         )
-        self.stream_iterator = SSEDecoder().aiter_bytes(response.aiter_bytes())
+        self.stream_iterator = (
+            SSEDecoder().aiter_bytes(
+                DeadlineBoundAsyncIterator(response.aiter_bytes(), _http_client_deadline, on_timeout_close=response.aclose)
+            )
+            if _http_client_deadline is not None
+            else SSEDecoder().aiter_bytes(response.aiter_bytes())
+        )
 
     def __aiter__(self):
         return self

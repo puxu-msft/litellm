@@ -2646,6 +2646,7 @@ class BaseLLMHTTPHandler:
                     custom_llm_provider=custom_llm_provider,
                     request_data=request_context,
                     call_type=CallTypes.responses.value,
+                    _http_client_deadline=logging_obj.http_client_deadline,
                 )
             else:
                 response = await with_deadline(
