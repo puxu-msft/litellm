@@ -81,7 +81,12 @@ from litellm.constants import (
 from litellm.exceptions import LiteLLMUnknownProvider
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.asyncify import run_async_function
-from litellm.litellm_core_utils.http_client_config import establish_request_deadline
+from litellm.litellm_core_utils.http_client_config import (
+    establish_request_deadline,
+    merge_http_client_config,
+    parse_http_client_config,
+    resolve_http_client_timeout,
+)
 from litellm.litellm_core_utils.chat_completion_agentic_loop import (
     maybe_run_chat_completion_agentic_loop,
 )
@@ -5101,6 +5106,7 @@ def completion(  # type: ignore
             )  # support region-based pricing for bedrock
 
         ### TIMEOUT LOGIC ###
+        raw_http_client = kwargs.pop("http_client", None)
         timeout = CompletionTimeout.resolve(
             timeout,
             kwargs,
@@ -5108,6 +5114,11 @@ def completion(  # type: ignore
             global_timeout=get_configured_request_timeout(),
             supports_httpx_timeout=supports_httpx_timeout,
         )
+        if raw_http_client is not None or getattr(litellm, "http_client", None) is not None:
+            deployment_cfg = parse_http_client_config(raw_http_client)
+            global_cfg = parse_http_client_config(getattr(litellm, "http_client", None))
+            merged_cfg = merge_http_client_config(global_cfg, deployment_cfg)
+            timeout = resolve_http_client_timeout(merged_cfg, legacy_effective_timeout=timeout).httpx_timeout
 
         ### REGISTER CUSTOM MODEL PRICING -- IF GIVEN ###
         if (

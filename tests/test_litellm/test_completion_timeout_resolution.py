@@ -142,3 +142,93 @@ def test_httpx_timeout_preserved_for_openai():
     )
     assert out is t
     assert isinstance(out, httpx.Timeout)
+
+
+def test_completion_pops_http_client_and_resolves_httpx_timeout():
+    from unittest.mock import patch
+
+    import httpx
+
+    import litellm
+
+    captured_timeout = []
+
+    def _fake_provider_call(*args, **kwargs):
+        captured_timeout.append(kwargs.get("timeout"))
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("litellm.main.openai_chat_completions.completion", side_effect=_fake_provider_call):
+        litellm.completion(
+            model="github_copilot/gpt-4",
+            messages=[{"role": "user", "content": "hi"}],
+            http_client={"connect_timeout": 2.0, "read_timeout": 9.0},
+        )
+
+    assert len(captured_timeout) == 1
+    resolved = captured_timeout[0]
+    assert isinstance(resolved, httpx.Timeout)
+    assert resolved.connect == 2.0
+    assert resolved.read == 9.0
+
+
+def test_completion_does_not_leak_http_client_key_into_optional_params():
+    from unittest.mock import patch
+
+    import litellm
+
+    captured_optional_params = []
+    original_get_optional_params = litellm.utils.get_optional_params
+
+    def _capture(*args, **kwargs):
+        result = original_get_optional_params(*args, **kwargs)
+        captured_optional_params.append(result)
+        return result
+
+    with (
+        patch("litellm.main.get_optional_params", side_effect=_capture),
+        patch(
+            "litellm.main.openai_chat_completions.completion",
+            return_value={"choices": [{"message": {"content": "ok"}}]},
+        ),
+    ):
+        litellm.completion(
+            model="github_copilot/gpt-4",
+            messages=[{"role": "user", "content": "hi"}],
+            http_client={"connect_timeout": 2.0},
+        )
+
+    assert len(captured_optional_params) == 1
+    assert "http_client" not in captured_optional_params[0]
+
+
+def test_completion_http_client_bypasses_supports_httpx_timeout_degrade_for_unlisted_provider():
+    """Regression for review finding #3(b): http_client is a universal opt-in, not gated behind
+    supports_httpx_timeout. A provider NOT on that allowlist (cohere) must still receive the full
+    per-axis httpx.Timeout http_client resolves to, not the degraded float."""
+    from unittest.mock import patch
+
+    import httpx
+
+    import litellm
+
+    captured_timeout = []
+
+    def _fake_provider_call(*args, **kwargs):
+        captured_timeout.append(kwargs.get("timeout"))
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("litellm.main.base_llm_http_handler.completion", side_effect=_fake_provider_call):
+        litellm.completion(
+            model="cohere/command-r",
+            messages=[{"role": "user", "content": "hi"}],
+            http_client={"connect_timeout": 2.0, "read_timeout": 9.0},
+        )
+
+    assert len(captured_timeout) == 1
+    resolved = captured_timeout[0]
+    assert isinstance(resolved, httpx.Timeout), (
+        "http_client-resolved httpx.Timeout must not be degraded to a float merely because the "
+        "provider is absent from supports_httpx_timeout's allowlist"
+    )
+    assert resolved.connect == 2.0
+    assert resolved.read == 9.0
