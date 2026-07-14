@@ -272,7 +272,7 @@ class AnthropicResponsesStreamWrapper:
                 self._chunk_queue.append({"type": "content_block_stop", "index": red_idx})
                 return
 
-            if token is not None:
+            if token is not None and self.reasoning_carrier == "signature":
                 # A: signature_delta on the reasoning (thinking) block before its stop.
                 self._chunk_queue.append(
                     {

@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from aiohttp import ClientSession
 
 import litellm
+from litellm.litellm_core_utils.http_client_config import (
+    warn_if_custom_client_bypasses_http_client_config,
+)
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.custom_httpx.http_handler import (
     _DEFAULT_TTL_FOR_HTTPX_CLIENTS,
@@ -200,8 +203,14 @@ class BaseOpenAILLM:
     @staticmethod
     def _get_async_http_client(
         shared_session: Optional["ClientSession"] = None,
+        http_client_config_present: bool = False,
     ) -> Optional[httpx.AsyncClient]:
         if litellm.aclient_session is not None:
+            warn_if_custom_client_bypasses_http_client_config(
+                has_custom_client=True,
+                http_client_config_present=http_client_config_present,
+                context="the global litellm.aclient_session override",
+            )
             return litellm.aclient_session
 
         if getattr(litellm, "network_mock", False):

@@ -72,7 +72,7 @@ def _reasoning_carrier_blocks(item: object, carrier: str) -> Optional[List[Dict[
     """
     from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
 
-    if not reasoning_bridge_enabled():
+    if not reasoning_bridge_enabled() or carrier not in ("signature", "redacted_thinking"):
         return None
 
     def _get(obj: object, key: str) -> object:

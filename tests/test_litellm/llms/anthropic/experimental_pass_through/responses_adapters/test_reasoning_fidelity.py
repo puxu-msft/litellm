@@ -232,12 +232,23 @@ def test_resolve_reasoning_summary_default_auto_when_enabled(monkeypatch):
 
     monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     # no model_info config -> default summary "auto" (visible reasoning)
-    assert _resolve_reasoning_summary({}) == "auto"
+    assert _resolve_reasoning_summary({"custom_llm_provider": "github_copilot"}) == "auto"
     # explicit off -> omit
-    assert _resolve_reasoning_summary({"model_info": {"github_copilot_reasoning": {"summary": "off"}}}) is None
+    assert (
+        _resolve_reasoning_summary(
+            {"custom_llm_provider": "github_copilot", "model_info": {"github_copilot_reasoning": {"summary": "off"}}}
+        )
+        is None
+    )
     # detailed
     assert (
-        _resolve_reasoning_summary({"model_info": {"github_copilot_reasoning": {"summary": "detailed"}}}) == "detailed"
+        _resolve_reasoning_summary(
+            {
+                "custom_llm_provider": "github_copilot",
+                "model_info": {"github_copilot_reasoning": {"summary": "detailed"}},
+            }
+        )
+        == "detailed"
     )
 
 
@@ -245,7 +256,7 @@ def test_resolve_reasoning_summary_none_when_disabled(monkeypatch):
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import _resolve_reasoning_summary
 
     monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
-    assert _resolve_reasoning_summary({}) is None
+    assert _resolve_reasoning_summary({"custom_llm_provider": "github_copilot"}) is None
 
 
 # ---- B carrier (redacted_thinking) streaming: two independent blocks ----
@@ -298,16 +309,38 @@ def test_resolve_reasoning_carrier_from_config(monkeypatch):
     from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import _resolve_reasoning_carrier
 
     monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
-    assert _resolve_reasoning_carrier({}) == "signature"  # default
+    assert _resolve_reasoning_carrier({"custom_llm_provider": "github_copilot"}) == "signature"  # default
     assert (
-        _resolve_reasoning_carrier({"model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}}})
+        _resolve_reasoning_carrier(
+            {
+                "custom_llm_provider": "github_copilot",
+                "model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}},
+            }
+        )
         == "redacted_thinking"
     )
     monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
     assert (
-        _resolve_reasoning_carrier({"model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}}})
-        == "signature"
+        _resolve_reasoning_carrier(
+            {
+                "custom_llm_provider": "github_copilot",
+                "model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}},
+            }
+        )
+        == "off"
     )
+
+
+def test_resolve_reasoning_off_for_non_copilot_provider(monkeypatch):
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import (
+        _resolve_reasoning_carrier,
+        _resolve_reasoning_summary,
+    )
+
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    # non github_copilot Responses provider (e.g. openai) -> bridge does not apply
+    assert _resolve_reasoning_summary({"custom_llm_provider": "openai"}) is None
+    assert _resolve_reasoning_carrier({"custom_llm_provider": "openai"}) == "off"
 
 
 # ---- non-stream response carrier + full round-trip regression ----

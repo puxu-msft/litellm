@@ -34,6 +34,9 @@ from litellm._logging import verbose_logger
 from litellm.constants import DEFAULT_MAX_RETRIES
 from litellm.files.types import FileContentStreamingResult
 from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded, with_deadline
+from litellm.litellm_core_utils.http_client_config import (
+    warn_if_custom_client_bypasses_http_client_config,
+)
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
@@ -359,6 +362,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         organization: Optional[str] = None,
         client: Optional[Union[OpenAI, AsyncOpenAI]] = None,
         shared_session: Optional["ClientSession"] = None,
+        http_client_config_present: bool = False,
     ) -> Optional[Union[OpenAI, AsyncOpenAI]]:
         client_initialization_params: Dict = locals()
         if client is None:
@@ -379,7 +383,10 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 _new_client: Union[OpenAI, AsyncOpenAI] = AsyncOpenAI(
                     api_key=api_key,
                     base_url=api_base,
-                    http_client=OpenAIChatCompletion._get_async_http_client(shared_session=shared_session),
+                    http_client=OpenAIChatCompletion._get_async_http_client(
+                        shared_session=shared_session,
+                        http_client_config_present=http_client_config_present,
+                    ),
                     timeout=timeout,
                     max_retries=max_retries,
                     organization=organization,
@@ -403,6 +410,11 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             return _new_client
 
         else:
+            warn_if_custom_client_bypasses_http_client_config(
+                has_custom_client=True,
+                http_client_config_present=http_client_config_present,
+                context="chat completions (OpenAI SDK client)",
+            )
             self._set_dynamic_params_on_client(
                 client=client,
                 organization=organization,
@@ -860,6 +872,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         )
         for _ in range(2):  # if call fails due to alternating messages, retry with reformatted message
             try:
+                http_client_config_present = (
+                    bool(litellm_params.get("http_client")) or getattr(litellm, "http_client", None) is not None
+                )
                 openai_aclient: AsyncOpenAI = self._get_openai_client(  # type: ignore
                     is_async=True,
                     api_key=api_key,
@@ -870,6 +885,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     organization=organization,
                     client=client,
                     shared_session=shared_session,
+                    http_client_config_present=http_client_config_present,
                 )
 
                 ## LOGGING
@@ -1045,6 +1061,9 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         data.update(self.get_stream_options(stream_options=stream_options, api_base=api_base))
         for _ in range(2):
             try:
+                http_client_config_present = (
+                    bool(litellm_params.get("http_client")) or getattr(litellm, "http_client", None) is not None
+                )
                 openai_aclient: AsyncOpenAI = self._get_openai_client(  # type: ignore
                     is_async=True,
                     api_key=api_key,
@@ -1055,6 +1074,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     organization=organization,
                     client=client,
                     shared_session=shared_session,
+                    http_client_config_present=http_client_config_present,
                 )
                 ## LOGGING
                 logging_obj.pre_call(

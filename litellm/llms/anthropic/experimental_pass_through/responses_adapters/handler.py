@@ -40,26 +40,35 @@ def _resolve_reasoning_cfg(extra_kwargs: Optional[Dict[str, Any]]) -> Any:
     return cfg
 
 
+def _reasoning_applies(extra_kwargs: Optional[Dict[str, Any]]) -> bool:
+    """The reasoning carrier bridge applies only to github_copilot (Responses) and
+    only when not killed. Other Responses providers (openai/azure) are untouched."""
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
+
+    if not reasoning_bridge_enabled():
+        return False
+    return (extra_kwargs or {}).get("custom_llm_provider") == "github_copilot"
+
+
 def _resolve_reasoning_summary(extra_kwargs: Optional[Dict[str, Any]]) -> Optional[str]:
     """Resolve the per-deployment Responses ``reasoning.summary`` wire value.
 
-    Returns None (defer to litellm default) when the reasoning bridge is disabled;
-    otherwise resolves ``model_info.github_copilot_reasoning.summary`` (default
-    ``auto`` -> visible reasoning).
+    Returns None (defer to litellm default) when the bridge does not apply (non
+    github_copilot provider or disabled); otherwise resolves
+    ``model_info.github_copilot_reasoning.summary`` (default ``auto`` -> visible).
     """
-    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled, summary_wire_value
+    from litellm.llms.github_copilot.reasoning_config import summary_wire_value
 
-    if not reasoning_bridge_enabled():
+    if not _reasoning_applies(extra_kwargs):
         return None
     return summary_wire_value(_resolve_reasoning_cfg(extra_kwargs).summary)
 
 
 def _resolve_reasoning_carrier(extra_kwargs: Optional[Dict[str, Any]]) -> str:
-    """Resolve the per-deployment reasoning carrier (``signature`` default / ``redacted_thinking``)."""
-    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
-
-    if not reasoning_bridge_enabled():
-        return "signature"
+    """Resolve the reasoning carrier: ``signature``/``redacted_thinking`` for
+    github_copilot, or ``off`` (no carrier emitted) for other providers / disabled."""
+    if not _reasoning_applies(extra_kwargs):
+        return "off"
     return _resolve_reasoning_cfg(extra_kwargs).carrier
 
 

@@ -113,3 +113,62 @@ async def test_async_streaming_propagates_deadline_exceeded_without_converting_t
             model="github_copilot/gpt-4",
             logging_obj=logging_obj,
         )
+
+
+def test_get_openai_client_warns_when_custom_client_bypasses_http_client_config(caplog):
+    import logging
+
+    handler = OpenAIChatCompletion()
+    fake_client = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        handler._get_openai_client(
+            is_async=True,
+            api_key="fake",
+            api_base="https://example.com",
+            timeout=600.0,
+            client=fake_client,
+            http_client_config_present=True,
+        )
+
+    assert any(
+        "http_client" in record.message and "custom client" in record.message.lower() for record in caplog.records
+    )
+
+
+def test_get_openai_client_silent_when_no_http_client_config(caplog):
+    import logging
+
+    handler = OpenAIChatCompletion()
+    fake_client = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        handler._get_openai_client(
+            is_async=True,
+            api_key="fake",
+            api_base="https://example.com",
+            timeout=600.0,
+            client=fake_client,
+            http_client_config_present=False,
+        )
+
+    assert not any("will be ignored" in record.message for record in caplog.records)
+
+
+def test_get_async_http_client_warns_when_aclient_session_bypasses_http_client_config(caplog):
+    import logging
+
+    import litellm
+    from litellm.llms.openai.common_utils import BaseOpenAILLM
+
+    original_aclient_session = litellm.aclient_session
+    litellm.aclient_session = MagicMock()
+    try:
+        with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+            BaseOpenAILLM._get_async_http_client(http_client_config_present=True)
+    finally:
+        litellm.aclient_session = original_aclient_session
+
+    assert any(
+        "http_client" in record.message and "custom client" in record.message.lower() for record in caplog.records
+    )
