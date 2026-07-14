@@ -535,3 +535,9 @@ git commit -m "test(github_copilot): property-based carrier decode safety (never
 - **B carrier 流式序列**（spec §4.2 两独立块）未实现（默认 A；配置若选 B 目前无效）。
 - **非流式响应侧发载体**未实现（Claude Code 恒流式，非流式罕见）。
 - 线上复验 default-on（需重启加载 `b4edda1fe8`）。
+
+### 更新（2026-07-14，config → visible summary 已接线）
+
+- **§4.4 可见 summary: 已交付**（`7ea19e28e2`）。`resolve_reasoning_config` 现已 live: `_build_responses_kwargs` 从 `model_info.github_copilot_reasoning.summary` 解析（默认 `auto` → 可见推理），threads 进 `translate_thinking_to_reasoning(reasoning_summary=...)`。8 个 litellm 契约单测不受影响（它们 `reasoning_summary=None` → 纯 litellm）。kill switch `GHC_REASONING_DISABLE`。此前「summary 降级为不强制」的偏离**已解除**。
+- **仍未接线: carrier A/B 的 per-deployment 选择**。`resolve_reasoning_config` 会校验 `carrier` 字段，但**没有任何代码读 `cfg.carrier`**——streaming 恒发 A（signature）。配置 `carrier="redacted_thinking"` 目前**被静默忽略**。要真正支持 B，需: ①实现 B 流式序列（spec §4.2 两独立块），②把 `cfg.carrier` plumb 进 stream wrapper。属独立后续。
+- §4.3（非载体 thinking → output_text 而非丢弃）偏离仍成立（不回退 litellm 契约 + 跨模型安全由 handler strip 单独保证）。
