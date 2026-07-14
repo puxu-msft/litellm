@@ -6,7 +6,7 @@ path used for OpenAI and Azure models.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Literal, Optional, Union, cast
 
 from litellm.litellm_core_utils.reasoning_effort_utils import (
     reasoning_effort_from_thinking_budget,
@@ -61,6 +61,43 @@ def _poc_reasoning_input_item(block: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "encrypted_content": env.encrypted_content,
         "summary": [{"type": "summary_text", "text": s} for s in env.summary_parts],
     }
+
+
+def _reasoning_carrier_blocks(item: object, carrier: str) -> Optional[List[Dict[str, Any]]]:
+    """Build the Anthropic carrier block(s) for a non-streaming reasoning item.
+
+    Returns None when the bridge is disabled or the reasoning state is incomplete
+    (missing/empty id or encrypted_content), so the caller falls back to the plain
+    summary-only thinking block. On by default; kill switch ``GHC_REASONING_DISABLE``.
+    """
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
+
+    if not reasoning_bridge_enabled():
+        return None
+
+    def _get(obj: object, key: str) -> object:
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    item_id = _get(item, "id")
+    encrypted = _get(item, "encrypted_content")
+    if not (isinstance(item_id, str) and item_id and isinstance(encrypted, str) and encrypted):
+        return None
+
+    from litellm.llms.github_copilot.reasoning_carrier import ReasoningReplayEnvelope, encode_carrier
+
+    summary_raw = _get(item, "summary")
+    summary_seq = summary_raw if isinstance(summary_raw, (list, tuple)) else ()
+    summary_parts = tuple(t for t in (_get(s, "text") for s in summary_seq) if isinstance(t, str) and t)
+    env = ReasoningReplayEnvelope(
+        reasoning_item_id=item_id,
+        encrypted_content=encrypted,
+        summary_parts=summary_parts,
+        origin_model=None,
+    )
+    resolved = cast(
+        'Literal["signature", "redacted_thinking"]', carrier if carrier == "redacted_thinking" else "signature"
+    )
+    return [dict(block) for block in encode_carrier(env, resolved)]
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -441,6 +478,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     def translate_response(
         self,
         response: ResponsesAPIResponse,
+        reasoning_carrier: str = "signature",
     ) -> AnthropicMessagesResponse:
         """
         Translate an OpenAI ResponsesAPIResponse to AnthropicMessagesResponse.
@@ -458,16 +496,22 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
         for item in response.output:
             if isinstance(item, ResponseReasoningItem):
-                for summary in item.summary:
-                    text = getattr(summary, "text", "")
-                    if text:
-                        content.append(
-                            AnthropicResponseContentBlockThinking(
-                                type="thinking",
-                                thinking=text,
-                                signature=None,
-                            ).model_dump()
-                        )
+                carrier_blocks = _reasoning_carrier_blocks(item, reasoning_carrier)
+                if carrier_blocks is not None:
+                    # emit the reasoning carrier (visible summary + encrypted_content)
+                    content.extend(carrier_blocks)
+                else:
+                    # bridge disabled / incomplete reasoning -> plain summary thinking
+                    for summary in item.summary:
+                        text = getattr(summary, "text", "")
+                        if text:
+                            content.append(
+                                AnthropicResponseContentBlockThinking(
+                                    type="thinking",
+                                    thinking=text,
+                                    signature=None,
+                                ).model_dump()
+                            )
 
             elif isinstance(item, ResponseOutputMessage):
                 for part in item.content:

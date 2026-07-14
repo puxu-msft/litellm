@@ -217,7 +217,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
         if not isinstance(result, ResponsesAPIResponse):
             raise ValueError(f"Expected ResponsesAPIResponse, got {type(result)}")
 
-        return _ADAPTER.translate_response(result)
+        return _ADAPTER.translate_response(result, reasoning_carrier=_resolve_reasoning_carrier(kwargs))
 
     @staticmethod
     def anthropic_messages_handler(
@@ -297,4 +297,4 @@ class LiteLLMMessagesToResponsesAPIHandler:
         if not isinstance(result, ResponsesAPIResponse):
             raise ValueError(f"Expected ResponsesAPIResponse, got {type(result)}")
 
-        return _ADAPTER.translate_response(result)
+        return _ADAPTER.translate_response(result, reasoning_carrier=_resolve_reasoning_carrier(kwargs))

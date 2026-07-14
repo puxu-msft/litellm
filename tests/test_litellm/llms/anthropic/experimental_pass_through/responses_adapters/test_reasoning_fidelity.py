@@ -308,3 +308,100 @@ def test_resolve_reasoning_carrier_from_config(monkeypatch):
         _resolve_reasoning_carrier({"model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}}})
         == "signature"
     )
+
+
+# ---- non-stream response carrier + full round-trip regression ----
+from unittest.mock import MagicMock  # noqa: E402
+
+
+def _reasoning_response(item_id="rs_rt", ec="ENC-RT-1234567890", summaries=("step alpha", "step beta")):
+    from openai.types.responses import ResponseReasoningItem
+
+    item = MagicMock(spec=ResponseReasoningItem)
+    item.id = item_id
+    item.encrypted_content = ec
+    item.summary = [type("S", (), {"text": t})() for t in summaries]
+    resp = MagicMock()
+    resp.output = [item]
+    resp.status = "completed"
+    resp.usage = None
+    resp.id = "resp_x"
+    resp.model = "gpt-5.6-sol"
+    return resp
+
+
+def test_nonstream_response_emits_signature_carrier(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    out = _ADAPTER.translate_response(_reasoning_response(), reasoning_carrier="signature")
+    thinking = [b for b in out["content"] if b.get("type") == "thinking" and b.get("signature")]
+    assert thinking, f"expected a carrier thinking block, got {[b.get('type') for b in out['content']]}"
+    res = decode_carrier(thinking[0])
+    assert isinstance(res, DecodedCarrier)
+    assert res.envelope.encrypted_content == "ENC-RT-1234567890"
+    assert thinking[0]["thinking"] == "step alpha step beta"  # visible summary
+
+
+def test_nonstream_response_emits_redacted_carrier_when_configured(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    out = _ADAPTER.translate_response(_reasoning_response(), reasoning_carrier="redacted_thinking")
+    red = [b for b in out["content"] if b.get("type") == "redacted_thinking"]
+    assert len(red) == 1
+    assert isinstance(decode_carrier(red[0]), DecodedCarrier)
+
+
+def test_nonstream_response_disabled_falls_back_to_summary_only(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
+    out = _ADAPTER.translate_response(_reasoning_response(), reasoning_carrier="signature")
+    thinking = [b for b in out["content"] if b.get("type") == "thinking"]
+    assert thinking and not thinking[0].get("signature")  # plain summary, no carrier
+
+
+def test_full_roundtrip_response_emit_then_request_reconstruct(monkeypatch):
+    """The core invariant, end-to-end without a live backend: a carrier emitted on the
+    response, stored+replayed verbatim, reconstructs to a reasoning item with the exact
+    original id + encrypted_content."""
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    out = _ADAPTER.translate_response(_reasoning_response(), reasoning_carrier="signature")
+    replayed = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": out["content"]},
+        {"role": "user", "content": "follow up"},
+    ]
+    items = _ADAPTER.translate_messages_to_responses_input(replayed)
+    reasoning = [it for it in items if it.get("type") == "reasoning"]
+    assert len(reasoning) == 1
+    assert reasoning[0]["id"] == "rs_rt"
+    assert reasoning[0]["encrypted_content"] == "ENC-RT-1234567890"
+
+
+def test_roundtrip_tampered_carrier_does_not_reconstruct(monkeypatch):
+    """A tampered carrier must NOT reconstruct a (backend-rejectable) reasoning item."""
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    out = _ADAPTER.translate_response(_reasoning_response(), reasoning_carrier="signature")
+    block = next(b for b in out["content"] if b.get("type") == "thinking" and b.get("signature"))
+    ns, ver, body = block["signature"].split(":", 2)
+    block["signature"] = f"{ns}:{ver}:%{body}"  # inject an invalid base64 char
+    replayed = [{"role": "assistant", "content": [block]}]
+    items = _ADAPTER.translate_messages_to_responses_input(replayed)
+    assert not any(it.get("type") == "reasoning" for it in items)
+
+
+def test_build_responses_kwargs_carries_reconstructed_reasoning_to_backend(monkeypatch):
+    """The outgoing Responses request (what hits copilot) contains the reconstructed
+    reasoning item with the exact encrypted_content -- the 'reaches the backend' invariant."""
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import _build_responses_kwargs
+
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    block, _ = _carrier_block(item_id="rs_backend", ec="ENC-BACKEND==")
+    kwargs = _build_responses_kwargs(
+        max_tokens=100,
+        model="gpt",
+        messages=[
+            {"role": "assistant", "content": [block, {"type": "text", "text": "prev"}]},
+            {"role": "user", "content": "continue"},
+        ],
+    )
+    reasoning = [it for it in kwargs["input"] if isinstance(it, dict) and it.get("type") == "reasoning"]
+    assert len(reasoning) == 1
+    assert reasoning[0]["id"] == "rs_backend"
+    assert reasoning[0]["encrypted_content"] == "ENC-BACKEND=="
