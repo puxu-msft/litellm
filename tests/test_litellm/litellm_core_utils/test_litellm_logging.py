@@ -3690,3 +3690,34 @@ def test_set_cost_breakdown_stores_reasoning_cost():
         cost_for_built_in_tools_cost_usd_dollar=0.0,
     )
     assert "reasoning_cost" not in no_reasoning.cost_breakdown
+
+
+def test_logging_defaults_http_client_deadline_to_none():
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    logging_obj = Logging(
+        model="gpt-4",
+        messages=[],
+        stream=False,
+        call_type="completion",
+        start_time=__import__("datetime").datetime.now(),
+        litellm_call_id="test-call-id",
+        function_id="test-function-id",
+    )
+    assert logging_obj.http_client_deadline is None
+
+
+def test_logging_set_http_client_deadline():
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    logging_obj = Logging(
+        model="gpt-4",
+        messages=[],
+        stream=False,
+        call_type="completion",
+        start_time=__import__("datetime").datetime.now(),
+        litellm_call_id="test-call-id",
+        function_id="test-function-id",
+    )
+    logging_obj.set_http_client_deadline(123.45)
+    assert logging_obj.http_client_deadline == 123.45

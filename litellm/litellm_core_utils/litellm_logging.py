@@ -344,6 +344,7 @@ class Logging(LiteLLMLoggingBaseClass):
         self.start_time = start_time  # log the call start time
         self.call_type = call_type
         self.litellm_call_id = litellm_call_id
+        self.http_client_deadline: Optional[float] = None
         self.litellm_trace_id: str = litellm_trace_id if litellm_trace_id else str(uuid.uuid4())
         self.function_id = function_id
         self.streaming_chunks: List[Any] = []  # for generating complete stream response
@@ -1281,6 +1282,13 @@ class Logging(LiteLLMLoggingBaseClass):
             self.model_call_details.get("end_time", datetime.datetime.now())
             - self.model_call_details.get("start_time", datetime.datetime.now())
         ).total_seconds() * 1000
+
+    def set_http_client_deadline(self, deadline: Optional[float]) -> None:
+        """Attach this request's absolute http_client.total_timeout deadline (an asyncio
+        loop-time value from establish_request_deadline), so downstream non-streaming awaits
+        and streaming iterators can enforce it via with_deadline / DeadlineBoundAsyncIterator
+        without new parameters threaded through every call layer."""
+        self.http_client_deadline = deadline
 
     def set_cost_breakdown(
         self,
