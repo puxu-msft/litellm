@@ -208,3 +208,41 @@ def test_summary_not_forced_by_default(monkeypatch):
     )
     assert r is not None
     assert "summary" not in r
+
+
+def test_translate_thinking_reasoning_summary_param(monkeypatch):
+    monkeypatch.setattr(
+        "litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation.is_reasoning_auto_summary_enabled",
+        lambda: False,
+    )
+    # explicit resolved summary -> requested
+    r = LiteLLMAnthropicToResponsesAPIAdapter.translate_thinking_to_reasoning(
+        {"type": "enabled", "budget_tokens": 1024}, reasoning_summary="auto"
+    )
+    assert r["summary"] == "auto"
+    # None -> defer to litellm default (no summary when global auto is off)
+    r2 = LiteLLMAnthropicToResponsesAPIAdapter.translate_thinking_to_reasoning(
+        {"type": "enabled", "budget_tokens": 1024}, reasoning_summary=None
+    )
+    assert "summary" not in r2
+
+
+def test_resolve_reasoning_summary_default_auto_when_enabled(monkeypatch):
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import _resolve_reasoning_summary
+
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    # no model_info config -> default summary "auto" (visible reasoning)
+    assert _resolve_reasoning_summary({}) == "auto"
+    # explicit off -> omit
+    assert _resolve_reasoning_summary({"model_info": {"github_copilot_reasoning": {"summary": "off"}}}) is None
+    # detailed
+    assert (
+        _resolve_reasoning_summary({"model_info": {"github_copilot_reasoning": {"summary": "detailed"}}}) == "detailed"
+    )
+
+
+def test_resolve_reasoning_summary_none_when_disabled(monkeypatch):
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import _resolve_reasoning_summary
+
+    monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
+    assert _resolve_reasoning_summary({}) is None

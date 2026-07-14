@@ -290,6 +290,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     def translate_thinking_to_reasoning(
         thinking: Dict[str, Any],
         output_config: Optional[Dict[str, Any]] = None,
+        reasoning_summary: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Convert Anthropic thinking param to Responses API reasoning param.
@@ -298,6 +299,11 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         ``reasoning_effort_from_thinking_budget`` thresholds. For adaptive
         thinking, uses ``output_config.effort`` if available, otherwise defaults
         to medium.
+
+        ``reasoning_summary`` is the per-deployment resolved summary wire value
+        (``auto``/``concise``/``detailed`` to request a visible summary, or None to
+        defer to the existing behavior). It takes precedence over the global
+        ``reasoning_auto_summary`` flag but not an explicit ``thinking.summary``.
         """
         if not isinstance(thinking, dict):
             return None
@@ -314,18 +320,20 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         else:
             return None
 
-        auto_summary = is_reasoning_auto_summary_enabled()
         result: Dict[str, Any] = {"effort": effort}
         summary = thinking.get("summary")
         if summary:
             result["summary"] = summary
-        elif auto_summary:
+        elif reasoning_summary is not None:
+            result["summary"] = reasoning_summary
+        elif is_reasoning_auto_summary_enabled():
             result["summary"] = "detailed"
         return result
 
     def translate_request(
         self,
         anthropic_request: AnthropicMessagesRequest,
+        reasoning_summary: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Translate a full Anthropic /v1/messages request dict to
@@ -388,6 +396,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             reasoning = self.translate_thinking_to_reasoning(
                 thinking,
                 output_config=cast(Optional[Dict[str, Any]], output_config),
+                reasoning_summary=reasoning_summary,
             )
             if reasoning:
                 responses_kwargs["reasoning"] = reasoning

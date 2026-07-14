@@ -19,6 +19,32 @@ from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 _ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
 
 
+def _resolve_reasoning_summary(extra_kwargs: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Resolve the per-deployment Responses ``reasoning.summary`` wire value.
+
+    Returns None (defer to litellm default) when the reasoning bridge is disabled;
+    otherwise resolves ``model_info.github_copilot_reasoning.summary`` (default
+    ``auto`` -> visible reasoning). Invalid config is logged and falls back to defaults.
+    """
+    from litellm._logging import verbose_logger
+    from litellm.llms.github_copilot.reasoning_config import (
+        InvalidReasoningConfig,
+        ResolvedReasoningConfig,
+        reasoning_bridge_enabled,
+        resolve_reasoning_config,
+        summary_wire_value,
+    )
+
+    if not reasoning_bridge_enabled():
+        return None
+    model_info = (extra_kwargs or {}).get("model_info")
+    cfg = resolve_reasoning_config(model_info if isinstance(model_info, dict) else None)
+    if isinstance(cfg, InvalidReasoningConfig):
+        verbose_logger.warning("github_copilot reasoning config invalid (%s); using defaults", cfg.reason)
+        cfg = ResolvedReasoningConfig()
+    return summary_wire_value(cfg.summary)
+
+
 def _build_responses_kwargs(
     *,
     max_tokens: int,
@@ -70,7 +96,9 @@ def _build_responses_kwargs(
         request_data["output_format"] = output_format
 
     anthropic_request = AnthropicMessagesRequest(**request_data)  # type: ignore[typeddict-item]
-    responses_kwargs = _ADAPTER.translate_request(anthropic_request)
+    responses_kwargs = _ADAPTER.translate_request(
+        anthropic_request, reasoning_summary=_resolve_reasoning_summary(extra_kwargs)
+    )
 
     # Normalize reasoning effort based on model capabilities
     # (e.g. "max" → "xhigh"/"high", "minimal" → "low" if unsupported)
