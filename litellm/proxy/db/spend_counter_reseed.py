@@ -30,6 +30,7 @@ from litellm.repositories.user_repository import UserRepository
 from litellm.repositories.verification_token_repository import (
     VerificationTokenRepository,
 )
+from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
 if TYPE_CHECKING:
     from litellm.caching.dual_cache import DualCache
@@ -82,6 +83,12 @@ class SpendCounterReseed:
         raises. Callers use None to fall back to a caller-supplied source.
         """
         if prisma_client is None:
+            return None
+        if GracefulShutdownManager.is_shutting_down():
+            verbose_proxy_logger.info(
+                "spend_counter_reseed_skipped_during_shutdown counter_key=%s",
+                counter_key,
+            )
             return None
         # Per-window key/team counters share prefixes with primary counters
         # but don't correspond to a DB row. Do not reject arbitrary entity IDs
@@ -215,6 +222,13 @@ class SpendCounterReseed:
         window_start: datetime,
     ) -> Optional[float]:
         if prisma_client is None:
+            return None
+        if GracefulShutdownManager.is_shutting_down():
+            verbose_proxy_logger.info(
+                "spend_counter_reseed_window_skipped_during_shutdown entity=%s:%s",
+                entity_type,
+                entity_id,
+            )
             return None
 
         if entity_type == "Key":
