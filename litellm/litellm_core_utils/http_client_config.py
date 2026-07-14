@@ -162,3 +162,19 @@ def establish_request_deadline(kwargs: dict, *, now: Callable[[], float]) -> Opt
     if merged is None or merged.total_timeout is None:
         return None
     return now() + merged.total_timeout
+
+
+def warn_if_custom_client_bypasses_http_client_config(
+    *, has_custom_client: bool, http_client_config_present: bool, context: str
+) -> None:
+    """Warn when a caller supplies both their own pre-built transport client AND http_client
+    config -- the caller-supplied client's own transport governs connect/read/pool timeouts, so
+    only `total_timeout` (an asyncio-level deadline independent of the transport object) still
+    applies. `context` names the call site so the log is actionable."""
+    if has_custom_client and http_client_config_present:
+        verbose_logger.warning(
+            f"A custom client was supplied for {context} together with `http_client` config; "
+            "the caller-supplied client's own transport governs connect/read/pool timeouts, so "
+            "those http_client fields will be ignored for this request. The `total_timeout` "
+            "asyncio-level deadline still applies regardless of which client is used."
+        )

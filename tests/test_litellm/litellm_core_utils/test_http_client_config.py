@@ -325,3 +325,42 @@ def test_establish_request_deadline_merges_global_and_deployment(monkeypatch):
     monkeypatch.setattr(litellm, "http_client", HttpClientConfig(total_timeout=60.0, connect_timeout=1.0))
     kwargs = {"model": "gpt-4", "http_client": {"total_timeout": 30.0}}
     assert establish_request_deadline(kwargs, now=lambda: 1000.0) == 1030.0
+
+
+def test_warn_if_custom_client_bypasses_http_client_config_warns_when_both_present(caplog):
+    import logging
+
+    from litellm.litellm_core_utils.http_client_config import (
+        warn_if_custom_client_bypasses_http_client_config,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        warn_if_custom_client_bypasses_http_client_config(
+            has_custom_client=True, http_client_config_present=True, context="unit test context"
+        )
+
+    assert any(
+        "http_client" in record.message
+        and "custom client" in record.message.lower()
+        and "will be ignored" in record.message
+        and "unit test context" in record.message
+        for record in caplog.records
+    )
+
+
+def test_warn_if_custom_client_bypasses_http_client_config_silent_otherwise(caplog):
+    import logging
+
+    from litellm.litellm_core_utils.http_client_config import (
+        warn_if_custom_client_bypasses_http_client_config,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        warn_if_custom_client_bypasses_http_client_config(
+            has_custom_client=True, http_client_config_present=False, context="unit test context"
+        )
+        warn_if_custom_client_bypasses_http_client_config(
+            has_custom_client=False, http_client_config_present=True, context="unit test context"
+        )
+
+    assert not any("will be ignored" in record.message for record in caplog.records)
