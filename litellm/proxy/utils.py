@@ -4381,6 +4381,8 @@ class PrismaClient:
            waitpid thread nor pidfd are available.
 
         """
+        if self._is_shutting_down():
+            return
         if self._watching_engine or self._engine_pidfd >= 0 or self._engine_wait_thread is not None:
             return
         pid = self._get_engine_pid()
@@ -4428,6 +4430,8 @@ class PrismaClient:
         reconnection lock. Without this re-arm, a planned restart would leave
         the proxy with no engine-death detection until the next reconnect.
         """
+        if self._is_shutting_down():
+            return
         self._engine_confirmed_dead = False
         self._cleanup_engine_watcher()
         asyncio.create_task(self._start_engine_watcher())
@@ -4544,6 +4548,12 @@ class PrismaClient:
         reason: str,
         timeout_seconds: Optional[float],
     ) -> bool:
+        if self._is_shutting_down():
+            verbose_proxy_logger.info(
+                "Skipping DB reconnect after acquiring lock; shutdown in progress. reason=%s",
+                reason,
+            )
+            return False
         now = time.time()
         if force is False and now - self._db_last_reconnect_attempt_ts < self._db_reconnect_cooldown_seconds:
             verbose_proxy_logger.debug(

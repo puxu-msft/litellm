@@ -21,10 +21,9 @@ Linux-only tests are skipped on Windows; the production code uses
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import threading
-from typing import Any, Optional
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -32,9 +31,7 @@ import pytest
 from litellm.proxy.utils import PrismaClient
 
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="engine watcher is Unix-only"
-)
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="engine watcher is Unix-only")
 
 
 def test_get_engine_pid_extracts_process_pid(prisma_client: PrismaClient) -> None:
@@ -72,15 +69,11 @@ def test_is_engine_alive_false_when_process_lookup_fails(
     prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prisma_client._engine_pid = 99999
-    monkeypatch.setattr(
-        "os.kill", MagicMock(side_effect=ProcessLookupError())
-    )
+    monkeypatch.setattr("os.kill", MagicMock(side_effect=ProcessLookupError()))
     assert prisma_client._is_engine_alive() is False
 
 
-def test_is_engine_alive_true_on_permission_error(
-    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_is_engine_alive_true_on_permission_error(prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch) -> None:
     prisma_client._engine_pid = 1
     monkeypatch.setattr("os.kill", MagicMock(side_effect=PermissionError()))
     assert prisma_client._is_engine_alive() is True
@@ -108,9 +101,7 @@ def test_reap_all_zombies_returns_set_of_reaped_pids(
 def test_reap_all_zombies_handles_no_children_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "os.waitpid", MagicMock(side_effect=ChildProcessError())
-    )
+    monkeypatch.setattr("os.waitpid", MagicMock(side_effect=ChildProcessError()))
     assert PrismaClient._reap_all_zombies() == set()
 
 
@@ -153,9 +144,7 @@ async def test_try_waitpid_watch_starts_thread_for_live_child(
 async def test_try_waitpid_watch_returns_false_for_non_child(
     prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "os.waitpid", MagicMock(side_effect=ChildProcessError())
-    )
+    monkeypatch.setattr("os.waitpid", MagicMock(side_effect=ChildProcessError()))
     assert prisma_client._try_waitpid_watch(123) is False
 
 
@@ -672,10 +661,7 @@ async def test_start_db_health_watchdog_task_wires_engine_replaced_hook(
 
     await prisma_client.start_db_health_watchdog_task()
     try:
-        assert (
-            prisma_client.db.on_engine_replaced
-            == prisma_client._handle_writer_engine_replaced
-        )
+        assert prisma_client.db.on_engine_replaced == prisma_client._handle_writer_engine_replaced
     finally:
         await prisma_client.stop_db_health_watchdog_task()
 
@@ -835,3 +821,34 @@ async def test_waitpid_death_during_shutdown_via_real_shutdown_manager(
         assert prisma_client.attempt_db_reconnect.await_count == 0
     finally:
         GracefulShutdownManager.reset()
+
+
+@pytest.mark.asyncio
+async def test_attempt_reconnect_inside_lock_skips_when_shutting_down(prisma_client: PrismaClient) -> None:
+    """A reconnect task queued behind the lock must not reconnect once shutdown
+    began while it was waiting for the lock — otherwise it races the teardown
+    that shutdown already started."""
+    prisma_client._is_shutting_down = lambda: True
+    prisma_client._run_reconnect_cycle = AsyncMock()
+    result = await prisma_client._attempt_reconnect_inside_lock(force=True, reason="test", timeout_seconds=None)
+    assert result is False
+    prisma_client._run_reconnect_cycle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_engine_watcher_noop_during_shutdown(prisma_client: PrismaClient) -> None:
+    """Re-arming engine-death detection while tearing down is pointless and
+    would spawn a poll task that outlives the process."""
+    prisma_client._is_shutting_down = lambda: True
+    prisma_client._get_engine_pid = MagicMock()
+    await prisma_client._start_engine_watcher()
+    prisma_client._get_engine_pid.assert_not_called()
+
+
+def test_handle_writer_engine_replaced_noop_during_shutdown(prisma_client: PrismaClient) -> None:
+    """A planned writer-engine replace during shutdown must not re-arm the
+    watcher."""
+    prisma_client._is_shutting_down = lambda: True
+    prisma_client._cleanup_engine_watcher = MagicMock()
+    prisma_client._handle_writer_engine_replaced()
+    prisma_client._cleanup_engine_watcher.assert_not_called()
