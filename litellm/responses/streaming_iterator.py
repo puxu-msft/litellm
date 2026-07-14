@@ -18,7 +18,8 @@ from litellm.constants import (
     STREAM_SSE_DONE_STRING,
 )
 from litellm.litellm_core_utils.asyncify import run_async_function
-from litellm.litellm_core_utils.asyncio_deadline import DeadlineBoundAsyncIterator
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineBoundAsyncIterator, DeadlineExceeded
+from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.litellm_core_utils.core_helpers import process_response_headers
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.llm_response_utils.get_api_base import get_api_base
@@ -595,6 +596,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             if _http_client_deadline is not None
             else SSEDecoder().aiter_bytes(response.aiter_bytes())
         )
+        self._any_chunk_yielded = False
 
     def __aiter__(self):
         return self
@@ -621,6 +623,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
                     result = await self._call_post_streaming_deployment_hook(
                         chunk=result,
                     )
+                    self._any_chunk_yielded = True
                     return result
                 # If result is None, continue the loop to get the next chunk
 
@@ -632,6 +635,35 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             self.finished = True
             self._handle_failure(e)
             raise e
+        except DeadlineExceeded as e:
+            # Map to the public litellm.Timeout contract (Task 8a's exception_type() branch),
+            # then wrap for Router's Responses-face fallback (router._aresponses_streaming_iterator's
+            # `except MidStreamFallbackError`). This face has no status-code skip-fallback filter,
+            # so no carve-out constant is needed (unlike chat's Task 16a).
+            from litellm.exceptions import MidStreamFallbackError
+
+            self.finished = True
+            # exception_type() RAISES its mapped exception rather than returning it, so call it
+            # inside try/except and catch the mapped exception.
+            try:
+                exception_type(
+                    model=self.model,
+                    custom_llm_provider=self.custom_llm_provider,
+                    original_exception=e,
+                    completion_kwargs={},
+                    extra_kwargs={},
+                )
+                raise AssertionError("exception_type() must raise")  # defensive; never reached
+            except Exception as mapping_error:
+                mapped_exception = mapping_error
+            self._handle_failure(mapped_exception)
+            raise MidStreamFallbackError(
+                message=str(mapped_exception),
+                model=self.model,
+                llm_provider=self.custom_llm_provider or "responses",
+                original_exception=mapped_exception,
+                is_pre_first_chunk=not self._any_chunk_yielded,
+            ) from e
         except Exception as e:
             self.finished = True
             self._handle_failure(e)

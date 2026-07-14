@@ -1,15 +1,20 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
 
-from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+import litellm
+from litellm.exceptions import MidStreamFallbackError
 from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator
 
 
 @pytest.mark.asyncio
-async def test_streaming_iterator_raises_deadline_exceeded_and_closes_response():
+async def test_streaming_iterator_deadline_maps_to_mid_stream_fallback_error():
+    """3rd-round review finding C (responses half): a mid-stream total_timeout expiry must
+    surface as MidStreamFallbackError wrapping litellm.Timeout, not the internal
+    DeadlineExceeded -- otherwise Router._aresponses_streaming_iterator's `except
+    MidStreamFallbackError` never engages and cross-deployment fallback silently never fires."""
+
     async def _aiter_bytes():
         yield b'data: {"type": "response.output_text.delta"}\n\n'
         await asyncio.sleep(10)
@@ -25,12 +30,16 @@ async def test_streaming_iterator_raises_deadline_exceeded_and_closes_response()
         model="github_copilot/gpt-4",
         responses_api_provider_config=MagicMock(),
         logging_obj=MagicMock(),
+        custom_llm_provider="openai",
         _http_client_deadline=asyncio.get_event_loop().time() + 0.05,
     )
 
-    with pytest.raises(DeadlineExceeded):
+    with pytest.raises(MidStreamFallbackError) as exc_info:
         async for _ in iterator:
             pass
+    assert isinstance(exc_info.value.original_exception, litellm.Timeout)
+    # one delta chunk was yielded before the deadline -> not a pre-first-chunk failure
+    assert exc_info.value.is_pre_first_chunk is False
     response.aclose.assert_awaited_once()
 
 
