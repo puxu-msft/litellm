@@ -3,7 +3,7 @@ timeouts, HTTP/2 reservation). See docs/superpowers/specs/2026-07-13-upstream-ht
 """
 
 from dataclasses import dataclass
-from typing import Optional, TypedDict, Union
+from typing import Callable, Optional, TypedDict, Union
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -146,3 +146,19 @@ def warn_if_legacy_timeout_coexists_with_http_client(
         context,
         legacy_timeout,
     )
+
+
+def establish_request_deadline(kwargs: dict, *, now: Callable[[], float]) -> Optional[float]:
+    """Compute the absolute asyncio-loop-time deadline for one request, given the raw call
+    kwargs (which may contain a per-deployment `http_client` value) and the global
+    `litellm.http_client` setting. Reads kwargs["http_client"] without popping it -- popping is
+    the sync completion()/equivalent call's job at its own timeout-resolution choke point, so
+    the value is still available there for resolve_http_client_timeout."""
+    import litellm
+
+    deployment_cfg = parse_http_client_config(kwargs.get("http_client"))
+    global_cfg = parse_http_client_config(getattr(litellm, "http_client", None))
+    merged = merge_http_client_config(global_cfg, deployment_cfg)
+    if merged is None or merged.total_timeout is None:
+        return None
+    return now() + merged.total_timeout

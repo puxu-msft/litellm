@@ -287,3 +287,41 @@ def test_warn_if_legacy_timeout_coexists_with_http_client_silent_when_neither_se
             legacy_timeout=None, http_client=None, context="irrelevant"
         )
     mock_logger.warning.assert_not_called()
+
+
+def test_establish_request_deadline_returns_none_with_no_config(monkeypatch):
+    import litellm
+    from litellm.litellm_core_utils.http_client_config import establish_request_deadline
+
+    monkeypatch.setattr(litellm, "http_client", None)
+    assert establish_request_deadline({"model": "gpt-4"}, now=lambda: 1000.0) is None
+
+
+def test_establish_request_deadline_returns_none_without_total_timeout(monkeypatch):
+    import litellm
+    from litellm.litellm_core_utils.http_client_config import establish_request_deadline
+
+    monkeypatch.setattr(litellm, "http_client", None)
+    kwargs = {"model": "gpt-4", "http_client": {"connect_timeout": 1.0}}
+    assert establish_request_deadline(kwargs, now=lambda: 1000.0) is None
+
+
+def test_establish_request_deadline_uses_deployment_total_timeout(monkeypatch):
+    import litellm
+    from litellm.litellm_core_utils.http_client_config import establish_request_deadline
+
+    monkeypatch.setattr(litellm, "http_client", None)
+    kwargs = {"model": "gpt-4", "http_client": {"total_timeout": 30.0}}
+    assert establish_request_deadline(kwargs, now=lambda: 1000.0) == 1030.0
+
+
+def test_establish_request_deadline_merges_global_and_deployment(monkeypatch):
+    import litellm
+    from litellm.litellm_core_utils.http_client_config import (
+        HttpClientConfig,
+        establish_request_deadline,
+    )
+
+    monkeypatch.setattr(litellm, "http_client", HttpClientConfig(total_timeout=60.0, connect_timeout=1.0))
+    kwargs = {"model": "gpt-4", "http_client": {"total_timeout": 30.0}}
+    assert establish_request_deadline(kwargs, now=lambda: 1000.0) == 1030.0
