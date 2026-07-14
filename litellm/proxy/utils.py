@@ -19,6 +19,7 @@ from typing import (
     Any,
     AsyncGenerator,
     Awaitable,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -47,6 +48,7 @@ from litellm.proxy._types import (
     SpendLogsPayload,
 )
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
+from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.proxy.model_listing import ModelInfoResponse
 from litellm.types.utils import CallTypes, CallTypesLiteral
@@ -2786,9 +2788,18 @@ class PrismaClient:
         database_url: str,
         proxy_logging_obj: ProxyLogging,
         http_client: Optional[Any] = None,
+        is_shutting_down: Optional[Callable[[], bool]] = None,
     ):
         ## init logging object
         self.proxy_logging_obj = proxy_logging_obj
+        # Predicate consulted before reconnecting after an engine death. During
+        # graceful shutdown the engine is torn down on purpose (or killed by a
+        # process-group SIGINT under a local Ctrl+C), so a death observed then
+        # must not trigger a reconnect. Injectable for tests; defaults to the
+        # process-wide GracefulShutdownManager the lifespan drives.
+        self._is_shutting_down: Callable[[], bool] = (
+            is_shutting_down if is_shutting_down is not None else GracefulShutdownManager.is_shutting_down
+        )
         self.iam_token_db_auth: Optional[bool] = str_to_bool(os.getenv("IAM_TOKEN_DB_AUTH"))
         verbose_proxy_logger.debug("Creating Prisma Client..")
         try:
@@ -4168,22 +4179,10 @@ class PrismaClient:
                 "prisma-query-engine PID %s already dead at watch start.",
                 pid,
             )
-            if self._consume_expected_death(pid):
-                verbose_proxy_logger.info(
-                    "PID %s death was planned (engine already replaced); not reconnecting.",
-                    pid,
-                )
-                self._cleanup_engine_watcher()
-                return True
-            self._engine_confirmed_dead = True
-            self._reap_all_zombies()
-            self._cleanup_engine_watcher()
-            asyncio.create_task(
-                self.attempt_db_reconnect(
-                    reason="engine_process_death",
-                    force=True,
-                )
-            )
+            # We are watching `pid`; keep _engine_pid in sync so the shared
+            # death handler's identity guard accepts it.
+            self._engine_pid = pid
+            self._handle_engine_death(pid, "watch start")
             return True
 
         try:
@@ -4238,33 +4237,61 @@ class PrismaClient:
             return True
         return False
 
-    def _on_engine_death_from_thread(self, dead_pid: int) -> None:
-        """Called on the event loop thread when the waitpid thread detects engine death."""
-        if self._engine_confirmed_dead:
-            return
-        if dead_pid != self._engine_pid:
+    def _handle_engine_death(self, dead_pid: int, source: str) -> None:
+        """Single decision point for an observed prisma-query-engine death.
+
+        Every detector (waitpid thread, pidfd, os.kill poll, watch-start probe)
+        funnels here so the crash-vs-planned-vs-shutdown policy lives in one
+        place instead of being copy-pasted four times.
+
+        Bookkeeping (mark dead, reap zombies, tear down the watcher) runs
+        synchronously so a second detector firing for the same PID is a no-op.
+        The reconnect *decision* is deferred to ``_reconnect_after_engine_death``
+        (scheduled as a task) so it reads the shutdown flag at task time: under a
+        local Ctrl+C the engine child gets the process-group SIGINT and dies
+        before the lifespan marks shutdown, and by the time the task runs the
+        flag has typically flipped.
+        """
+        if self._engine_confirmed_dead or dead_pid != self._engine_pid:
             return
         if self._consume_expected_death(dead_pid):
             verbose_proxy_logger.info(
-                "prisma-query-engine PID %s exited as part of a planned restart; "
-                "not reconnecting (engine already replaced).",
+                "prisma-query-engine PID %s exited as part of a planned restart "
+                "(%s); not reconnecting (engine already replaced).",
                 dead_pid,
+                source,
             )
             self._cleanup_engine_watcher()
             return
-        verbose_proxy_logger.error(
-            "prisma-query-engine PID %s exited (waitpid thread); triggering reconnect.",
-            dead_pid,
-        )
         self._engine_confirmed_dead = True
         self._reap_all_zombies()
         self._cleanup_engine_watcher()
-        asyncio.create_task(
-            self.attempt_db_reconnect(
-                reason="engine_process_death",
-                force=True,
+        asyncio.create_task(self._reconnect_after_engine_death(dead_pid, source))
+
+    async def _reconnect_after_engine_death(self, dead_pid: int, source: str) -> None:
+        """Reconnect after a confirmed engine death, unless we are shutting down.
+
+        A death seen while the proxy is draining is expected (the engine is
+        being torn down), so we log at INFO and stop rather than resurrecting
+        the engine and racing the shutdown.
+        """
+        if self._is_shutting_down():
+            verbose_proxy_logger.info(
+                "prisma-query-engine PID %s exited during proxy shutdown (%s); not reconnecting.",
+                dead_pid,
+                source,
             )
+            return
+        verbose_proxy_logger.error(
+            "prisma-query-engine PID %s exited (%s); triggering reconnect.",
+            dead_pid,
+            source,
         )
+        await self.attempt_db_reconnect(reason="engine_process_death", force=True)
+
+    def _on_engine_death_from_thread(self, dead_pid: int) -> None:
+        """Called on the event loop thread when the waitpid thread detects engine death."""
+        self._handle_engine_death(dead_pid, "waitpid thread")
 
     def _try_pidfd_watch(self, pid: int) -> bool:
         """
@@ -4305,28 +4332,7 @@ class PrismaClient:
                     pass
                 self._engine_pidfd = -1
             return
-        dead_pid = self._engine_pid
-        if self._consume_expected_death(dead_pid):
-            verbose_proxy_logger.info(
-                "prisma-query-engine PID %s exited (pidfd event) as part of a "
-                "planned restart; not reconnecting (engine already replaced).",
-                dead_pid,
-            )
-            self._cleanup_engine_watcher()
-            return
-        verbose_proxy_logger.error(
-            "prisma-query-engine PID %s exited (pidfd event); triggering reconnect.",
-            dead_pid,
-        )
-        self._engine_confirmed_dead = True
-        self._reap_all_zombies()
-        self._cleanup_engine_watcher()
-        asyncio.create_task(
-            self.attempt_db_reconnect(
-                reason="engine_process_death",
-                force=True,
-            )
-        )
+        self._handle_engine_death(self._engine_pid, "pidfd event")
 
     async def _poll_engine_proc(self) -> None:
         """poll via os.kill(pid, 0) every 1s.
@@ -4337,26 +4343,7 @@ class PrismaClient:
             try:
                 os.kill(self._engine_pid, 0)
             except ProcessLookupError:
-                dead_pid = self._engine_pid
-                if self._consume_expected_death(dead_pid):
-                    verbose_proxy_logger.info(
-                        "prisma-query-engine PID %s gone as part of a planned "
-                        "restart; not reconnecting (engine already replaced).",
-                        dead_pid,
-                    )
-                    self._cleanup_engine_watcher()
-                    return
-                verbose_proxy_logger.error(
-                    "prisma-query-engine PID %s gone; triggering reconnect.",
-                    dead_pid,
-                )
-                self._engine_confirmed_dead = True
-                self._reap_all_zombies()
-                self._cleanup_engine_watcher()
-                await self.attempt_db_reconnect(
-                    reason="engine_process_death",
-                    force=True,
-                )
+                self._handle_engine_death(self._engine_pid, "os.kill poll")
                 return
             except (PermissionError, OSError):
                 verbose_proxy_logger.debug(
