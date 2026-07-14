@@ -81,6 +81,7 @@ from litellm.constants import (
 from litellm.exceptions import LiteLLMUnknownProvider
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.asyncify import run_async_function
+from litellm.litellm_core_utils.http_client_config import establish_request_deadline
 from litellm.litellm_core_utils.chat_completion_agentic_loop import (
     maybe_run_chat_completion_agentic_loop,
 )
@@ -507,6 +508,11 @@ async def acompletion(
     #########################################################
     #########################################################
     litellm_logging_obj = kwargs.get("litellm_logging_obj", None)
+    assert litellm_logging_obj is not None, (
+        "acompletion() is always wrapped by litellm.utils.client's wrapper_async, which "
+        "asserts logging_obj is not None and injects it into kwargs before this point runs"
+    )
+    litellm_logging_obj.set_http_client_deadline(establish_request_deadline(kwargs, now=loop.time))
     if isinstance(litellm_logging_obj, LiteLLMLoggingObj) and (
         litellm_logging_obj.should_run_prompt_management_hooks(
             prompt_id=kwargs.get("prompt_id", None),
