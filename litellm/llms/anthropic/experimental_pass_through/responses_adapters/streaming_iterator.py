@@ -9,14 +9,13 @@ from litellm import verbose_logger
 from litellm._uuid import uuid
 
 
-def _poc_reasoning_signature_delta(item: object, block_idx: int) -> Union[Dict[str, object], None]:
-    """PoC (behind ``GHC_REASONING_POC=1``): build a ``signature_delta`` carrying
-    the reasoning replay envelope for a completed reasoning item.
+def _reasoning_carrier_token(item: object) -> Union[str, None]:
+    """Build the ``ghc-rsn`` carrier token for a completed reasoning item.
 
-    Returns None when the flag is off, the item is not a reasoning item, or the
-    reasoning state is incomplete (missing/empty id or encrypted_content) -- so the
-    normal path is unchanged and we never emit a valid-looking but unreplayable
-    carrier. This is the streaming instrumentation for spec block 1 phase 0.
+    Returns None when the bridge is disabled, the item is not a reasoning item, or
+    the reasoning state is incomplete (missing/empty id or encrypted_content) -- so
+    we never emit a valid-looking but unreplayable carrier. On by default; kill
+    switch ``GHC_REASONING_DISABLE``.
     """
     from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
 
@@ -31,8 +30,6 @@ def _poc_reasoning_signature_delta(item: object, block_idx: int) -> Union[Dict[s
 
     item_id = _get(item, "id")
     encrypted = _get(item, "encrypted_content")
-    # Only emit when we actually hold the real reasoning state. Empty id/encrypted
-    # content would be a misleading carrier that cannot be replayed to the backend.
     if not (isinstance(item_id, str) and item_id and isinstance(encrypted, str) and encrypted):
         return None
 
@@ -50,11 +47,7 @@ def _poc_reasoning_signature_delta(item: object, block_idx: int) -> Union[Dict[s
         summary_parts=summary_parts,
         origin_model=None,
     )
-    return {
-        "type": "content_block_delta",
-        "index": block_idx,
-        "delta": {"type": "signature_delta", "signature": serialize_envelope(env)},
-    }
+    return serialize_envelope(env)
 
 
 class AnthropicResponsesStreamWrapper:
@@ -75,8 +68,10 @@ class AnthropicResponsesStreamWrapper:
         self,
         responses_stream: Any,
         model: str,
+        reasoning_carrier: str = "signature",
     ) -> None:
         self.responses_stream = responses_stream
+        self.reasoning_carrier = reasoning_carrier
         self.model = model
         self._message_id: str = f"msg_{uuid.uuid4()}"
         self._current_block_index: int = -1
@@ -255,13 +250,37 @@ class AnthropicResponsesStreamWrapper:
                 if item_id
                 else self._current_block_index
             )
-            # Only attach the reasoning carrier when this done event maps to a real
+            # Attach the reasoning carrier only when this done event maps to a real
             # opened reasoning block; never fall back to the current (possibly text)
-            # block, which would inject the signature into the wrong content block.
-            if item_id is not None and item_id in self._item_id_to_block_index:
-                poc_delta = _poc_reasoning_signature_delta(item, self._item_id_to_block_index[item_id])
-                if poc_delta is not None:
-                    self._chunk_queue.append(poc_delta)
+            # block, which would inject the carrier into the wrong content block.
+            mapped_reasoning = item_id is not None and item_id in self._item_id_to_block_index
+            token = _reasoning_carrier_token(item) if mapped_reasoning else None
+            reasoning_idx = self._item_id_to_block_index[item_id] if mapped_reasoning else block_idx
+
+            if token is not None and self.reasoning_carrier == "redacted_thinking":
+                # B: close the summary thinking block, then a separate redacted_thinking
+                # carrier block (two independent content blocks, spec §4.2).
+                self._chunk_queue.append({"type": "content_block_stop", "index": reasoning_idx})
+                red_idx = self._next_block_index()
+                self._chunk_queue.append(
+                    {
+                        "type": "content_block_start",
+                        "index": red_idx,
+                        "content_block": {"type": "redacted_thinking", "data": token},
+                    }
+                )
+                self._chunk_queue.append({"type": "content_block_stop", "index": red_idx})
+                return
+
+            if token is not None:
+                # A: signature_delta on the reasoning (thinking) block before its stop.
+                self._chunk_queue.append(
+                    {
+                        "type": "content_block_delta",
+                        "index": reasoning_idx,
+                        "delta": {"type": "signature_delta", "signature": token},
+                    }
+                )
             self._chunk_queue.append(
                 {
                     "type": "content_block_stop",

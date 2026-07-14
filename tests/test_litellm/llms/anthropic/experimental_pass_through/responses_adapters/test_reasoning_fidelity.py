@@ -246,3 +246,65 @@ def test_resolve_reasoning_summary_none_when_disabled(monkeypatch):
 
     monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
     assert _resolve_reasoning_summary({}) is None
+
+
+# ---- B carrier (redacted_thinking) streaming: two independent blocks ----
+
+
+def _wrapper_b() -> AnthropicResponsesStreamWrapper:
+    return AnthropicResponsesStreamWrapper(
+        responses_stream=iter(()), model="gpt-5.6-sol", reasoning_carrier="redacted_thinking"
+    )
+
+
+def test_b_carrier_emits_separate_redacted_block(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    chunks = _drive_reasoning(_wrapper_b())
+    # B uses a redacted_thinking block, not a signature_delta
+    assert not _sig_deltas(chunks)
+    red = [
+        c
+        for c in chunks
+        if c.get("type") == "content_block_start" and c.get("content_block", {}).get("type") == "redacted_thinking"
+    ]
+    assert len(red) == 1, f"expected one redacted_thinking block, got {[c.get('type') for c in chunks]}"
+    data = red[0]["content_block"]["data"]
+    res = decode_carrier({"type": "redacted_thinking", "data": data})
+    assert isinstance(res, DecodedCarrier)
+    assert res.envelope.encrypted_content == "ENC-STREAM=="
+    # the redacted carrier block is a separate content block from the summary thinking block
+    thinking_start = next(
+        c
+        for c in chunks
+        if c.get("type") == "content_block_start" and c.get("content_block", {}).get("type") == "thinking"
+    )
+    assert red[0]["index"] != thinking_start["index"]
+    # both blocks get their own content_block_stop
+    stops = {c["index"] for c in chunks if c.get("type") == "content_block_stop"}
+    assert thinking_start["index"] in stops and red[0]["index"] in stops
+
+
+def test_a_carrier_still_default_signature(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    chunks = _drive_reasoning(_wrapper())  # default carrier = signature
+    assert _sig_deltas(chunks)
+    assert not any(
+        c.get("type") == "content_block_start" and c.get("content_block", {}).get("type") == "redacted_thinking"
+        for c in chunks
+    )
+
+
+def test_resolve_reasoning_carrier_from_config(monkeypatch):
+    from litellm.llms.anthropic.experimental_pass_through.responses_adapters.handler import _resolve_reasoning_carrier
+
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    assert _resolve_reasoning_carrier({}) == "signature"  # default
+    assert (
+        _resolve_reasoning_carrier({"model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}}})
+        == "redacted_thinking"
+    )
+    monkeypatch.setenv("GHC_REASONING_DISABLE", "1")
+    assert (
+        _resolve_reasoning_carrier({"model_info": {"github_copilot_reasoning": {"carrier": "redacted_thinking"}}})
+        == "signature"
+    )

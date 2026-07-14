@@ -19,30 +19,48 @@ from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 _ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
 
 
-def _resolve_reasoning_summary(extra_kwargs: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Resolve the per-deployment Responses ``reasoning.summary`` wire value.
+def _resolve_reasoning_cfg(extra_kwargs: Optional[Dict[str, Any]]) -> Any:
+    """Resolve the per-deployment ``ResolvedReasoningConfig`` from ``model_info``.
 
-    Returns None (defer to litellm default) when the reasoning bridge is disabled;
-    otherwise resolves ``model_info.github_copilot_reasoning.summary`` (default
-    ``auto`` -> visible reasoning). Invalid config is logged and falls back to defaults.
+    Returns defaults when the model_info config is absent or invalid (logged). The
+    bridge-enabled gate is applied by the callers.
     """
     from litellm._logging import verbose_logger
     from litellm.llms.github_copilot.reasoning_config import (
         InvalidReasoningConfig,
         ResolvedReasoningConfig,
-        reasoning_bridge_enabled,
         resolve_reasoning_config,
-        summary_wire_value,
     )
 
-    if not reasoning_bridge_enabled():
-        return None
     model_info = (extra_kwargs or {}).get("model_info")
     cfg = resolve_reasoning_config(model_info if isinstance(model_info, dict) else None)
     if isinstance(cfg, InvalidReasoningConfig):
         verbose_logger.warning("github_copilot reasoning config invalid (%s); using defaults", cfg.reason)
-        cfg = ResolvedReasoningConfig()
-    return summary_wire_value(cfg.summary)
+        return ResolvedReasoningConfig()
+    return cfg
+
+
+def _resolve_reasoning_summary(extra_kwargs: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Resolve the per-deployment Responses ``reasoning.summary`` wire value.
+
+    Returns None (defer to litellm default) when the reasoning bridge is disabled;
+    otherwise resolves ``model_info.github_copilot_reasoning.summary`` (default
+    ``auto`` -> visible reasoning).
+    """
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled, summary_wire_value
+
+    if not reasoning_bridge_enabled():
+        return None
+    return summary_wire_value(_resolve_reasoning_cfg(extra_kwargs).summary)
+
+
+def _resolve_reasoning_carrier(extra_kwargs: Optional[Dict[str, Any]]) -> str:
+    """Resolve the per-deployment reasoning carrier (``signature`` default / ``redacted_thinking``)."""
+    from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
+
+    if not reasoning_bridge_enabled():
+        return "signature"
+    return _resolve_reasoning_cfg(extra_kwargs).carrier
 
 
 def _build_responses_kwargs(
@@ -191,7 +209,9 @@ class LiteLLMMessagesToResponsesAPIHandler:
         result = await litellm.aresponses(**responses_kwargs)
 
         if stream:
-            wrapper = AnthropicResponsesStreamWrapper(responses_stream=result, model=model)
+            wrapper = AnthropicResponsesStreamWrapper(
+                responses_stream=result, model=model, reasoning_carrier=_resolve_reasoning_carrier(kwargs)
+            )
             return wrapper.async_anthropic_sse_wrapper()
 
         if not isinstance(result, ResponsesAPIResponse):
@@ -269,7 +289,9 @@ class LiteLLMMessagesToResponsesAPIHandler:
         result = litellm.responses(**responses_kwargs)
 
         if stream:
-            wrapper = AnthropicResponsesStreamWrapper(responses_stream=result, model=model)
+            wrapper = AnthropicResponsesStreamWrapper(
+                responses_stream=result, model=model, reasoning_carrier=_resolve_reasoning_carrier(kwargs)
+            )
             return wrapper.async_anthropic_sse_wrapper()
 
         if not isinstance(result, ResponsesAPIResponse):
