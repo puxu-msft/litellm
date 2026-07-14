@@ -190,3 +190,31 @@ def test_request_side_flag_off_no_reasoning_item(monkeypatch):
     msgs = [{"role": "assistant", "content": [block]}]
     items = _ADAPTER.translate_messages_to_responses_input(msgs)
     assert not any(it.get("type") == "reasoning" for it in items)
+
+
+# ---- Phase 5: request reasoning.summary so gpt reasoning is visible ----
+
+def test_summary_requested_auto_when_flag_on(monkeypatch):
+    monkeypatch.setenv("GHC_REASONING_POC", "1")
+    monkeypatch.setattr(
+        "litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation.is_reasoning_auto_summary_enabled",
+        lambda: False,
+    )
+    r = LiteLLMAnthropicToResponsesAPIAdapter.translate_thinking_to_reasoning(
+        {"type": "enabled", "budget_tokens": 1024}
+    )
+    assert r is not None
+    assert r["summary"] == "auto"
+
+
+def test_summary_not_forced_when_flag_off(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_POC", raising=False)
+    monkeypatch.setattr(
+        "litellm.llms.anthropic.experimental_pass_through.responses_adapters.transformation.is_reasoning_auto_summary_enabled",
+        lambda: False,
+    )
+    r = LiteLLMAnthropicToResponsesAPIAdapter.translate_thinking_to_reasoning(
+        {"type": "enabled", "budget_tokens": 1024}
+    )
+    assert r is not None
+    assert "summary" not in r

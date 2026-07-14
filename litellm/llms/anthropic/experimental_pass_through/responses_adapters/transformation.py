@@ -323,6 +323,10 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             result["summary"] = summary
         elif auto_summary:
             result["summary"] = "detailed"
+        elif _poc_reasoning_enabled():
+            # spec block 1 §4.4 default: request a summary so gpt's reasoning is
+            # visible as thinking text (and rides alongside the carrier)
+            result["summary"] = "auto"
         return result
 
     def translate_request(
