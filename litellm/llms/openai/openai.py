@@ -33,6 +33,7 @@ from litellm import LlmProviders
 from litellm._logging import verbose_logger
 from litellm.constants import DEFAULT_MAX_RETRIES
 from litellm.files.types import FileContentStreamingResult
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded, with_deadline
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
@@ -883,11 +884,14 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     },
                 )
 
-                headers, response = await self.make_openai_chat_completion_request(
-                    openai_aclient=openai_aclient,
-                    data=data,
-                    timeout=timeout,
-                    logging_obj=logging_obj,
+                headers, response = await with_deadline(
+                    logging_obj.http_client_deadline,
+                    self.make_openai_chat_completion_request(
+                        openai_aclient=openai_aclient,
+                        data=data,
+                        timeout=timeout,
+                        logging_obj=logging_obj,
+                    ),
                 )
                 stringified_response = provider_config.transform_parsed_response_dict(response.model_dump())
                 logging_obj.post_call(
@@ -934,6 +938,8 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 else:
                     raise e
                 # e.message
+            except DeadlineExceeded:
+                raise
             except Exception as e:
                 exception_response = getattr(e, "response", None)
                 status_code = getattr(e, "status_code", 500)
@@ -1062,11 +1068,14 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     },
                 )
 
-                headers, response = await self.make_openai_chat_completion_request(
-                    openai_aclient=openai_aclient,
-                    data=data,
-                    timeout=timeout,
-                    logging_obj=logging_obj,
+                headers, response = await with_deadline(
+                    logging_obj.http_client_deadline,
+                    self.make_openai_chat_completion_request(
+                        openai_aclient=openai_aclient,
+                        data=data,
+                        timeout=timeout,
+                        logging_obj=logging_obj,
+                    ),
                 )
                 logging_obj.model_call_details["response_headers"] = headers
                 streamwrapper = CustomStreamWrapper(
@@ -1084,6 +1093,8 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     data = drop_params_from_unprocessable_entity_error(e, data)
                 else:
                     raise e
+            except DeadlineExceeded:
+                raise
             except (
                 Exception
             ) as e:  # need to exception handle here. async exceptions don't get caught in sync functions.
