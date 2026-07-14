@@ -42,11 +42,39 @@ class GracefulShutdownManager:
     _is_shutting_down: bool = False
     _shutdown_started_at: Optional[float] = None
     _drain_performed: bool = False
+    _deadline: Optional[float] = None
+    _force_exit: bool = False
 
     @classmethod
     def is_shutting_down(cls) -> bool:
         """Whether this worker has begun graceful shutdown."""
         return cls._is_shutting_down
+
+    @classmethod
+    def deadline_remaining(cls) -> float:
+        """
+        Seconds left before the frozen shutdown deadline. Returns 0.0 before
+        shutdown has started, after the deadline has passed, or once a second
+        SIGINT has requested a force exit — the last case lets every
+        ``while deadline_remaining() > 0`` drain loop (LoggingWorker.quiesce,
+        ManagedTaskSupervisor.drain, both Phase 1b) collapse to "expired"
+        immediately without threading an extra flag through their signatures.
+        """
+        if cls._force_exit:
+            return 0.0
+        if cls._deadline is None:
+            return 0.0
+        return max(0.0, cls._deadline - time.monotonic())
+
+    @classmethod
+    def request_force_exit(cls) -> None:
+        """Mark that a second termination signal arrived. Idempotent."""
+        cls._force_exit = True
+
+    @classmethod
+    def is_force_exit(cls) -> bool:
+        """Whether a second termination signal has requested an immediate exit."""
+        return cls._force_exit
 
     @classmethod
     def get_timeout(cls) -> float:
@@ -78,6 +106,7 @@ class GracefulShutdownManager:
             return
         cls._is_shutting_down = True
         cls._shutdown_started_at = time.monotonic()
+        cls._deadline = cls._shutdown_started_at + cls.get_timeout()
         verbose_proxy_logger.info(
             "graceful_shutdown_started in_flight_requests=%s",
             get_in_flight_requests(),
@@ -172,3 +201,5 @@ class GracefulShutdownManager:
         cls._is_shutting_down = False
         cls._shutdown_started_at = None
         cls._drain_performed = False
+        cls._deadline = None
+        cls._force_exit = False

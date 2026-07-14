@@ -85,9 +85,7 @@ def test_timeout_falls_back_on_garbage(monkeypatch):
 @pytest.mark.asyncio
 async def test_returns_immediately_when_already_drained():
     start = time.monotonic()
-    drained = await GracefulShutdownManager.wait_for_drain(
-        timeout=10, count_fn=lambda: 0
-    )
+    drained = await GracefulShutdownManager.wait_for_drain(timeout=10, count_fn=lambda: 0)
     assert drained == 0
     assert time.monotonic() - start < 0.5
 
@@ -95,18 +93,14 @@ async def test_returns_immediately_when_already_drained():
 @pytest.mark.asyncio
 async def test_waits_until_counter_reaches_zero_then_returns_drained_count():
     count_fn = _counter_that_drains_after(calls_before_zero=3)
-    drained = await GracefulShutdownManager.wait_for_drain(
-        timeout=10, count_fn=count_fn
-    )
+    drained = await GracefulShutdownManager.wait_for_drain(timeout=10, count_fn=count_fn)
     assert drained == 3
 
 
 @pytest.mark.asyncio
 async def test_times_out_when_counter_never_drains():
     start = time.monotonic()
-    drained = await GracefulShutdownManager.wait_for_drain(
-        timeout=0.3, count_fn=lambda: 2
-    )
+    drained = await GracefulShutdownManager.wait_for_drain(timeout=0.3, count_fn=lambda: 2)
     elapsed = time.monotonic() - start
     assert 0.3 <= elapsed < 2.0
     assert drained == 0
@@ -115,9 +109,7 @@ async def test_times_out_when_counter_never_drains():
 @pytest.mark.asyncio
 async def test_zero_timeout_does_not_block():
     start = time.monotonic()
-    drained = await GracefulShutdownManager.wait_for_drain(
-        timeout=0, count_fn=lambda: 5
-    )
+    drained = await GracefulShutdownManager.wait_for_drain(timeout=0, count_fn=lambda: 5)
     assert time.monotonic() - start < 0.2
     assert drained == 5
 
@@ -127,9 +119,7 @@ async def test_exclude_self_treats_one_inflight_as_drained():
     """The /health/drain request counts itself, so a steady count of 1 must be
     treated as fully drained rather than timing out."""
     start = time.monotonic()
-    drained = await GracefulShutdownManager.wait_for_drain(
-        timeout=5, exclude_self=True, count_fn=lambda: 1
-    )
+    drained = await GracefulShutdownManager.wait_for_drain(timeout=5, exclude_self=True, count_fn=lambda: 1)
     assert time.monotonic() - start < 0.5
     assert drained == 0
 
@@ -163,9 +153,7 @@ async def test_second_drain_is_a_noop_so_window_is_not_doubled():
     await GracefulShutdownManager.wait_for_drain(timeout=0.2, count_fn=lambda: 1)
 
     start = time.monotonic()
-    drained = await GracefulShutdownManager.wait_for_drain(
-        timeout=5, count_fn=lambda: 1
-    )
+    drained = await GracefulShutdownManager.wait_for_drain(timeout=5, count_fn=lambda: 1)
     assert time.monotonic() - start < 0.1
     assert drained == 0
 
@@ -179,3 +167,59 @@ async def test_emits_periodic_drain_waiting_log_while_waiting():
         timeout=10, count_fn=count_fn, poll_interval=0, log_interval=0
     )
     assert drained == 3
+
+
+def test_deadline_remaining_is_zero_before_shutdown_starts():
+    assert GracefulShutdownManager.deadline_remaining() == 0.0
+
+
+def test_deadline_remaining_reflects_configured_timeout(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "10")
+    GracefulShutdownManager.start_shutdown()
+    remaining = GracefulShutdownManager.deadline_remaining()
+    assert 9.5 < remaining <= 10.0
+
+
+def test_deadline_is_frozen_on_first_call_not_reset_by_second(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "10")
+    GracefulShutdownManager.start_shutdown()
+    first_remaining = GracefulShutdownManager.deadline_remaining()
+    time.sleep(0.05)
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "999")
+    GracefulShutdownManager.start_shutdown()  # second call, idempotent
+    second_remaining = GracefulShutdownManager.deadline_remaining()
+    assert second_remaining < first_remaining  # clock kept running, env change ignored
+
+
+def test_deadline_remaining_reaches_zero_after_timeout_elapses(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "0.05")
+    GracefulShutdownManager.start_shutdown()
+    time.sleep(0.1)
+    assert GracefulShutdownManager.deadline_remaining() == 0.0
+
+
+def test_is_force_exit_false_by_default():
+    assert GracefulShutdownManager.is_force_exit() is False
+
+
+def test_request_force_exit_sets_flag_idempotently():
+    GracefulShutdownManager.request_force_exit()
+    GracefulShutdownManager.request_force_exit()
+    assert GracefulShutdownManager.is_force_exit() is True
+
+
+def test_force_exit_makes_deadline_remaining_zero_even_with_time_left(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "30")
+    GracefulShutdownManager.start_shutdown()
+    assert GracefulShutdownManager.deadline_remaining() > 0.0
+    GracefulShutdownManager.request_force_exit()
+    assert GracefulShutdownManager.deadline_remaining() == 0.0
+
+
+def test_reset_clears_deadline_and_force_exit(monkeypatch):
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "10")
+    GracefulShutdownManager.start_shutdown()
+    GracefulShutdownManager.request_force_exit()
+    GracefulShutdownManager.reset()
+    assert GracefulShutdownManager.deadline_remaining() == 0.0
+    assert GracefulShutdownManager.is_force_exit() is False
