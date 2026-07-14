@@ -7,7 +7,6 @@ never touching AsyncHTTPHandler.post. This drives async_anthropic_messages_handl
 a configured provider-config mock (the Task 22 harness), capturing the `data` bytes handed to
 the wire post()."""
 
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
