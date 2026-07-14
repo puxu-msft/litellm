@@ -23,6 +23,7 @@ from typing import (
 
 import litellm
 from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+from litellm.litellm_core_utils.http_client_config import establish_request_deadline
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
     sanitize_tool_use_ids_in_anthropic_messages,
@@ -339,6 +340,12 @@ async def anthropic_messages(
             )
 
     loop = asyncio.get_event_loop()
+    litellm_logging_obj = kwargs.get("litellm_logging_obj")
+    assert litellm_logging_obj is not None, (
+        "anthropic_messages() is always wrapped by litellm.utils.client's wrapper_async, which "
+        "asserts logging_obj is not None and injects it into kwargs before this point runs"
+    )
+    litellm_logging_obj.set_http_client_deadline(establish_request_deadline(kwargs, now=loop.time))
     kwargs["is_async"] = True
 
     func = partial(

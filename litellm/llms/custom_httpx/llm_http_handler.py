@@ -1887,18 +1887,23 @@ class BaseLLMHTTPHandler:
         litellm_params: GenericLiteLLMParams,
         api_key: Optional[str],
         model: str,
+        timeout: httpx.Timeout,
     ) -> httpx.Response:
         max_attempts = max(provider_config.max_retry_on_anthropic_messages_http_error, 1)
         litellm_params_dict = dict(litellm_params)
         optional_params_dict = dict(litellm_params)
         for attempt_idx in range(max_attempts):
             try:
-                response = await async_httpx_client.post(
-                    url=request_url,
-                    headers=headers,
-                    data=signed_json_body or json.dumps(request_body),
-                    stream=stream or False,
-                    logging_obj=logging_obj,
+                response = await with_deadline(
+                    logging_obj.http_client_deadline,
+                    async_httpx_client.post(
+                        url=request_url,
+                        headers=headers,
+                        data=signed_json_body or json.dumps(request_body),
+                        stream=stream or False,
+                        timeout=timeout,
+                        logging_obj=logging_obj,
+                    ),
                 )
                 response.raise_for_status()
                 return response
@@ -2071,6 +2076,17 @@ class BaseLLMHTTPHandler:
             },
         )
 
+        from litellm.llms.custom_httpx.http_handler import _default_cached_client_timeout
+
+        merged_http_client_cfg = merge_http_client_config(
+            parse_http_client_config(getattr(litellm, "http_client", None)),
+            parse_http_client_config(litellm_params.http_client),
+        )
+        resolved_timeout = resolve_http_client_timeout(
+            merged_http_client_cfg,
+            legacy_effective_timeout=litellm_params.timeout or _default_cached_client_timeout(),
+        ).httpx_timeout
+
         response = await self._async_post_anthropic_messages_with_http_error_retry(
             async_httpx_client=async_httpx_client,
             request_url=request_url,
@@ -2083,6 +2099,7 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
             api_key=api_key,
             model=model,
+            timeout=resolved_timeout,
         )
 
         # used for logging + cost tracking

@@ -925,3 +925,136 @@ async def test_anthropic_messages_maps_deadline_exceeded_to_litellm_timeout():
                 custom_llm_provider="anthropic",
                 api_key="k",
             )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_establishes_http_client_deadline():
+    import litellm
+
+    captured = []
+    original = litellm.litellm_core_utils.litellm_logging.Logging.set_http_client_deadline
+
+    def _capture(self, deadline):
+        captured.append(deadline)
+        return original(self, deadline)
+
+    with (
+        patch(
+            "litellm.litellm_core_utils.litellm_logging.Logging.set_http_client_deadline",
+            new=_capture,
+            autospec=False,
+        ),
+        patch(
+            "litellm.llms.anthropic.experimental_pass_through.messages.handler.anthropic_messages_handler",
+            return_value=MagicMock(),
+        ),
+    ):
+        await litellm.anthropic_messages(
+            max_tokens=100,
+            messages=[{"role": "user", "content": "hi"}],
+            model="github_copilot/claude-3-haiku",
+            http_client={"total_timeout": 20.0},
+        )
+
+    assert len(captured) == 1
+    assert captured[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_async_post_anthropic_messages_passes_explicit_timeout():
+    """Regression: the wire-level post() previously had no timeout= kwarg at all, so per-request
+    http_client config (and even the legacy per-face default) was silently ignored."""
+    import httpx
+
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+
+    handler = BaseLLMHTTPHandler()
+    captured_kwargs = []
+
+    async def _fake_post(**kwargs):
+        captured_kwargs.append(kwargs)
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        return response
+
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(side_effect=_fake_post)
+
+    await handler._async_post_anthropic_messages_with_http_error_retry(
+        async_httpx_client=mock_client,
+        request_url="https://api.example.com/v1/messages",
+        headers={},
+        signed_json_body=None,
+        request_body={"model": "claude-3-haiku", "messages": []},
+        stream=False,
+        logging_obj=MagicMock(http_client_deadline=None),
+        provider_config=MagicMock(max_retry_on_anthropic_messages_http_error=1),
+        litellm_params=MagicMock(http_client=None, timeout=None),
+        api_key="fake-key",
+        model="claude-3-haiku",
+        timeout=httpx.Timeout(600.0, connect=5.0),
+    )
+
+    assert len(captured_kwargs) == 1
+    assert "timeout" in captured_kwargs[0]
+    assert isinstance(captured_kwargs[0]["timeout"], httpx.Timeout)
+
+
+@pytest.mark.asyncio
+async def test_async_anthropic_messages_handler_merges_global_http_client_with_deployment_override():
+    """Regression for review finding #8: this call site previously fed resolve_http_client_timeout
+    only litellm_params.http_client, ignoring any global litellm.http_client setting."""
+    import httpx
+
+    import litellm
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+    from litellm.types.router import GenericLiteLLMParams
+
+    handler = BaseLLMHTTPHandler()
+    captured_kwargs = []
+
+    async def _fake_post(**kwargs):
+        captured_kwargs.append(kwargs)
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        return response
+
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(side_effect=_fake_post)
+
+    # provider_config methods the handler calls before the post(), returning correctly-shaped
+    # values so request construction reaches the wire call this test inspects.
+    provider_config = MagicMock()
+    provider_config.validate_anthropic_messages_environment.return_value = ({}, "https://api.example.com")
+    provider_config.should_filter_anthropic_beta_headers.return_value = False
+    provider_config.transform_anthropic_messages_request.return_value = {"model": "claude-3-haiku", "messages": []}
+    provider_config.get_complete_url.return_value = "https://api.example.com/v1/messages"
+    provider_config.sign_request.return_value = ({}, None)
+    provider_config.max_retry_on_anthropic_messages_http_error = 1
+
+    original_global_http_client = litellm.http_client
+    litellm.http_client = {"connect_timeout": 4.0, "pool_timeout": 12.0}
+    try:
+        with patch(
+            "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+            return_value=mock_client,
+        ):
+            try:
+                await handler.async_anthropic_messages_handler(
+                    model="claude-3-haiku",
+                    messages=[{"role": "user", "content": "hi"}],
+                    anthropic_messages_provider_config=provider_config,
+                    anthropic_messages_optional_request_params={},
+                    custom_llm_provider="anthropic",
+                    litellm_params=GenericLiteLLMParams(http_client={"connect_timeout": 2.0}),
+                    logging_obj=MagicMock(http_client_deadline=None),
+                )
+            except Exception:
+                pass  # request construction beyond the post() call is out of scope here
+    finally:
+        litellm.http_client = original_global_http_client
+
+    assert len(captured_kwargs) == 1
+    resolved = captured_kwargs[0]["timeout"]
+    assert resolved.connect == 2.0  # deployment overrides global
+    assert resolved.pool == 12.0  # falls back to global
