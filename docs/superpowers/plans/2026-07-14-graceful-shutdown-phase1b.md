@@ -70,7 +70,7 @@ Phase 1a 计划第 2250-2252 行的"承诺的后续"一节已经点名"六个 Pa
 `litellm_core_utils/streaming_handler.py`（Path B1）和 5 个 Path A 站点里的 4 个（A1-A3 在核心 SDK；A4-A6 在 proxy 层）都是核心 SDK 代码，不能直接 `import` `ManagedTaskSupervisor`/`AccountingLease`（proxy-only 类型）。复用 spec 已经采纳的 `CompletionToken` 中立协议模式，新增一个同样中立的 `AccountingScope` 协议 + `ContextVar` + 两个中立辅助函数，全部放在 `litellm/litellm_core_utils/accounting_scope.py`：
 
 - `current_accounting_scope: ContextVar[AccountingScope | None]`——不是"用 `ContextVar != None` 做 admission 授权"（spec §B 明确禁止的做法），而是"用它在同一条真实调度链路上传递一个已经被显式校验过的 scope **引用**"；真正的授权判断永远是对这个引用调用 `scope.is_valid()`/`scope.spawn(...)` 的显式方法调用，`ContextVar` 只负责让这个引用能免 import 地传到核心 SDK 代码手上。
-- `register_root_scope_provider(provider)` / `acquire_root_scope()`——一次性 DI 注册钩子，在 `litellm/proxy/shutdown/managed_task_supervisor.py` 模块导入时调用一次（与本文件里 `GLOBAL_LOGGING_WORKER = LoggingWorker()` 这个既有的模块级单例注册写法同构，不是"到处重新赋值全局变量"）。纯 SDK 场景（不 import 任何 `litellm.proxy.*`）下这个 provider 永远是 `None`，所有相关函数退化为逐字节等价于今天的裸 `asyncio.create_task`——这就是"pure-SDK 行为必须逐字节不变"这条硬约束的落地方式。
+- `register_root_scope_provider(provider)` / `acquire_root_scope()`——**可撤销**的 DI 注册钩子（major 9 修订：不是模块导入时一次性注册、永不撤销）。`GLOBAL_MANAGED_TASK_SUPERVISOR = ManagedTaskSupervisor()` 这个进程级单例仍然在 `managed_task_supervisor.py` 模块导入时创建（同构于本文件既有的 `GLOBAL_LOGGING_WORKER = LoggingWorker()` 写法），但 `register_root_scope_provider(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease)` 这个*注册调用*本身挪到 Task 10 的 lifespan 启动阶段才执行，并在 lifespan 关停阶段——`drain()` 完全跑完之后——显式调用 `register_root_scope_provider(None)` 撤销注册。这样同一个进程内"先跑一个 proxy 实例、完整关停、再跑纯 SDK 调用"（例如测试场景，或者未来允许在同进程里重启第二个 lifespan）时，`acquire_root_scope()` 不会继续持有一个指向已经关停 supervisor 的悬挂引用——供应商闭包本身仍然经由 `AccountingLease.is_valid()`（blocker 1/2 的 `_hard_shutdown`/root admission 状态）反映"proxy 运行时是否仍处于活跃状态"，但撤销注册这一步把"引用是否还挂着"和"挂着的引用是否还有效"两件事都做干净，而不是只依赖后者。纯 SDK 场景（从未 import 过 `litellm.proxy.*`，因而这个注册调用从未发生过）下这个 provider 永远是 `None`，所有相关函数退化为逐字节等价于今天的裸 `asyncio.create_task`——这就是"pure-SDK 行为必须逐字节不变"这条硬约束的落地方式。
 - `spawn_detached(coro, *, name)`——核心 SDK 代码里替代裸 `asyncio.create_task` 的唯一入口：先读 ambient scope，读不到（或已失效）就尝试 `acquire_root_scope()` 拿一个新 root scope，两者都拿不到就回退到裸 `asyncio.create_task`（byte-for-byte 匹配现状）。
 - `create_task_with_scope(coro, *, token)`——被 `LoggingWorker._process_log_task` 通过 `task.context.run(...)` 调用，在 `task.context` 内先绑定 `current_accounting_scope`（如果 `token` 同时满足 `AccountingScope` 的 `is_valid`/`spawn` 结构，用 `@runtime_checkable` Protocol 判断，不需要收窄 `LoggingTask.token` 的类型注解，那个字段维持 spec 原文写的中立 `CompletionToken | None`），再 `asyncio.create_task`，让 Path B 的嵌套创建点（如 `update_cache` 内部的裸 `create_task`）能在同一条 Context 链路上看到并使用这个 scope。
 
@@ -166,7 +166,10 @@ class ManagedTaskSet:
     def is_empty(self) -> bool: ...
     def cancel_all(self) -> None: ...
     async def wait_settled(self) -> None: ...
+    async def cancel_all_and_count_failures(self) -> tuple[int, int]: ...
 ```
+
+`cancel_all_and_count_failures()` is a new addition (previously only `cancel_all()` existed) needed by Task 4/5's `DeadlineExceeded.cancellation_failed`/`LoggingDeadlineExceeded.cancellation_failed` fields (spec's three-variant `DrainOutcome`, see Task 4/5/10 below): the deadline path must not just cancel best-effort, it must report back how many tasks actually honored the cancellation cleanly vs. how many did not (suppressed it, returned normally anyway, or raised something else), so ops can tell a "cancel worked" shutdown from a "some task refused to die" one from the returned outcome alone, not just from logs.
 
 **Steps**
 
@@ -272,6 +275,68 @@ class TestManagedTaskSet:
         s.add(asyncio.create_task(failing()))
         await s.wait_settled()  # must not propagate ValueError
         assert s.is_empty()
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_and_count_failures_counts_clean_cancellations(self):
+        s = ManagedTaskSet()
+        started = asyncio.Event()
+
+        async def work():
+            started.set()
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(work())
+        s.add(task)
+        await started.wait()
+
+        cancelled, cancellation_failed = await s.cancel_all_and_count_failures()
+        assert (cancelled, cancellation_failed) == (1, 0)
+        assert s.is_empty()
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_and_count_failures_counts_suppressed_cancellation_as_failed(self):
+        """A task that catches CancelledError and returns normally instead of
+        re-raising did not honor the cancellation -- it must count toward
+        cancellation_failed, not cancelled."""
+        s = ManagedTaskSet()
+        started = asyncio.Event()
+
+        async def swallow_cancellation():
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                return "ignored cancellation on purpose"
+
+        task = asyncio.create_task(swallow_cancellation())
+        s.add(task)
+        await started.wait()
+
+        cancelled, cancellation_failed = await s.cancel_all_and_count_failures()
+        assert (cancelled, cancellation_failed) == (0, 1)
+        assert s.is_empty()
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_and_count_failures_counts_other_exception_as_failed(self):
+        """A task that raises something other than CancelledError in
+        response to cancel() is not a clean cancellation either."""
+        s = ManagedTaskSet()
+        started = asyncio.Event()
+
+        async def raise_other_error():
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise ValueError("not a clean cancellation") from None
+
+        task = asyncio.create_task(raise_other_error())
+        s.add(task)
+        await started.wait()
+
+        cancelled, cancellation_failed = await s.cancel_all_and_count_failures()
+        assert (cancelled, cancellation_failed) == (0, 1)
+        assert s.is_empty()
 ```
 
 2. 确认失败：`pytest tests/test_litellm/litellm_core_utils/test_managed_task_set.py -v`——`ModuleNotFoundError: No module named 'litellm.litellm_core_utils.managed_task_set'`。
@@ -331,6 +396,37 @@ class ManagedTaskSet:
         while self._tasks:
             pending = tuple(self._tasks)
             await asyncio.gather(*pending, return_exceptions=True)
+
+    async def cancel_all_and_count_failures(self) -> tuple[int, int]:
+        """Cancel every currently-tracked task and report how many actually
+        honored the cancellation cleanly.
+
+        Returns (cancelled, cancellation_failed):
+          - cancelled: tasks whose result was a CancelledError raised in
+            direct response to this call's cancel().
+          - cancellation_failed: tasks that, despite being cancelled, either
+            returned normally (the coroutine caught CancelledError and chose
+            not to re-raise) or raised a different exception. asyncio.gather()
+            only returns once every snapshotted task is done, so there is no
+            third "still pending" outcome for a task inside one snapshot --
+            the fixed-point while-loop below exists only to also cancel a task
+            that a done-callback races into adding to this set mid-round, the
+            same race wait_settled() already guards against above.
+        """
+        cancelled = 0
+        cancellation_failed = 0
+        while self._tasks:
+            pending = tuple(self._tasks)
+            for task in pending:
+                task.cancel()
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            for result in results:
+                if isinstance(result, asyncio.CancelledError):
+                    cancelled += 1
+                else:
+                    cancellation_failed += 1
+        return cancelled, cancellation_failed
+```
 ```
 
 4. 确认转绿：同一 pytest 命令全绿。
@@ -367,13 +463,26 @@ class AccountingRootToken(CompletionToken, AccountingScope, Protocol):
 
 current_accounting_scope: ContextVar[AccountingScope | None]
 
-def register_root_scope_provider(provider: Callable[[], AccountingRootToken | None]) -> None: ...
+def register_root_scope_provider(provider: Callable[[], AccountingRootToken | None] | None) -> None: ...
 def acquire_root_scope() -> AccountingRootToken | None: ...
 def spawn_detached(coro: Coroutine[object, object, object], *, name: str) -> None: ...
 def create_task_with_scope(coro: Coroutine[object, object, object], *, token: CompletionToken | None) -> "asyncio.Task[object]": ...
+
+@contextlib.asynccontextmanager
+def ambient_or_root_scope() -> "AsyncIterator[AccountingScope | None]": ...
+
+@dataclass(frozen=True, slots=True)
+class NeutralOutcomeCompleted:
+    kind: Literal["completed"] = "completed"
 ```
 
 **补充说明（Task 6 落笔时回填，如实记录）**：`AccountingRootToken` 这个组合 Protocol 与 `register_root_scope_provider`/`acquire_root_scope` 的返回类型放宽，是撰写 Task 6（Path A 6 处接入）时才发现的真实需要——Path A 的调用点需要把"能 settle 的 token"和"能做子任务授权的 scope"合并成同一个值传给 `ensure_initialized_and_enqueue(token=...)`，而 Task 2 最初落盘时只顾到 Path B（`spawn_detached`）单独需要 `AccountingScope`。这是纯粹的类型收紧/放宽（`AccountingRootToken` 结构上是 `AccountingScope` 的子类型，处处可替换），不改变任何已落盘运行时行为，也不破坏 Task 2 已保存的任何测试断言（那些测试只检查 `.spawn()`/`.settle()` 等运行时调用，从不检查静态类型标注）。
+
+**范围调整说明（本轮评审回填，如实记录，非新增功能）**：以下两处调整都是把 Task 4/Task 8 已定的裁决（blocker 1/2：admission 只在 `settle()` 上关闭，不在 `spawn()` 上关闭；一条 lease 在自己 scope 存活期内可以派生任意有限次子任务）如实落到 Task 2 自身代码上的必然结果，不是独立新功能：
+
+1. **`NeutralOutcomeCompleted` 从 Task 3 提前到本 Task 定义**。原计划把它和 `NeutralOutcomeFailed`/`NeutralOutcomeDropped` 一起放在 Task 3（`accounting_scope.py` 的追加改动里），但 `spawn_detached` 本身（本 Task 定义）就需要在下面第 2 点的修复里 settle 一个"完成"结果，晚到 Task 3 才有定义会在本 Task 内产生前向引用。`NeutralOutcomeFailed`/`NeutralOutcomeDropped` 不受影响，继续留在 Task 3（它们服务的 drop/rebind 路径本身也定义在 Task 3）。
+2. **`spawn_detached` 的 ad hoc root 分支必须在 `spawn()` 之后立即自行 `settle()`**——这是撰写 Task 4 的 blocker 1/2 修复时才发现的真实缺口，如实记录：`spawn_detached` 在"没有 ambient scope、但 `acquire_root_scope()` 能拿到一个根 scope"这条回退路径里（即本次调用本身就是 root，例如 `streaming_handler.py` 的标准成功收尾场景），目前的实现只调用 `scope.spawn(...)` 就返回，从不调用 `scope.settle(...)`。在 blocker 1/2 修复前，这条路径能"蒙混过关"是因为旧版 `AccountingLease.spawn()` 的 `finally` 块本身就会关闭 admission（相当于把"一次性使用"的语义焐在了 `spawn()` 里）；一旦 blocker 1/2 把关闭 admission 的时机严格收敛到只有 `settle()` 才会触发（好让同一条 lease 在其 scope 存活期内可以派生任意有限次子任务），这条 ad hoc root 分支如果继续只 `spawn()` 不 `settle()`，`_admissions_in_progress` 会永久留一个計数不清零——因为这个 ad hoc root scope 只是这次函数调用里的局部变量，从未被返回给任何调用方，不会再有第二次机会去 `settle()` 它。修复：ad hoc root 分支在 `spawn()` 之后立即 `settle(NeutralOutcomeCompleted())`——这条 ad hoc root scope 存在的唯一目的就是"授权这一次 spawn"，spawn 调用本身返回的瞬间就是它生命周期的自然终点。
+3. **新增 `ambient_or_root_scope()` 异步上下文管理器（本轮评审 blocker 4 落笔时补充，本 Task 内追加，非 Task 8 自行拍板新接口）**：blocker 4（`_ProxyDBLogger.async_post_call_failure_hook`，详见 Task 8 B4 小节）需要的不是"给单次 `spawn()` 授权"（`spawn_detached` 已经做的事），而是"给一整段可能先后触碰多次 Path B 调用点的函数体授权，函数体自己收尾时才 settle"——两者的 ambient-或-root 判定逻辑（`current_accounting_scope.get()`、`is_valid()`、否则 `acquire_root_scope()`、只在自己新拿的 root 上才 settle）完全相同，唯一区别是"谁负责在什么时刻调用 settle()"：`spawn_detached` 自己在 `spawn()` 之后立即 settle（服务单次派生），`ambient_or_root_scope()` 把 settle 挪到 `async with` 块退出时（服务一整段可能派生多次的函数体）。为避免在 Task 8 B4 的落笔点手写第二份重复的 is_ambient 判定逻辑（违反本项目"不重复造轮子"的编码约定），把这个判定逻辑收敛成 `accounting_scope.py` 自己的一个薄封装，供 `spawn_detached` 之外的"整段函数体自行acquire/settle"场景复用。
 
 **Steps**
 
@@ -454,6 +563,8 @@ class TestSpawnDetached:
         _, name, kind = scope.spawned[0]
         assert name == "update_cache"
         assert kind == "accounting"
+        assert scope.settled == []  # nested/ambient case: caller who created
+        # this scope owns settling it, spawn_detached must never touch it
 
     @pytest.mark.asyncio
     async def test_ignores_ambient_scope_once_invalid_and_falls_back_to_bare_task(self):
@@ -484,6 +595,26 @@ class TestSpawnDetached:
             register_root_scope_provider(None)
 
         assert len(root_scope.spawned) == 1
+
+    @pytest.mark.asyncio
+    async def test_ad_hoc_root_scope_settles_itself_immediately_after_spawn(self):
+        """补充说明 #2（本轮评审前回填）的回归测试：ad hoc root scope（本次
+        调用本身就是 root，从 acquire_root_scope() 现拿现用、从未交还给任何
+        调用方）必须在 spawn() 之后立即自行 settle()，否则
+        AccountingLease._admissions_in_progress 会永久多计一次、永不清零——
+        这条 lease 从此再也没有第二次机会被 settle()。"""
+        root_scope = _FakeScope()
+        register_root_scope_provider(lambda: root_scope)
+        try:
+            async def coro():
+                pass
+
+            spawn_detached(coro(), name="root_boundary")
+        finally:
+            register_root_scope_provider(None)
+
+        assert len(root_scope.settled) == 1
+        assert root_scope.settled[0].kind == "completed"
 
 
 class TestCreateTaskWithScope:
@@ -522,6 +653,75 @@ class TestCreateTaskWithScope:
 
         task = ctx.run(create_task_with_scope, inner(), token=None)
         assert await task is None
+
+
+class TestAmbientOrRootScope:
+    """blocker 4 (本轮评审): async_post_call_failure_hook 需要的是"整段函数体
+    自行 acquire/settle"，不是 spawn_detached 那种单次派生授权——见 Task 2
+    "范围调整说明" #3。"""
+
+    @pytest.mark.asyncio
+    async def test_yields_ambient_scope_without_settling_it_on_exit(self):
+        from litellm.litellm_core_utils.accounting_scope import ambient_or_root_scope
+
+        scope = _FakeScope()
+        token = current_accounting_scope.set(scope)
+        try:
+            async with ambient_or_root_scope() as yielded:
+                assert yielded is scope
+        finally:
+            current_accounting_scope.reset(token)
+
+        assert scope.settled == []  # nested/ambient: caller who created this
+        # scope still owns settling it, ambient_or_root_scope must never touch it
+
+    @pytest.mark.asyncio
+    async def test_acquires_and_settles_a_fresh_root_scope_when_no_ambient_scope(self):
+        from litellm.litellm_core_utils.accounting_scope import (
+            ambient_or_root_scope,
+            register_root_scope_provider,
+        )
+
+        root_scope = _FakeScope()
+        register_root_scope_provider(lambda: root_scope)
+        try:
+            async with ambient_or_root_scope() as yielded:
+                assert yielded is root_scope
+                assert root_scope.settled == []  # not yet -- still inside the block
+        finally:
+            register_root_scope_provider(None)
+
+        assert len(root_scope.settled) == 1
+        assert root_scope.settled[0].kind == "completed"
+
+    @pytest.mark.asyncio
+    async def test_settles_even_when_the_body_raises(self):
+        from litellm.litellm_core_utils.accounting_scope import (
+            ambient_or_root_scope,
+            register_root_scope_provider,
+        )
+
+        root_scope = _FakeScope()
+        register_root_scope_provider(lambda: root_scope)
+        try:
+            with pytest.raises(ValueError):
+                async with ambient_or_root_scope():
+                    raise ValueError("boom")
+        finally:
+            register_root_scope_provider(None)
+
+        assert len(root_scope.settled) == 1
+
+    @pytest.mark.asyncio
+    async def test_yields_none_and_settles_nothing_when_no_scope_available_at_all(self):
+        from litellm.litellm_core_utils.accounting_scope import (
+            ambient_or_root_scope,
+            register_root_scope_provider,
+        )
+
+        register_root_scope_provider(None)  # explicit: pure-SDK has no provider
+        async with ambient_or_root_scope() as yielded:
+            assert yielded is None
 ```
 
 2. 确认失败：`pytest tests/test_litellm/litellm_core_utils/test_accounting_scope.py -v`——`ModuleNotFoundError`。
@@ -549,8 +749,10 @@ code path unchanged.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
-from typing import Callable, Coroutine, Literal, Protocol, runtime_checkable
+import dataclasses
+from typing import AsyncIterator, Callable, Coroutine, Literal, Protocol, runtime_checkable
 
 
 class AccountingOutcomeLike(Protocol):
@@ -606,11 +808,31 @@ current_accounting_scope: "contextvars.ContextVar[AccountingScope | None]" = con
 _root_scope_provider: "Callable[[], AccountingRootToken | None] | None" = None
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class NeutralOutcomeCompleted:
+    """Neutral (proxy-agnostic) completed-outcome value, settled by
+    spawn_detached()'s own ad hoc root branch onto a scope it acquired and
+    owns for the duration of a single call (see this Task's "范围调整说明"
+    #1/#2 above): kept here, not in Task 3's NeutralOutcomeFailed/Dropped,
+    because spawn_detached (defined in this same module) needs it, and
+    defining it at Task 3 instead would create a forward reference within
+    this Task."""
+
+    kind: Literal["completed"] = "completed"
+
+
 def register_root_scope_provider(provider: "Callable[[], AccountingRootToken | None] | None") -> None:
-    """One-shot DI registration, called once at proxy-startup import time by
-    managed_task_supervisor.py (module-level side effect, same idiom as this
-    codebase's existing `GLOBAL_LOGGING_WORKER = LoggingWorker()` singleton).
-    Passing `None` clears it back to pure-SDK behavior (used by tests)."""
+    """Revocable DI registration hook (major 9): Task 10's lifespan startup
+    calls this once, after the proxy has finished starting up, with
+    `GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease`; Task 10's lifespan
+    shutdown calls it again with `None` once `drain()` has fully returned.
+    Deliberately NOT a one-shot import-time side effect (an earlier revision
+    of this docstring said so; superseded once this Task's registration call
+    itself moved out of module-import time and into Task 10's lifespan, so
+    the same-process "run a proxy, shut it down, then make a pure-SDK call"
+    scenario never keeps a dangling reference to an already-shut-down
+    supervisor). Passing `None` is also this module's own default (never
+    imported/registered at all == pure-SDK usage, unaffected)."""
     global _root_scope_provider
     _root_scope_provider = provider
 
@@ -630,12 +852,23 @@ def spawn_detached(coro: "Coroutine[object, object, object]", *, name: str) -> N
     (this call site *is* the root, e.g. streaming_handler.py's standard
     streaming success boundary) -> bare create_task (no accounting machinery
     registered at all, i.e. pure-SDK; or the scope refused admission).
+
+    The ad hoc root branch settles its freshly-acquired scope immediately
+    after spawning through it (see this Task's "范围调整说明" #2 above): this
+    scope is a purely local variable, never handed back to any caller, so
+    nothing else will ever call settle() on it -- without this, a
+    supervisor's `_admissions_in_progress` counter would leak one
+    permanently-uncleared count per ad hoc call. An ambient (nested) scope is
+    never settled here -- its root caller owns that.
     """
     scope = current_accounting_scope.get()
-    if scope is None or not scope.is_valid():
+    is_ambient = scope is not None and scope.is_valid()
+    if not is_ambient:
         scope = acquire_root_scope()
     if scope is not None and scope.is_valid():
         scope.spawn(coro, name=name, kind="accounting")
+        if not is_ambient:
+            scope.settle(NeutralOutcomeCompleted())
         return
     asyncio.create_task(coro)
 
@@ -659,6 +892,39 @@ def create_task_with_scope(
     if isinstance(token, AccountingScope):
         current_accounting_scope.set(token)
     return asyncio.create_task(coro)
+
+
+@contextlib.asynccontextmanager
+async def ambient_or_root_scope() -> "AsyncIterator[AccountingScope | None]":
+    """Yield the ambient scope if one is already set and still valid;
+    otherwise acquire a fresh root scope for the duration of the `async with`
+    block and settle it (NeutralOutcomeCompleted) on exit -- including when
+    the block raises, so a failure inside the body never leaks an
+    unsettled ad hoc root the way spawn_detached's own fallback would if it
+    forgot to settle (Task 2 "范围调整说明" #2).
+
+    Unlike spawn_detached (which settles immediately after a single spawn()),
+    this is for a whole unit of work that may spawn zero, one, or several
+    Path B children before it is done -- e.g. blocker 4's
+    async_post_call_failure_hook, which reaches update_database's single
+    spawn_detached call site but should not force spawn_detached to keep
+    re-resolving ambient-vs-root on every nested call once the outer function
+    has already established one for its own duration.
+
+    A nested/ambient scope is never settled here -- its own root caller owns
+    that, exactly as in spawn_detached.
+    """
+    existing = current_accounting_scope.get()
+    is_ambient = existing is not None and existing.is_valid()
+    scope = existing if is_ambient else acquire_root_scope()
+    token = current_accounting_scope.set(scope) if scope is not None and not is_ambient else None
+    try:
+        yield scope
+    finally:
+        if scope is not None and not is_ambient:
+            scope.settle(NeutralOutcomeCompleted())
+        if token is not None:
+            current_accounting_scope.reset(token)
 ```
 
 4. 确认转绿：`pytest tests/test_litellm/litellm_core_utils/test_accounting_scope.py -v` 全绿（已核实 `pyproject.toml:291` 设置 `asyncio_mode = "auto"`，全部用 `@pytest.mark.asyncio` + `async def` 写法，与 `test_logging_worker.py` 等既有测试一致，不引入本仓库未用过的 `event_loop` fixture）。
@@ -980,6 +1246,27 @@ def _settle(token: "CompletionToken | None", outcome) -> None:
         token.settle(outcome)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class Enqueued:
+    pass
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Rejected:
+    reason: str
+
+
+EnqueueOutcome = Enqueued | Rejected
+"""blocker 3（本轮评审）：`enqueue()`的hot-path首次尝试与`_retry_enqueue_task`的
+延迟重试，此前各自独立检查不同的前置条件（前者查 `_queue is None`/`_admission_open`
+两项，后者只查 `_queue is None` 一项，从未检查 `_admission_open` 或任何"硬 quiesce"
+状态）——意味着 quiesce() 关闭 admission 之后，一个仍在延迟重试队列里的旧 item
+依然可能在 admission 已关闭的情况下被重新塞回队列、并被 worker loop 正常执行，
+与"关停期不再接受/执行新工作"这条约定矛盾。统一成 `_try_enqueue_existing_task`
+一个入口，两个调用点都过同一套检查（queue 存在性 / `_admission_open` / 
+`_quiesced`（major 8 新增的硬 quiesce 标志）/ 实际 `put_nowait()` 是否成功）。"""
+
+
 class LoggingWorker:
     """
     A simple, async logging worker that processes log coroutines in the background.
@@ -1010,6 +1297,15 @@ class LoggingWorker:
         """Flipped by quiesce() (Task 5) via its `admission_policy` callable.
         SDK-only usage never calls quiesce(), so this stays True forever for
         pure-SDK callers -- part of the byte-for-byte-unchanged guarantee."""
+        self._quiesced: bool = False
+        """major 8 (本轮评审新增)：一旦 `stop_after_quiesce()`（Task 5）被调用，
+        永久置真——与 `_admission_open` 是两个独立维度：`_admission_open` 是
+        quiesce() 循环期间逐轮翻面的"这一刻是否还接受新 enqueue"，`_quiesced`
+        是"worker loop 自身是否已经进入终态、绝不能再执行 clear_queue() 里的
+        业务 callback"。`_worker_loop` 自己的 `except CancelledError` 分支据此
+        判断：为真则走 `_drain_and_settle_dropped`（只丢弃结算，不执行），为假
+        则维持 pre-Phase-1b 既有行为，仍走 `clear_queue()`（会执行队列里的
+        业务 callback，供既有非 quiesce 的 `stop()` 调用方保持行为不变）。"""
 
         atexit.register(self._flush_on_exit)
 
@@ -1018,7 +1314,14 @@ class LoggingWorker:
         settle its token as dropped. Used wherever a queue is about to be
         discarded (event-loop change) or emptied post-deadline (quiesce(),
         Task 5) without ever being processed. Returns the number of items
-        drained, so quiesce() can report it in LoggingDeadlineExceeded."""
+        drained, so quiesce() can report it in LoggingDeadlineExceeded.
+
+        **major 7 修订**：每一次 `get_nowait()` 都必须配一次 `task_done()`——
+        `get_nowait()` 会递减 `asyncio.Queue` 内部的 unfinished-task 计数器，
+        而 `flush()`/`worker.flush()` 依赖 `queue.join()` 等这个计数器归零；
+        此前这里从未调用过 `task_done()`，导致任何一次真正走到这个分支的 drop
+        （event-loop 切换、或 quiesce() 的 deadline 分支）都会让 `join()`
+        永远挂起，因为计数器从未被这些"直接丢弃、从未真正处理"的 item 减到底。"""
         if queue is None:
             return 0
         drained = 0
@@ -1027,9 +1330,12 @@ class LoggingWorker:
                 task = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            task.coroutine.close()
-            _settle(task.token, NeutralOutcomeDropped(reason=reason))
-            drained += 1
+            try:
+                task.coroutine.close()
+                _settle(task.token, NeutralOutcomeDropped(reason=reason))
+                drained += 1
+            finally:
+                queue.task_done()
         return drained
 
     def _ensure_queue(self) -> None:
@@ -1107,26 +1413,54 @@ class LoggingWorker:
 
         except asyncio.CancelledError:
             verbose_logger.debug("LoggingWorker cancelled during shutdown")
-            await self.clear_queue()
+            if self._quiesced:
+                # major 8: once stop_after_quiesce() has run, cancellation
+                # must never fall through to clear_queue() -- that method
+                # still executes queued business coroutines (see its own
+                # docstring), which is exactly what quiesce()'s deadline
+                # path and the whole shutdown contract forbid past this
+                # point. Drop-and-settle only.
+                self._drain_and_settle_dropped(self._queue, reason="quiesced_shutdown")
+            else:
+                await self.clear_queue()
+
+    def _try_enqueue_existing_task(self, task: LoggingTask) -> "EnqueueOutcome":
+        """Single admission gate for handing an already-constructed
+        LoggingTask to `self._queue` -- shared by enqueue()'s hot-path
+        attempt and _retry_enqueue_task()'s delayed retry (blocker 3), so
+        both check exactly the same preconditions in the same order instead
+        of drifting apart (the retry path previously only checked `_queue is
+        None`, silently ignoring `_admission_open`)."""
+        if self._queue is None:
+            return Rejected(reason="worker_not_initialized")
+        if not self._admission_open:
+            return Rejected(reason="admission_closed")
+        if self._quiesced:
+            return Rejected(reason="quiesced")
+        try:
+            self._queue.put_nowait(task)
+        except asyncio.QueueFull:
+            return Rejected(reason="queue_full")
+        return Enqueued()
 
     def enqueue(self, coroutine: Coroutine, *, token: "CompletionToken | None" = None) -> None:
         """
         Add a coroutine to the logging queue.
         Hot path: never blocks, aggressively clears queue if full.
         """
-        if self._queue is None or not self._admission_open:
-            coroutine.close()
-            reason = "worker_not_initialized" if self._queue is None else "admission_closed"
-            _settle(token, NeutralOutcomeDropped(reason=reason))
-            return
-
         task = LoggingTask(coroutine=coroutine, context=contextvars.copy_context(), token=token)
-
-        try:
-            self._queue.put_nowait(task)
-        except asyncio.QueueFull:
-            verbose_logger.exception("LoggingWorker queue is full")
-            self._handle_queue_full(task)
+        outcome = self._try_enqueue_existing_task(task)
+        match outcome:
+            case Enqueued():
+                return
+            case Rejected(reason="queue_full"):
+                verbose_logger.exception("LoggingWorker queue is full")
+                self._handle_queue_full(task)
+            case Rejected(reason=reason):
+                coroutine.close()
+                _settle(token, NeutralOutcomeDropped(reason=reason))
+            case _:
+                assert_never(outcome)
 
     def _should_start_aggressive_clear(self) -> bool:
         if self._aggressive_clear_in_progress:
@@ -1182,15 +1516,17 @@ class LoggingWorker:
     async def _retry_enqueue_task(self, task: LoggingTask, delay: float) -> None:
         await asyncio.sleep(delay)
 
-        if self._queue is None:
-            task.coroutine.close()
-            _settle(task.token, NeutralOutcomeDropped(reason="queue_gone_before_retry"))
-            return
-
-        try:
-            self._queue.put_nowait(task)
-        except asyncio.QueueFull:
-            self._handle_queue_full(task)
+        outcome = self._try_enqueue_existing_task(task)
+        match outcome:
+            case Enqueued():
+                return
+            case Rejected(reason="queue_full"):
+                self._handle_queue_full(task)
+            case Rejected(reason=reason):
+                task.coroutine.close()
+                _settle(task.token, NeutralOutcomeDropped(reason=reason))
+            case _:
+                assert_never(outcome)
 
     def _extract_tasks_from_queue(self) -> list[LoggingTask]:
         if self._queue is None:
@@ -1406,9 +1742,18 @@ GLOBAL_LOGGING_WORKER = LoggingWorker()
 
 **范围调整说明（如实记录，非静默改动）**：原 8 点任务清单把"扩展 `AccountingSkippedDuringShutdown` 为完整 tagged union"列为独立的第 7 点、和"记账创建点接入"的第 6 点分开。读码后发现 `AccountingLease.settle()`（本 Task）必须把中立 `NeutralOutcome*`（Task 3）翻译成 proxy 侧的富类型才能对外暴露 `.outcome`，也就是说**完整 union 必须先于/随 `AccountingLease` 一起存在**，不能拖到后面单独的"接入"任务里才定义，否则 Task 4 自己都编译不过。因此把"扩展 tagged union"的定义并入本 Task，原第 8 点（Task 8）改为纯粹的"B2/B3 两个记账创建点接入 accounting 感知的任务派生机制"，不再重复定义类型。这是任务编号内部的先后顺序调整，不改变任何验收范围或 spec 覆盖面。（Task 8 落笔时进一步发现，具体机制应复用 Task 2 的 `spawn_detached`，而非本 Task 最初设想的专用 `spawn_child` 入口——详见下面"补充说明"与 Task 8 正文的"记录未采纳方案"。）
 
+**本轮评审已定裁决（非本计划自行拍板，四条一并落到本 Task）**：
+
+1. **blocker 1（拆分 admission 与 hard shutdown）**：此前 `close_root_admission()` 直接把 `_hard_shutdown` 置位，这个标志同时也是 `AccountingLease.is_valid()` 判断自己是否还有效的依据——等于"只封闭新 root 入口"这一步会连带让所有已发放、仍在存活期内的 lease 瞬间失效，违反 spec"仍允许已登记 accounting task 派生 child"这条要求。修复：拆成两个独立标志，`_root_admission_open`（`close_root_admission()` 只翻这一个）与 `_hard_shutdown`（只有 `drain()` 自己的 deadline/force-exit 分支才翻）；`acquire_root_lease()` 只看前者，`AccountingLease.is_valid()` 只看自身 `_settled` 与后者，永不看前者。
+2. **blocker 2（scope 生命周期绑定 root 协程自身生命周期，而非首次 spawn）**：见上方"设计说明"的修订——`AccountingLease.spawn()` 不再在自己的 `finally` 里关闭 admission，只有 `settle()` 才关闭；同一条 lease 在 root 协程自己跑完之前可以先后派生任意有限次子任务。
+3. **`DrainOutcome` 改为 spec 字面三变体**：见上方 Interfaces 一节。
+4. **Phase 2 预留**：`AccountingLease` 新增一个不透明的 `correlation_token: object | None = None` 字段，Phase 1b 里永远是 `None`、不参与任何判断逻辑，只是提前把字段占位留好，避免 Phase 2 需要时再动一次这个已冻结的构造签名。
+
+**major 6（drain() 必须等 telemetry 也 settle，且 `cancellation_failed` 要有真实统计口径）**：`drain()` 的 `Drained`/`DeadlineExceeded`/`ForcedExit` 三条返回路径，在 `self._telemetry.cancel_all()` 之后都必须 `await self._telemetry.wait_settled()`，不能取消完就直接返回、把"这些任务到底有没有真的响应取消"这件事丢给垃圾回收器；deadline 分支的 `cancelled`/`cancellation_failed` 改用 Task 1 新增的 `self._accounting.cancel_all_and_count_failures()` 产出真实统计（区分"干净响应了 cancel()"与"取消后仍返回正常值/抛出其他异常"），不再是此前 `len(self._accounting)`/`self._admissions_in_progress` 这种"取消完之后还剩多少个"的静态快照（那种写法从不反映取消本身是否成功）。
+
 **Files**: `litellm/proxy/shutdown/accounting_outcome.py`（改，Phase 1a 产物，扩展）, `litellm/proxy/shutdown/managed_task_supervisor.py`（新）, `tests/test_litellm/proxy/shutdown/test_accounting_outcome.py`（新，先核实 Phase 1a 是否已建对应测试文件——已核实：Phase 1a 计划正文的 Task 6 只把断言写进了 `tests/test_litellm/proxy/db/test_spend_counter_reseed.py` 和 `tests/test_litellm/caching/test_redis_cache.py` 里，未新建独立的 `test_accounting_outcome.py`，所以这里新建是合理的，不是重复）, `tests/test_litellm/proxy/shutdown/test_managed_task_supervisor.py`（新）
 
-**设计说明**：`admissions_in_progress` 这个计数器要有真实语义（不是"函数调用内自增自减、从未被其他协程观察到"的摆设），所以窗口定义为「`acquire_root_lease()` 拿到 lease」到「这个 lease 第一次 `spawn()` 或 `settle()`（两者取先）」之间——这段窗口之间**没有** `await`点由本模块插入，但调用方（比如 `_client_async_logging_helper` 拿到 lease 后、真正 `enqueue()` 之前）可能会先做一段自己的同步/异步工作，此时 `drain()` 的 `while True` 循环如果恰好在这个窗口被协作调度到，必须能看到"还有一个 admission 未关闭"而不是误判为已排空。
+**设计说明**：`admissions_in_progress` 这个计数器要有真实语义（不是"函数调用内自增自减、从未被其他协程观察到"的摆设），所以窗口定义为「`acquire_root_lease()` 拿到 lease」到「这个 lease 调用 `settle()`」之间——**已定裁决（本轮评审修订，blocker 2）**：窗口终点**只有** `settle()`，不再是"`spawn()` 或 `settle()`（两者取先）"。scope 的生命周期绑定的是它所属 root 协程自身的生命周期，而不是"第一次派生子任务"这个时间点：同一个 root 协程在自己彻底跑完之前，可以先后派生任意有限次数的子任务（比如同一个流式响应先后触发 `_batch_database_updates` 和 `update_cache` 两次记账工作），每一次都还应该被算作"这个 root 仍然存活、仍然可能再派生"，只有 root 自己的 `finally` 块调用 `settle()`（无论成功还是失败收尾）才是这段窗口的真正终点。这段窗口之间**没有** `await`点由本模块插入，但调用方（比如 `_client_async_logging_helper` 拿到 lease 后、真正 `enqueue()` 之前，或者派生了第一个子任务之后还要继续派生第二个之前）可能会先做一段自己的同步/异步工作，此时 `drain()` 的 `while True` 循环如果恰好在这个窗口被协作调度到，必须能看到"还有一个 admission 未关闭"而不是误判为已排空。
 
 **Interfaces**
 
@@ -1432,27 +1777,37 @@ class AccountingLease:
     def spawn(self, coro, *, name: str, kind: Literal["accounting", "telemetry"]) -> None: ...
     @property
     def outcome(self) -> AccountingOutcome | None: ...
+    correlation_token: object | None  # Phase 2 reservation, always None in Phase 1b
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Drained: ...
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class DeadlineExceeded:
-    remaining_accounting_tasks: int
-    remaining_admissions_in_progress: int
+    cancelled: int
+    cancellation_failed: int
 
-DrainOutcome = Drained | DeadlineExceeded
+@dataclasses.dataclass(frozen=True, slots=True)
+class ForcedExit:
+    cancelled: int
+    cancellation_failed: int
+
+DrainOutcome = Drained | DeadlineExceeded | ForcedExit
 
 class ManagedTaskSupervisor:
     def acquire_root_lease(self) -> AccountingLease | None: ...
     def spawn_telemetry(self, coro, *, name: str) -> None: ...
     def is_shutting_down_hard(self) -> bool: ...
+    def close_root_admission(self) -> None: ...
     async def drain(
         self,
         deadline_remaining: Callable[[], float],
         root_queue_unfinished: Callable[[], int] = lambda: 0,
+        is_force_exit: Callable[[], bool] = GracefulShutdownManager.is_force_exit,
     ) -> DrainOutcome: ...
 ```
+
+**已定裁决（本轮评审，非本计划自行拍板）：`DrainOutcome` 是 spec 第 140/176 行字面要求的三变体 `Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`**，不是此前几轮撰写里一直维持的两变体（`remaining_accounting_tasks`/`remaining_admissions_in_progress` 字段、无独立 `ForcedExit`）。`drain()` 新增 `is_force_exit: Callable[[], bool]` 参数，默认绑定 `GracefulShutdownManager.is_force_exit`（Phase 1a 已有的无参 `@classmethod`，可以直接作为一个零参可调用对象传递，见该方法自身文档：`deadline_remaining()` 在 `_force_exit` 为真时本来就坍缩成 `0.0`，让 `while deadline_remaining() > 0` 型循环不用额外多穿一个 flag 就能同时应对两种触发原因——但这也意味着 `drain()`/`quiesce()` 自己无法只从 `deadline_remaining()` 的返回值反推出"是强制退出、还是单纯到期"，必须显式再问一次 `is_force_exit()`）；到达 deadline 分支时判断 `is_force_exit()`：为真则产出 `ForcedExit`，为假则产出 `DeadlineExceeded`——两者字段形状相同（`cancelled`/`cancellation_failed`），只是变体标签不同，供调用方（Task 10）程序化区分，不再依赖日志文本。`cancelled`/`cancellation_failed` 由新增的 `ManagedTaskSet.cancel_all_and_count_failures()`（Task 1）产出，取代此前的 `remaining_accounting_tasks`/`remaining_admissions_in_progress`（那两个字段本来就只是"取消之后 `len()`/计数器还剩多少"的静态快照，从未真正反映"取消是否成功"）。
 
 **Steps**
 
@@ -1509,6 +1864,7 @@ import pytest
 from litellm.proxy.shutdown.managed_task_supervisor import (
     DeadlineExceeded,
     Drained,
+    ForcedExit,
     ManagedTaskSupervisor,
 )
 
@@ -1548,15 +1904,81 @@ class TestAccountingLease:
         lease.settle(_Outcome())
         assert supervisor._admissions_in_progress == 0
 
-    def test_admissions_in_progress_closes_on_spawn(self):
+    def test_admissions_in_progress_stays_open_across_any_number_of_spawns_until_settle(self):
+        """blocker 2 regression: scope lifetime is bound to the owning root
+        coroutine's own lifetime, not to the first spawn() call -- the same
+        lease must be able to spawn multiple children (e.g. a root that
+        triggers both _batch_database_updates and update_cache) before its
+        owner finally calls settle()."""
         supervisor = ManagedTaskSupervisor()
         lease = supervisor.acquire_root_lease()
 
         async def coro():
             pass
 
-        lease.spawn(coro(), name="x", kind="accounting")
-        assert supervisor._admissions_in_progress == 0
+        lease.spawn(coro(), name="_batch_database_updates", kind="accounting")
+        assert supervisor._admissions_in_progress == 1  # still open after first spawn
+
+        lease.spawn(coro(), name="update_cache", kind="accounting")
+        assert supervisor._admissions_in_progress == 1  # still open after second spawn
+
+        class _Outcome:
+            kind = "completed"
+
+        lease.settle(_Outcome())
+        assert supervisor._admissions_in_progress == 0  # only settle() closes it
+
+    def test_correlation_token_defaults_to_none_and_is_not_interpreted(self):
+        """Phase 2 reservation: the field exists so Phase 2 does not need to
+        touch this already-frozen constructor signature again, but Phase 1b
+        never assigns it a non-None value nor branches on it."""
+        supervisor = ManagedTaskSupervisor()
+        lease = supervisor.acquire_root_lease()
+        assert lease is not None
+        assert lease.correlation_token is None
+
+
+class TestCloseRootAdmissionVsHardShutdown:
+    """blocker 1 regression: closing root admission and declaring a hard
+    shutdown are two independent state transitions -- the former must never
+    invalidate leases that were already issued before it ran."""
+
+    def test_close_root_admission_refuses_new_root_leases(self):
+        supervisor = ManagedTaskSupervisor()
+        supervisor.close_root_admission()
+        assert supervisor.acquire_root_lease() is None
+
+    def test_close_root_admission_leaves_existing_lease_valid_and_able_to_spawn_a_child(self):
+        supervisor = ManagedTaskSupervisor()
+        lease = supervisor.acquire_root_lease()
+        assert lease is not None
+
+        supervisor.close_root_admission()
+
+        assert lease.is_valid()
+
+        async def coro():
+            pass
+
+        lease.spawn(coro(), name="child_after_root_closed", kind="accounting")
+        assert not supervisor._accounting.is_empty()  # the spawn actually went through
+
+    def test_hard_shutdown_invalidates_existing_lease_and_refuses_further_spawns(self):
+        supervisor = ManagedTaskSupervisor()
+        lease = supervisor.acquire_root_lease()
+        assert lease is not None
+
+        supervisor._hard_shutdown = True  # simulate drain()'s deadline branch
+
+        assert not lease.is_valid()
+
+        ran = []
+
+        async def coro():
+            ran.append("ran")
+
+        lease.spawn(coro(), name="refused", kind="accounting")
+        assert supervisor._accounting.is_empty()  # refused: coroutine closed, never scheduled
 
 
 class TestSpawnChildAndTelemetry:
@@ -1571,8 +1993,7 @@ class TestSpawnChildAndTelemetry:
 
         lease.spawn(coro(), name="update_cache", kind="accounting")
         await asyncio.wait_for(done.wait(), timeout=1)
-        assert supervisor._accounting.is_empty() or True  # allow done-callback race
-        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # let the done-callback run
         assert supervisor._accounting.is_empty()
 
     @pytest.mark.asyncio
@@ -1587,7 +2008,15 @@ class TestSpawnChildAndTelemetry:
         await asyncio.wait_for(done.wait(), timeout=1)
 
     @pytest.mark.asyncio
-    async def test_task_creation_failure_rolls_back_admission_and_closes_coroutine(self, monkeypatch):
+    async def test_task_creation_failure_closes_coroutine_but_leaves_admission_open_for_caller_to_settle(
+        self, monkeypatch
+    ):
+        """blocker 2 regression: admission bookkeeping is exclusively
+        settle()'s job now -- a failed spawn() attempt (e.g. the event loop
+        rejects task creation) must not silently roll back admission either;
+        the owning root coroutine is still expected to reach its own
+        `finally` and call settle() itself, regardless of how many
+        intermediate spawn() attempts succeeded or failed."""
         supervisor = ManagedTaskSupervisor()
         lease = supervisor.acquire_root_lease()
         closed = []
@@ -1609,7 +2038,7 @@ class TestSpawnChildAndTelemetry:
             lease.spawn(_Coro(), name="x", kind="accounting")
 
         assert closed == [True]
-        assert supervisor._admissions_in_progress == 0  # rolled back, not leaked
+        assert supervisor._admissions_in_progress == 1  # unaffected -- only settle() closes it
 
 
 class TestDrain:
@@ -1636,27 +2065,67 @@ class TestDrain:
         assert finished == ["x"]
 
     @pytest.mark.asyncio
-    async def test_drain_cancels_and_reports_deadline_exceeded_when_child_outlives_deadline(self):
+    async def test_drain_reports_deadline_exceeded_with_clean_cancellation_count(self):
         supervisor = ManagedTaskSupervisor()
         lease = supervisor.acquire_root_lease()
-        cancelled = asyncio.Event()
+        cancelled_event = asyncio.Event()
 
         async def coro():
             try:
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
-                cancelled.set()
+                cancelled_event.set()
                 raise
 
         lease.spawn(coro(), name="update_cache", kind="accounting")
 
-        outcome = await supervisor.drain(deadline_remaining=lambda: -1.0)
+        outcome = await supervisor.drain(deadline_remaining=lambda: -1.0, is_force_exit=lambda: False)
 
-        assert isinstance(outcome, DeadlineExceeded)
-        assert cancelled.is_set()
+        assert outcome == DeadlineExceeded(cancelled=1, cancellation_failed=0)
+        assert cancelled_event.is_set()
 
     @pytest.mark.asyncio
-    async def test_drain_cancels_telemetry_tasks_once_accounting_is_settled(self):
+    async def test_drain_reports_forced_exit_instead_of_deadline_exceeded_when_is_force_exit_true(self):
+        """已定裁决（三变体）：到达 deadline 时是 DeadlineExceeded 还是 ForcedExit 完全由
+        注入的 is_force_exit() 决定，drain() 自己不重新猜测触发原因。"""
+        supervisor = ManagedTaskSupervisor()
+        lease = supervisor.acquire_root_lease()
+
+        async def coro():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise
+
+        lease.spawn(coro(), name="update_cache", kind="accounting")
+
+        outcome = await supervisor.drain(deadline_remaining=lambda: -1.0, is_force_exit=lambda: True)
+
+        assert outcome == ForcedExit(cancelled=1, cancellation_failed=0)
+
+    @pytest.mark.asyncio
+    async def test_drain_deadline_exceeded_counts_a_suppressed_cancellation_as_cancellation_failed(self):
+        supervisor = ManagedTaskSupervisor()
+        lease = supervisor.acquire_root_lease()
+
+        async def swallow_cancellation():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                return "ignored on purpose"
+
+        lease.spawn(swallow_cancellation(), name="update_cache", kind="accounting")
+
+        outcome = await supervisor.drain(deadline_remaining=lambda: -1.0, is_force_exit=lambda: False)
+
+        assert outcome == DeadlineExceeded(cancelled=0, cancellation_failed=1)
+
+    @pytest.mark.asyncio
+    async def test_drain_awaits_telemetry_settlement_before_returning_on_the_happy_path(self):
+        """major 6: even the non-deadline Drained path must not return while
+        a cancelled telemetry task is still mid-cancellation -- it must be
+        observably settled by the time drain() itself returns, not merely
+        "cancel() was called at some point"."""
         supervisor = ManagedTaskSupervisor()
         telemetry_cancelled = asyncio.Event()
 
@@ -1673,8 +2142,37 @@ class TestDrain:
         outcome = await supervisor.drain(deadline_remaining=lambda: 5.0)
 
         assert isinstance(outcome, Drained)
+        assert telemetry_cancelled.is_set()  # already true -- no extra sleep needed after drain() returns
+        assert supervisor._telemetry.is_empty()
+
+    @pytest.mark.asyncio
+    async def test_drain_awaits_telemetry_settlement_before_returning_on_the_deadline_path(self):
+        supervisor = ManagedTaskSupervisor()
+        lease = supervisor.acquire_root_lease()
+        telemetry_cancelled = asyncio.Event()
+
+        async def accounting_coro():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise
+
+        async def telemetry_coro():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                telemetry_cancelled.set()
+                raise
+
+        lease.spawn(accounting_coro(), name="update_cache", kind="accounting")
+        supervisor.spawn_telemetry(telemetry_coro(), name="budget_alerts")
         await asyncio.sleep(0)
+
+        outcome = await supervisor.drain(deadline_remaining=lambda: -1.0, is_force_exit=lambda: False)
+
+        assert isinstance(outcome, DeadlineExceeded)
         assert telemetry_cancelled.is_set()
+        assert supervisor._telemetry.is_empty()
 
     @pytest.mark.asyncio
     async def test_drain_honors_injected_root_queue_unfinished_before_reporting_drained(self):
@@ -1757,6 +2255,7 @@ from litellm.proxy.shutdown.accounting_outcome import (
     AccountingOutcome,
     AccountingSkippedDuringShutdown,
 )
+from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
 # Bounded poll interval for the fixed-point re-check in drain()/quiesce()
 # (Task 5 reuses this same constant). A bare `await asyncio.sleep(0)` would
@@ -1784,31 +2283,35 @@ def _translate(outcome: AccountingOutcomeLike) -> AccountingOutcome:
 
 
 class AccountingLease:
-    __slots__ = ("_supervisor", "_settled", "_outcome", "_admission_closed")
+    """已定裁决（blocker 1/2，本轮评审）：admission 只在 `settle()` 上关闭，`spawn()`
+    自身从不关闭——scope 的生命周期绑定的是它所属 root 协程自身的生命周期，而不是"第一次
+    派生子任务"这个时间点，允许同一条 lease 在存活期内先后派生任意有限次子任务。"""
 
-    def __init__(self, supervisor: "ManagedTaskSupervisor") -> None:
+    __slots__ = ("_supervisor", "_settled", "_outcome", "correlation_token")
+
+    def __init__(self, supervisor: "ManagedTaskSupervisor", *, correlation_token: object | None = None) -> None:
         self._supervisor = supervisor
         self._settled = False
         self._outcome: AccountingOutcome | None = None
-        self._admission_closed = False
+        # Phase 2 预留字段：Phase 1b 里永远是 None，不参与任何判断逻辑，只是提前把构造
+        # 签名占位留好，避免 Phase 2 需要时再动一次这个已冻结的签名。
+        self.correlation_token = correlation_token
         supervisor._admissions_in_progress += 1
 
-    def _close_admission(self) -> None:
-        if self._admission_closed:
-            return
-        self._admission_closed = True
-        self._supervisor._admissions_in_progress -= 1
-
     def is_valid(self) -> bool:
+        """只看自身是否已 settle、以及 supervisor 是否已进入 hard shutdown——**从不**看
+        root admission 是否已经关闭（blocker 1）：`close_root_admission()` 只拒绝*新*
+        lease，不使已发放的 lease 失效。"""
         return not self._settled and not self._supervisor.is_shutting_down_hard()
 
     def settle(self, outcome: AccountingOutcomeLike) -> None:
-        """Idempotent, per spec: only the first call wins."""
+        """Idempotent, per spec: only the first call wins. This is the ONLY
+        place admission closes (blocker 2) -- `spawn()` never closes it."""
         if self._settled:
             return
         self._settled = True
         self._outcome = _translate(outcome)
-        self._close_admission()
+        self._supervisor._admissions_in_progress -= 1
 
     def spawn(
         self,
@@ -1817,15 +2320,21 @@ class AccountingLease:
         name: str,
         kind: Literal["accounting", "telemetry"],
     ) -> None:
-        try:
-            if kind == "accounting":
-                self._supervisor._spawn_accounting_child(coro, name=name, scope=self)
-            elif kind == "telemetry":
-                self._supervisor._spawn_telemetry_child(coro, name=name)
-            else:
-                assert_never(kind)
-        finally:
-            self._close_admission()
+        if not self.is_valid():
+            # Refuse silently rather than raise: an invalid lease (already
+            # settled, or the supervisor has since declared a hard shutdown)
+            # means the caller's own root coroutine is (or should be) already
+            # winding down -- closing the coroutine here is the same "don't
+            # leak an unawaited coroutine" contract every other rejection
+            # path in this plan follows (LoggingWorker.enqueue(), etc.).
+            coro.close()
+            return
+        if kind == "accounting":
+            self._supervisor._spawn_accounting_child(coro, name=name, scope=self)
+        elif kind == "telemetry":
+            self._supervisor._spawn_telemetry_child(coro, name=name)
+        else:
+            assert_never(kind)
 
     @property
     def outcome(self) -> "AccountingOutcome | None":
@@ -1839,23 +2348,31 @@ class Drained:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class DeadlineExceeded:
-    remaining_accounting_tasks: int
-    remaining_admissions_in_progress: int
+    cancelled: int
+    cancellation_failed: int
 
 
-DrainOutcome = Drained | DeadlineExceeded
+@dataclasses.dataclass(frozen=True, slots=True)
+class ForcedExit:
+    cancelled: int
+    cancellation_failed: int
+
+
+DrainOutcome = Drained | DeadlineExceeded | ForcedExit
 
 
 class ManagedTaskSupervisor:
     """One instance per process, constructed once at proxy startup (Task 10
-    wires it into the FastAPI lifespan and calls
-    `accounting_scope.register_root_scope_provider` with a callable that
-    returns `self.acquire_root_lease()`)."""
+    registers `self.acquire_root_lease` as the accounting_scope root-scope
+    provider at lifespan startup, and revokes that registration at lifespan
+    shutdown once `drain()` has fully returned -- major 9, see Architecture
+    section)."""
 
     def __init__(self) -> None:
         self._accounting = ManagedTaskSet()
         self._telemetry = ManagedTaskSet()
         self._admissions_in_progress = 0
+        self._root_admission_open = True
         self._hard_shutdown = False
 
     def is_shutting_down_hard(self) -> bool:
@@ -1868,20 +2385,25 @@ class ManagedTaskSupervisor:
         this at quiesce step 3 (spec section C), strictly before
         `LoggingWorker.quiesce()` (step 4) and `drain()` (step 5) run, so a
         root scope cannot sneak in during the window those two steps are
-        still polling. Reuses the same `_hard_shutdown` flag `drain()`'s own
-        deadline branch flips -- setting it here is a no-op if `drain()`
-        later flips it again (idempotent), and does not by itself cancel
-        anything: cancellation is still exclusively `drain()`'s deadline
-        branch's responsibility, not this method's."""
-        self._hard_shutdown = True
+        still polling. **blocker 1 修订**：只翻 `_root_admission_open` 这一个
+        独立标志，绝不触碰 `_hard_shutdown`——已发放、仍在存活期内的 lease 完全
+        不受影响（`AccountingLease.is_valid()` 从不检查 `_root_admission_open`），
+        也不会由此触发任何取消：取消仍然唯一由 `drain()` 自己的 deadline/force-exit
+        分支负责。"""
+        self._root_admission_open = False
 
     def acquire_root_lease(self) -> "AccountingLease | None":
-        """Root-boundary lease acquisition. Returns None once a hard
-        shutdown has been declared (drain()'s deadline branch), refusing
-        any further root admission -- matches spec's "admission 授权
-        用不可伪造 scope" together with is_valid()'s own post-hard-shutdown
-        check on already-issued leases."""
-        if self._hard_shutdown:
+        """Root-boundary lease acquisition. Returns None once root admission
+        has been explicitly closed (`close_root_admission()`, quiesce step 3)
+        **or** a hard shutdown has since been declared (`drain()`'s deadline
+        branch) -- the latter check is a defensive belt-and-suspenders
+        addition: in the real quiesce sequence `close_root_admission()`
+        always runs strictly before `drain()` can ever flip `_hard_shutdown`
+        (step 3 precedes step 5), so this branch is unreachable in
+        production, but it keeps this method from ever handing out a
+        lease that would be born already-invalid via
+        `AccountingLease.is_valid()`'s own hard-shutdown check."""
+        if not self._root_admission_open or self._hard_shutdown:
             return None
         return AccountingLease(self)
 
@@ -1933,6 +2455,7 @@ class ManagedTaskSupervisor:
         self,
         deadline_remaining: Callable[[], float],
         root_queue_unfinished: Callable[[], int] = lambda: 0,
+        is_force_exit: Callable[[], bool] = GracefulShutdownManager.is_force_exit,
     ) -> DrainOutcome:
         """Joint fixed-point over (root_queue_unfinished, accounting_tasks,
         admissions_in_progress). `root_queue_unfinished` defaults to a
@@ -1943,44 +2466,56 @@ class ManagedTaskSupervisor:
         itself has already fully quiesced its own backlog before drain() is
         ever invoked (strict quiesce-then-drain ordering), so this guard
         only ever matters for genuinely re-entrant work created during
-        drain() itself."""
+        drain() itself. `is_force_exit` defaults to
+        `GracefulShutdownManager.is_force_exit` (an unbound classmethod
+        reference, valid as a zero-arg callable); injectable for tests so
+        this module never has to reach into process-global state directly.
+        已定裁决（三变体）：`deadline_remaining() <= 0` 本身无法分辨"自然到期"还是
+        "第二次 SIGINT 强制退出"（`GracefulShutdownManager.deadline_remaining()`
+        在 `_force_exit` 为真时本就坍缩成 0.0），所以到达 deadline 时必须显式再问一次
+        `is_force_exit()` 才能决定产出 `DeadlineExceeded` 还是 `ForcedExit`——drain()
+        自己绝不重新猜测触发原因。"""
         while True:
             if root_queue_unfinished() == 0 and self._accounting.is_empty() and self._admissions_in_progress == 0:
                 self._telemetry.cancel_all()
+                await self._telemetry.wait_settled()
                 return Drained()
 
             if deadline_remaining() <= 0:
                 self._hard_shutdown = True
-                self._accounting.cancel_all()
+                cancelled, cancellation_failed = await self._accounting.cancel_all_and_count_failures()
                 self._telemetry.cancel_all()
-                await self._accounting.wait_settled()
-                return DeadlineExceeded(
-                    remaining_accounting_tasks=len(self._accounting),
-                    remaining_admissions_in_progress=self._admissions_in_progress,
-                )
+                await self._telemetry.wait_settled()
+                if is_force_exit():
+                    return ForcedExit(cancelled=cancelled, cancellation_failed=cancellation_failed)
+                return DeadlineExceeded(cancelled=cancelled, cancellation_failed=cancellation_failed)
 
             await asyncio.sleep(min(_DRAIN_POLL_INTERVAL_SECONDS, max(deadline_remaining(), 0.0)))
 
 
 GLOBAL_MANAGED_TASK_SUPERVISOR = ManagedTaskSupervisor()
 
-# Module-import-time DI registration -- same idiom as this codebase's existing
-# `GLOBAL_LOGGING_WORKER = LoggingWorker()` singleton (logging_worker.py) and
-# exactly what the Architecture section already promised for this module
-# ("register_root_scope_provider(provider) ... 在
-# litellm/proxy/shutdown/managed_task_supervisor.py 模块导入时调用一次"). Pure-SDK
-# code that never imports anything under litellm.proxy.* never imports this
-# module either, so _root_scope_provider stays None there and every Path B
-# call site's fallback-to-bare-create_task behavior is unaffected.
-accounting_scope.register_root_scope_provider(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease)
+# Module-import-time creation of the process-scoped singleton -- same idiom as
+# this codebase's existing `GLOBAL_LOGGING_WORKER = LoggingWorker()` singleton
+# (logging_worker.py). The *registration* of this singleton as the root-scope
+# provider is deliberately NOT done here (major 9: a permanent import-time
+# registration can never be revoked, leaking a reference to a torn-down
+# supervisor into any later pure-SDK call in the same process) -- Task 10's
+# lifespan startup calls `accounting_scope.register_root_scope_provider(
+# GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease)` explicitly, and lifespan
+# shutdown calls `accounting_scope.register_root_scope_provider(None)` once
+# `drain()` has fully returned. Pure-SDK code that never imports anything
+# under litellm.proxy.* never triggers either call, so `_root_scope_provider`
+# stays None there and every Path B call site's fallback-to-bare-create_task
+# behavior is unaffected.
 ```
 
 **补充说明（Task 8 落笔时回填，如实记录）**：撰写 Task 8（B2/B3 接入）时读码复核 Task 4 已落盘的实现，发现两处真实缺口，均已在上面的 Steps §3 代码里直接改正（不是另开一个"Task 4.5"，因为这两处都是 Task 4 自身该交付、但当时遗漏的部分，补丁范围完全落在 `managed_task_supervisor.py` 内部）：
 
-1. **缺口一——从未创建/注册全局单例**：Architecture 一节（本文档第 68 行）承诺"`register_root_scope_provider(provider)`——一次性 DI 注册钩子，在 `managed_task_supervisor.py` 模块导入时调用一次"，但 Task 4 最初落盘的 Steps §3 代码里从未出现 `GLOBAL_MANAGED_TASK_SUPERVISOR`/`register_root_scope_provider` 字样（用 `grep` 核实过，零匹配）——也就是说 Task 6 的六个 Path A 站点、Task 7 的 B1 站点，实际运行时 `acquire_root_scope()`/`spawn_detached()` 永远只会看到 `_root_scope_provider is None`（因为没人调用过 `register_root_scope_provider`），永远退化成纯-SDK 回退路径，"记账域感知"从未真正生效过——这不是"暂时用不上、可以延后"的问题，而是让 Task 6/7 已落盘的全部测试断言其实只覆盖了纯-SDK 分支、从未覆盖过真正接入 supervisor 之后的路径。现已在 Steps §3 补上模块级 `GLOBAL_MANAGED_TASK_SUPERVISOR = ManagedTaskSupervisor()` 单例与 `accounting_scope.register_root_scope_provider(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease)` 注册调用。
+1. **缺口一——从未创建全局单例**：Architecture 一节（本文档第 68 行）承诺"`register_root_scope_provider(provider)` ... 在 `managed_task_supervisor.py` 模块导入时创建单例"，但 Task 4 最初落盘的 Steps §3 代码里从未出现 `GLOBAL_MANAGED_TASK_SUPERVISOR` 字样（用 `grep` 核实过，零匹配）——也就是说 Task 6 的六个 Path A 站点、Task 7 的 B1 站点，实际运行时 `acquire_root_scope()`/`spawn_detached()` 永远只会看到 `_root_scope_provider is None`，永远退化成纯-SDK 回退路径，"记账域感知"从未真正生效过——这不是"暂时用不上、可以延后"的问题，而是让 Task 6/7 已落盘的全部测试断言其实只覆盖了纯-SDK 分支、从未覆盖过真正接入 supervisor 之后的路径。现已在 Steps §3 补上模块级 `GLOBAL_MANAGED_TASK_SUPERVISOR = ManagedTaskSupervisor()` 单例（**本轮评审再修订（major 9）**：把实际的 `register_root_scope_provider(...)` 注册调用挪到 Task 10 的 lifespan 启动阶段执行，本模块只创建单例，不在导入时自行注册——理由见 Architecture 一节的更新与 Task 10 正文）。
 2. **缺口二——`_spawn_accounting_child` 从未把 `current_accounting_scope` 绑定进新建的子任务**：这一处更隐蔽也更严重——`AccountingLease.spawn()` 原先直接调用 `self._supervisor._spawn_accounting_child(coro, name=name)`，而 `_spawn_accounting_child` 原先只是裸 `asyncio.create_task(coro, name=name)`，从未在新任务的 Context 里 `current_accounting_scope.set(...)`。这意味着即便缺口一被修好，Task 7（B1，`spawn_detached` 在 `streaming_handler.py:2053` 获取一个全新 root scope 并 `scope.spawn(...)`）之后，`dispatch_success_handlers` 在这个新任务里跑起来、层层 `await` 调用到 Task 8 的 `update_cache`/`_batch_database_updates` 时，`current_accounting_scope.get()` 拿到的仍然是 `None`——因为 `asyncio.create_task` 隐式拷贝的是*调用 `_spawn_accounting_child` 那一刻*的 Context，而那一刻从未写入过这个 scope。Task 8 的整个设计前提（B2/B3 靠 `current_accounting_scope.get()` 拿到 Task 7 acquire 到的同一个 lease）如果不修这里就完全不成立。现已在 Steps §3 把 `_spawn_accounting_child` 改成接收 `scope: AccountingLease` 参数，用 `contextvars.copy_context()` 取一份*私有*副本、在副本里 `current_accounting_scope.set(scope)` 后再 `ctx.run(...)` 创建任务——用副本而不是直接对当前 Context `.set()`，是为了不把这个 scope 泄漏进调用方自己后续的代码（比如 `CustomStreamWrapper.__anext__` 处理下一个 chunk 时，绝不应该还残留着上一个 chunk 的 scope）。这个修法与 Task 2 里 `create_task_with_scope` 的既有设计同构（那里调用方负责 `context.run(create_task_with_scope, coro, token=token)`；这里由于 `_spawn_accounting_child` 不是被外部captured Context 调用，所以自己内部做一次 `copy_context()`）。
 
-两处缺口都通过下面新增的 `TestGlobalRegistrationAndScopePropagation` 测试类锁定（既验证模块导入后 `accounting_scope.acquire_root_scope()` 确实能拿到真实 lease，也验证被 spawn 的子任务内部能看到同一个 scope、且不泄漏进调用方自己的 Context）；Task 4 原有的 5 个测试类无需改动，因为它们从不检查 `current_accounting_scope`，行为断言（settle/admission 计数/drain 语义）不受影响。
+两处缺口都通过下面新增的 `TestGlobalSingletonAndScopePropagation` 测试类锁定（既验证 `GLOBAL_MANAGED_TASK_SUPERVISOR` 单例确实存在、其 `acquire_root_lease` 可以被 `register_root_scope_provider` 接受并如实产出真实 lease——**本轮评审再修订（major 9）**：不再断言"模块导入本身就完成了注册"，因为注册调用已挪到 Task 10 的 lifespan 启动阶段，本测试改为像 Task 10 lifespan 代码那样显式调用 `register_root_scope_provider(...)`、并在 `finally` 里撤销注册，避免污染同一 pytest 进程里的其他测试模块；lifespan 启动/关停两端的真实接线由 Task 10 自己的测试端到端锁定——，也验证被 spawn 的子任务内部能看到同一个 scope、且不泄漏进调用方自己的 Context）；Task 4 原有的 5 个测试类无需改动，因为它们从不检查 `current_accounting_scope`，行为断言（settle/admission 计数/drain 语义）不受影响。
 
 ```python
 # tests/test_litellm/proxy/shutdown/test_managed_task_supervisor.py（追加）
@@ -1997,16 +2532,31 @@ from litellm.proxy.shutdown.managed_task_supervisor import (
 )
 
 
-class TestGlobalRegistrationAndScopePropagation:
-    def test_module_import_registers_global_supervisor_as_root_scope_provider(self):
-        # GLOBAL_MANAGED_TASK_SUPERVISOR is a process-wide singleton; importing
-        # this module must have already wired it into accounting_scope's DI
-        # hook (this is exactly the behavior Task 6/7's real call sites rely
-        # on -- their own tests inject a _FakeRootToken instead, so this is
-        # the only place the *real* registration wiring is asserted).
-        token = accounting_scope.acquire_root_scope()
-        assert token is not None
-        assert isinstance(token, type(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease()))
+class TestGlobalSingletonAndScopePropagation:
+    def test_global_supervisor_singleton_acquire_root_lease_is_a_valid_provider(self):
+        # GLOBAL_MANAGED_TASK_SUPERVISOR is a process-wide singleton created at
+        # module import time; only *registering* it as accounting_scope's DI
+        # hook happens later, at Task 10's lifespan startup (major 9: a
+        # revocable registration, not a permanent import-time side effect).
+        # This test exercises that exact registration call directly (the same
+        # call Task 10 makes), then tears it down, so it never leaks into
+        # any other test module running in the same pytest process.
+        accounting_scope.register_root_scope_provider(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease)
+        try:
+            token = accounting_scope.acquire_root_scope()
+            assert token is not None
+            assert isinstance(token, type(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease()))
+        finally:
+            accounting_scope.register_root_scope_provider(None)
+
+    def test_unregistering_leaves_no_reference_to_the_supervisor(self):
+        """major 9's core guarantee: once unregistered, acquire_root_scope()
+        must fall back to None -- not silently return a lease from a
+        supervisor that the caller believes is no longer live."""
+        accounting_scope.register_root_scope_provider(GLOBAL_MANAGED_TASK_SUPERVISOR.acquire_root_lease)
+        accounting_scope.register_root_scope_provider(None)
+
+        assert accounting_scope.acquire_root_scope() is None
 
     @pytest.mark.asyncio
     async def test_lease_spawn_propagates_scope_to_nested_call_site_without_leaking_to_caller(self):
@@ -2026,36 +2576,11 @@ class TestGlobalRegistrationAndScopePropagation:
 
         await asyncio.wait_for(done.wait(), timeout=1)
         assert seen_scope_inside_child == [lease]
-
-
-class TestCloseRootAdmission:
-    def test_close_root_admission_refuses_new_leases_without_cancelling_existing_children(self):
-        """Task 10 (lifespan quiesce step 3) calls this eagerly, strictly
-        before LoggingWorker.quiesce()/drain() run -- it must close new root
-        admission immediately, but must NOT reach into either managed set
-        (an already-admitted accounting child must keep running until
-        drain()'s own deadline logic decides otherwise)."""
-        supervisor = ManagedTaskSupervisor()
-        lease = supervisor.acquire_root_lease()
-        assert lease is not None
-
-        async def already_running_child():
-            await asyncio.sleep(10)
-
-        lease.spawn(already_running_child(), name="already_running", kind="accounting")
-
-        supervisor.close_root_admission()
-
-        assert supervisor.acquire_root_lease() is None
-        assert not supervisor._accounting.is_empty()  # untouched by close_root_admission itself
-
-        supervisor._accounting.cancel_all()
-
 ```
 
 `pytest tests/test_litellm/proxy/shutdown/test_accounting_outcome.py tests/test_litellm/proxy/shutdown/test_managed_task_supervisor.py -v` 全绿。同时跑一次 Phase 1a 已有的 `tests/test_litellm/proxy/db/test_spend_counter_reseed.py tests/test_litellm/caching/test_redis_cache.py -v` 确认扩展 `accounting_outcome.py` 没有破坏 Phase 1a 对 `AccountingSkippedDuringShutdown` 的既有断言。
 
-**补充说明（Task 10 落笔时发现，如实记录）**：撰写 Task 10（lifespan 接线）核对 spec 第 C 节 9 步协议时发现，第 3 步"封闭新的 root accounting admission，但允许持有效 scope 的已登记 accounting task 派生 child"在 Task 4 原先落盘的接口里**没有对应的可调用方法**——`_hard_shutdown`（进而 `acquire_root_lease()` 拒绝新 lease）此前只在 `drain()` 自己的 deadline-exceeded 分支里被置位，也就是说"关闭新 admission"这件事此前被隐式地和"取消现有 child"这件事**绑定在同一次状态翻转里**、且只会在 deadline 到达时才发生——而 spec 要求这是两个独立时间点的独立动作（第 3 步早于第 5 步的 `drain()`，且第 3 步明确不取消已登记 child）。这不是"暂时用不上、可以延后"的缺口，因为不修的话 Task 10 没有任何办法在 `LoggingWorker.quiesce()`（第 4 步）仍在轮询期间就提前把新 root scope 的口子关上，只能等到 `drain()` 自己的 deadline 分支才会关（如果根本没触发 deadline，则整个关停过程中口子始终没关过）。已在上面 Steps §3 的类定义里补上 `close_root_admission()` 方法（复用同一个 `_hard_shutdown` 标志、但不触发任何取消），并用新增的 `TestCloseRootAdmission` 测试类锁定"调用后拒绝新 lease、但不触碰已登记 child"这条行为边界。
+（原先此处有一段"补充说明（Task 10 落笔时发现）"及配套的 `TestCloseRootAdmission` 测试类，描述"`close_root_admission()` 复用同一个 `_hard_shutdown` 标志"——那是本轮评审之前的旧设计。blocker 1 已经把 `_root_admission_open`/`_hard_shutdown` 拆成两个独立标志，`close_root_admission()` 只翻前者，对应的行为边界已经由上面 Steps §1 的 `TestCloseRootAdmissionVsHardShutdown`（`test_close_root_admission_refuses_new_root_leases`/`test_close_root_admission_leaves_existing_lease_valid_and_able_to_spawn_a_child`/`test_hard_shutdown_invalidates_existing_lease_and_refuses_further_spawns`）完整覆盖，旧的说明段落与重复的测试类已删除，避免两套测试类各自维护同一行为的边界条件。）
 
 5. 提交：`git add litellm/proxy/shutdown/accounting_outcome.py litellm/proxy/shutdown/managed_task_supervisor.py tests/test_litellm/proxy/shutdown/test_accounting_outcome.py tests/test_litellm/proxy/shutdown/test_managed_task_supervisor.py && git commit -m "feat: add ManagedTaskSupervisor, AccountingLease, and full AccountingOutcome union"`
 
@@ -2080,11 +2605,18 @@ class LoggingDrained:
 @dataclasses.dataclass(frozen=True, slots=True)
 class LoggingDeadlineExceeded:
     dropped_queue_items: int
-    cancelled_running_tasks: int
-    cancelled_helper_tasks: int
+    cancelled: int
+    cancellation_failed: int
 
 
-LoggingDrainOutcome = LoggingDrained | LoggingDeadlineExceeded
+@dataclasses.dataclass(frozen=True, slots=True)
+class LoggingForcedExit:
+    dropped_queue_items: int
+    cancelled: int
+    cancellation_failed: int
+
+
+LoggingDrainOutcome = LoggingDrained | LoggingDeadlineExceeded | LoggingForcedExit
 
 
 class LoggingWorker:
@@ -2093,8 +2625,16 @@ class LoggingWorker:
         self,
         deadline_remaining: Callable[[], float],
         admission_policy: Callable[[], bool],
+        is_force_exit: Callable[[], bool],
     ) -> LoggingDrainOutcome: ...
+    async def stop_after_quiesce(self) -> None: ...
 ```
+
+**本轮评审的三处修订，如实记录**：
+
+1. **三变体裁决**：`LoggingDeadlineExceeded`/新增 `LoggingForcedExit` 现在与 Task 4 的 `DeadlineExceeded`/`ForcedExit` 共用同一对字段名 `cancelled`/`cancellation_failed`（分别来自对 `_running_tasks`/`_helper_tasks` 各自调用 Task 1 的 `cancel_all_and_count_failures()` 后再相加）。`dropped_queue_items` 单独保留为第三个字段——它统计的是从未出队、从未成为 `asyncio.Task` 的队列项（`_drain_and_settle_dropped()` 直接 `coroutine.close()`），概念上不是"取消一个任务"而是"从未开始就地结算"，套不进 `cancelled`/`cancellation_failed` 这对只描述"已发起取消、是否清爽退出"的字段里；把它们硬塞进同一对字段会丢失"完全没跑过"与"跑了一半被取消"这两种运维需要分辨的情形，所以按需要保留为独立字段，而不是削足适履揉进两个字段。
+2. **`is_force_exit` 无默认值（与 Task 4`drain()`不同，如实记录一处刻意的不对称）**：Task 4 的 `drain()` 给 `is_force_exit` 挂了 `GracefulShutdownManager.is_force_exit` 默认值，因为 `managed_task_supervisor.py` 本来就在 `litellm/proxy/shutdown/` 目录下，与 `GracefulShutdownManager` 同层，import 它不产生跨层依赖。而本 Task 的 `logging_worker.py` 位于 `litellm/litellm_core_utils/`——这一层是给纯 SDK（非 proxy）调用方共用的低层工具（major 9 讨论的可撤销 runtime binding 正是为了保这条边界），若在这里 `from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager` 当默认值，就会让一个 core-utils 模块反向依赖 proxy 专属模块，方向性错误，且有绕出循环 import 的风险（`litellm/proxy/` 下大量模块本就依赖 `litellm_core_utils`）。因此本 Task 把 `is_force_exit` 定义成**必填**参数，不带默认值；调用方（Task 10 的 lifespan 接线，本就在 `litellm/proxy/` 下）显式传 `is_force_exit=GracefulShutdownManager.is_force_exit`——这与协调者对 Task 10"两处调用都必须显式传 `is_force_exit=...`"的要求完全一致，只是没有在 Task 5 自己的签名上重复挂一个永远不会被跨层默认值用到的默认值。下面 Steps §1 新增/修订的测试因此都显式传一个 lambda（与既有 `deadline_remaining`/`admission_policy` 参数的注入风格一致），不受影响。
+3. **`stop_after_quiesce()` 新增（major 8）**：`quiesce()` 本身从不触碰 `_worker_task`/`_worker_loop()`——那个后台任务在 `quiesce()` 返回之后仍然活着（这是有意的：`ManagedTaskSupervisor.drain()` 的 `root_queue_unfinished` 参数依赖 `_worker_loop` 仍在运行才能继续处理 `drain()` 窗口期内姗姗来迟的队列项，见 Task 10 接线）。因此需要一个独立的终态停止方法，由 Task 10 在 `drain()` 也返回之后再调用一次，见下方 Steps §3。
 
 **Steps**
 
@@ -2105,7 +2645,9 @@ class LoggingWorker:
     async def test_quiesce_returns_drained_immediately_when_nothing_pending(self):
         worker = LoggingWorker()
         worker.start()
-        outcome = await worker.quiesce(deadline_remaining=lambda: 5.0, admission_policy=lambda: True)
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: 5.0, admission_policy=lambda: True, is_force_exit=lambda: False
+        )
         assert isinstance(outcome, LoggingDrained)
         await worker.stop()
 
@@ -2120,7 +2662,9 @@ class LoggingWorker:
             ran.append("x")
 
         worker.enqueue(coro())
-        outcome = await worker.quiesce(deadline_remaining=lambda: 5.0, admission_policy=lambda: True)
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: 5.0, admission_policy=lambda: True, is_force_exit=lambda: False
+        )
 
         assert isinstance(outcome, LoggingDrained)
         assert ran == ["x"]
@@ -2137,7 +2681,9 @@ class LoggingWorker:
                 settled.append(outcome)
 
         quiesce_task = asyncio.create_task(
-            worker.quiesce(deadline_remaining=lambda: 5.0, admission_policy=lambda: False)
+            worker.quiesce(
+                deadline_remaining=lambda: 5.0, admission_policy=lambda: False, is_force_exit=lambda: False
+            )
         )
         await asyncio.sleep(0)  # let quiesce's first loop iteration set _admission_open
 
@@ -2175,13 +2721,41 @@ class LoggingWorker:
         worker.enqueue(coro(), token=FakeToken())
         assert worker._queue.qsize() == 1
 
-        outcome = await worker.quiesce(deadline_remaining=lambda: -1.0, admission_policy=lambda: False)
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: -1.0, admission_policy=lambda: False, is_force_exit=lambda: False
+        )
 
         assert isinstance(outcome, LoggingDeadlineExceeded)
         assert outcome.dropped_queue_items == 1
         assert executed == []
         assert len(settled) == 1
         assert settled[0].kind == "skipped_during_shutdown"
+        worker._sem.release()
+        await worker.stop()
+
+    @pytest.mark.asyncio
+    async def test_quiesce_never_runs_unconsumed_queue_items_when_forced_exit(self):
+        """三变体裁决：is_force_exit() 为 True 时同样不许执行 queued 业务
+        callback，只是把结果 tag 换成 LoggingForcedExit——drop 语义与
+        deadline-exceeded 分支完全一致，唯一区别是外部可观测的变体类型。"""
+        worker = LoggingWorker()
+        worker.start()
+        await worker._sem.acquire()
+        executed = []
+
+        async def coro():
+            executed.append("ran")
+
+        worker.enqueue(coro())
+        assert worker._queue.qsize() == 1
+
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: -1.0, admission_policy=lambda: False, is_force_exit=lambda: True
+        )
+
+        assert isinstance(outcome, LoggingForcedExit)
+        assert outcome.dropped_queue_items == 1
+        assert executed == []
         worker._sem.release()
         await worker.stop()
 
@@ -2201,11 +2775,41 @@ class LoggingWorker:
         worker.ensure_initialized_and_enqueue(slow_coro(), token=FakeToken())
         await asyncio.sleep(0.02)  # 让 worker loop 出队并启动它
 
-        outcome = await worker.quiesce(deadline_remaining=lambda: -1.0, admission_policy=lambda: False)
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: -1.0, admission_policy=lambda: False, is_force_exit=lambda: False
+        )
 
         assert isinstance(outcome, LoggingDeadlineExceeded)
-        assert outcome.cancelled_running_tasks == 1
+        assert outcome.cancelled == 1
+        assert outcome.cancellation_failed == 0
         assert len(settled) == 1
+        await worker.stop()
+
+    @pytest.mark.asyncio
+    async def test_quiesce_counts_a_suppressed_running_task_cancellation_as_cancellation_failed(self):
+        """镜像 Task 4 `test_drain_deadline_exceeded_counts_a_suppressed_cancellation_as_cancellation_failed`：
+        一个吞掉 CancelledError、正常返回的运行中任务，必须记进
+        `cancellation_failed` 而不是 `cancelled`——`cancelled`/`cancellation_failed`
+        字段名与语义在 Task 4/5 之间完全一致，是三变体裁决的一部分。"""
+        worker = LoggingWorker()
+        worker.start()
+
+        async def swallow_cancellation():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                return "ignored on purpose"
+
+        worker.ensure_initialized_and_enqueue(swallow_cancellation())
+        await asyncio.sleep(0.02)
+
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: -1.0, admission_policy=lambda: False, is_force_exit=lambda: False
+        )
+
+        assert isinstance(outcome, LoggingDeadlineExceeded)
+        assert outcome.cancelled == 0
+        assert outcome.cancellation_failed == 1
         await worker.stop()
 
     @pytest.mark.asyncio
@@ -2228,11 +2832,38 @@ class LoggingWorker:
         await asyncio.sleep(0)
         assert len(worker._helper_tasks) == 1
 
-        outcome = await worker.quiesce(deadline_remaining=lambda: -1.0, admission_policy=lambda: False)
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: -1.0, admission_policy=lambda: False, is_force_exit=lambda: False
+        )
 
         assert isinstance(outcome, LoggingDeadlineExceeded)
-        assert outcome.cancelled_helper_tasks == 1
+        assert outcome.cancelled == 1
         assert worker._helper_tasks.is_empty()
+        worker._sem.release()
+        await worker.stop()
+
+    @pytest.mark.asyncio
+    async def test_flush_returns_immediately_after_deadline_triggered_quiesce(self):
+        """major 7 回归测试：`_drain_and_settle_dropped()` 此前每个 `get_nowait()`
+        出的 item 都不配对 `task_done()`，导致 `queue.join()`（`flush()` 的全部实现）
+        永远挂起。修复前这个测试会在默认 pytest 超时下挂死/超时失败；修复后必须
+        立刻返回。"""
+        worker = LoggingWorker()
+        worker.start()
+        await worker._sem.acquire()  # 占满唯一并发名额，逼 item 停在队列里不出队
+
+        async def coro():
+            pass
+
+        worker.enqueue(coro())
+        assert worker._queue.qsize() == 1
+
+        outcome = await worker.quiesce(
+            deadline_remaining=lambda: -1.0, admission_policy=lambda: False, is_force_exit=lambda: False
+        )
+        assert isinstance(outcome, LoggingDeadlineExceeded)
+
+        await asyncio.wait_for(worker.flush(), timeout=1.0)
         worker._sem.release()
         await worker.stop()
 
@@ -2253,13 +2884,58 @@ class LoggingWorker:
         assert worker.queue_size() == 1
         worker._sem.release()
         await worker.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_after_quiesce_cancels_worker_loop_and_never_falls_through_to_clear_queue(self):
+        """major 8: 一旦 `stop_after_quiesce()` 跑过，`_worker_loop` 的
+        `except CancelledError` 分支必须走 drop-and-settle，绝不能落到
+        `clear_queue()`（那个方法仍然会真正执行 queued 业务 callback）。"""
+        worker = LoggingWorker()
+        worker.start()
+        executed = []
+
+        async def coro():
+            executed.append("ran")
+
+        await worker._sem.acquire()  # 占满并发名额，逼 item 停在队列里不出队
+        worker.enqueue(coro())
+        assert worker._queue.qsize() == 1
+
+        await worker.stop_after_quiesce()
+
+        assert worker._worker_task is None
+        assert executed == []  # clear_queue() 从未被调用，协程体从未执行
+
+    @pytest.mark.asyncio
+    async def test_enqueue_after_stop_after_quiesce_is_settled_dropped_not_queued(self):
+        """blocker 3 + major 8 的交叉验证：`stop_after_quiesce()` 跑过之后，
+        `_try_enqueue_existing_task` 必须走 `_quiesced` 分支拒绝，而不是
+        `_admission_open` 分支（两者是本轮评审区分出的独立标志，见 Task 3
+        `__init__` 的字段说明）。"""
+        worker = LoggingWorker()
+        worker.start()
+        await worker.stop_after_quiesce()
+        settled = []
+
+        class FakeToken:
+            def settle(self, outcome):
+                settled.append(outcome)
+
+        async def late_coro():
+            pass
+
+        worker.enqueue(late_coro(), token=FakeToken())
+
+        assert len(settled) == 1
+        assert settled[0].kind == "skipped_during_shutdown"
+        assert settled[0].reason == "quiesced"
 ```
 
-同时在文件顶部 import 区补充 `from litellm.litellm_core_utils.logging_worker import (LoggingDrained, LoggingDeadlineExceeded, ...)`（若既有 import 已用 `from litellm.litellm_core_utils.logging_worker import *`-风格聚合导入，则改为按需追加具名导入，不使用通配符）。
+同时在文件顶部 import 区补充 `from litellm.litellm_core_utils.logging_worker import (LoggingDrained, LoggingDeadlineExceeded, LoggingForcedExit, ...)`（若既有 import 已用 `from litellm.litellm_core_utils.logging_worker import *`-风格聚合导入，则改为按需追加具名导入，不使用通配符）。
 
-2. 确认失败：`pytest tests/test_litellm/litellm_core_utils/test_logging_worker.py -v -k quiesce` —— `AttributeError: 'LoggingWorker' object has no attribute 'quiesce'`；`test_queue_size_*` 同理因 `queue_size` 不存在而失败。
+2. 确认失败：`pytest tests/test_litellm/litellm_core_utils/test_logging_worker.py -v -k quiesce` —— `AttributeError: 'LoggingWorker' object has no attribute 'quiesce'`；`test_queue_size_*`、`test_stop_after_quiesce_*`、`test_enqueue_after_stop_after_quiesce_*` 同理因对应属性/方法不存在而失败。
 
-3. 实现。在 `litellm/litellm_core_utils/logging_worker.py` 顶部 import 块补充 `from typing import Callable`（若尚未导入）；在 `LoggingTask` 定义之后、`LoggingWorker` 类定义之前追加：
+3. 实现。在 `litellm/litellm_core_utils/logging_worker.py` 顶部 import 块补充 `from typing import Callable`（若尚未导入，`assert_never` 已在 Task 3 的 blocker 3 修订里补过）；在 `LoggingTask` 定义之后、`LoggingWorker` 类定义之前追加：
 
 ```python
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -2270,11 +2946,18 @@ class LoggingDrained:
 @dataclasses.dataclass(frozen=True, slots=True)
 class LoggingDeadlineExceeded:
     dropped_queue_items: int
-    cancelled_running_tasks: int
-    cancelled_helper_tasks: int
+    cancelled: int
+    cancellation_failed: int
 
 
-LoggingDrainOutcome = LoggingDrained | LoggingDeadlineExceeded
+@dataclasses.dataclass(frozen=True, slots=True)
+class LoggingForcedExit:
+    dropped_queue_items: int
+    cancelled: int
+    cancellation_failed: int
+
+
+LoggingDrainOutcome = LoggingDrained | LoggingDeadlineExceeded | LoggingForcedExit
 
 # Same rationale as managed_task_supervisor.py's _DRAIN_POLL_INTERVAL_SECONDS
 # (see that module's comment): bounded polling, not a bare `sleep(0)` busy
@@ -2298,12 +2981,21 @@ _QUIESCE_POLL_INTERVAL_SECONDS = 0.05
         self,
         deadline_remaining: Callable[[], float],
         admission_policy: Callable[[], bool],
+        is_force_exit: Callable[[], bool],
     ) -> LoggingDrainOutcome:
         """
         Proxy-only drain entry point -- a wholly separate method from
         flush()/stop(), which keep their pre-Phase-1b semantics untouched
         (pure-SDK callers, and the existing repo-wide flush() call sites,
         never call quiesce() and are therefore entirely unaffected).
+
+        `is_force_exit` has no default (unlike
+        ManagedTaskSupervisor.drain()'s default of
+        `GracefulShutdownManager.is_force_exit`) because this module lives in
+        `litellm_core_utils`, a layer shared with pure-SDK callers, and must
+        not import anything from `litellm.proxy.*` -- see this Task's
+        "本轮评审的三处修订" note above the Interfaces block. Callers (Task
+        10's lifespan wiring) pass it explicitly.
 
         Normal phase: `admission_policy()` is polled once per loop
         iteration and written into `self._admission_open`, so `enqueue()`
@@ -2313,13 +3005,17 @@ _QUIESCE_POLL_INTERVAL_SECONDS = 0.05
         background task; quiesce() itself never dequeues or runs anything,
         it only watches until settled or the deadline passes.
 
-        Deadline phase: any coroutine still sitting in `self._queue`
-        unconsumed is drained item-by-item -- closed and settled as
-        dropped, NEVER executed via clear_queue() (spec line 133: 取消路径
-        不得执行 queued 业务 callback) -- then every currently in-flight
-        processing task and every retry/aggressive-clear helper task is
-        cancelled together and awaited to settlement (spec's five-category
-        cancel enumeration).
+        Deadline/force-exit phase: any coroutine still sitting in
+        `self._queue` unconsumed is drained item-by-item -- closed and
+        settled as dropped, NEVER executed via clear_queue() (spec line 133:
+        取消路径不得执行 queued 业务 callback) -- then every currently
+        in-flight processing task and every retry/aggressive-clear helper
+        task is cancelled together and awaited to settlement, counting clean
+        vs. failed cancellations the same way Task 4's `drain()` does (major
+        6/three-variant). `is_force_exit()` is checked once, after
+        cancellation has already happened, purely to pick which of
+        `LoggingDeadlineExceeded`/`LoggingForcedExit` to tag the result with
+        -- it is never re-queried a second time to guess the reason.
         """
         if self._queue is None:
             return LoggingDrained()
@@ -2332,22 +3028,50 @@ _QUIESCE_POLL_INTERVAL_SECONDS = 0.05
 
             if deadline_remaining() <= 0:
                 dropped = self._drain_and_settle_dropped(self._queue, reason="deadline_exceeded")
-                cancelled_running = len(self._running_tasks)
-                cancelled_helpers = len(self._helper_tasks)
-                self._running_tasks.cancel_all()
-                self._helper_tasks.cancel_all()
-                await self._running_tasks.wait_settled()
-                await self._helper_tasks.wait_settled()
+                running_cancelled, running_failed = await self._running_tasks.cancel_all_and_count_failures()
+                helper_cancelled, helper_failed = await self._helper_tasks.cancel_all_and_count_failures()
+                cancelled = running_cancelled + helper_cancelled
+                cancellation_failed = running_failed + helper_failed
+                if is_force_exit():
+                    return LoggingForcedExit(
+                        dropped_queue_items=dropped,
+                        cancelled=cancelled,
+                        cancellation_failed=cancellation_failed,
+                    )
                 return LoggingDeadlineExceeded(
                     dropped_queue_items=dropped,
-                    cancelled_running_tasks=cancelled_running,
-                    cancelled_helper_tasks=cancelled_helpers,
+                    cancelled=cancelled,
+                    cancellation_failed=cancellation_failed,
                 )
 
             await asyncio.sleep(min(_QUIESCE_POLL_INTERVAL_SECONDS, max(deadline_remaining(), 0.0)))
+
+    async def stop_after_quiesce(self) -> None:
+        """
+        Terminal stop for the background `_worker_loop` task itself (major
+        8). A wholly separate method from `stop()` (unchanged, still used by
+        pure-SDK/non-quiesce callers) -- `quiesce()` above never touches
+        `_worker_loop`/`_worker_task` on its own, since
+        `ManagedTaskSupervisor.drain()`'s `root_queue_unfinished` guard (Task
+        10 wiring) depends on `_worker_loop` staying alive to keep draining
+        late-arriving queue items during `drain()`'s own window. Call this
+        only once, only after both `quiesce()` and `drain()` have returned.
+
+        Sets `_quiesced = True` first so `_worker_loop`'s
+        `except CancelledError` handler drops-and-settles any item still in
+        the queue instead of falling through to `clear_queue()` --
+        `clear_queue()` still *executes* queued business coroutines (see its
+        own docstring), which is exactly what the whole shutdown contract
+        forbids past this point.
+        """
+        self._quiesced = True
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+            self._worker_task = None
 ```
 
-4. 确认转绿：`pytest tests/test_litellm/litellm_core_utils/test_logging_worker.py -v` 全绿。再跑一次 Task 3 已核实的既有 `flush()`/`stop()` 调用方所在测试文件，确认它们仍不受影响（`quiesce()`/`queue_size()` 是纯新增方法，不改动任何既有方法体）。
+4. 确认转绿：`pytest tests/test_litellm/litellm_core_utils/test_logging_worker.py -v` 全绿。再跑一次 Task 3 已核实的既有 `flush()`/`stop()` 调用方所在测试文件，确认它们仍不受影响（`quiesce()`/`queue_size()`/`stop_after_quiesce()` 是纯新增方法，不改动任何既有方法体）。
 
 5. 提交：`git add litellm/litellm_core_utils/logging_worker.py tests/test_litellm/litellm_core_utils/test_logging_worker.py && git commit -m "feat: add LoggingWorker.quiesce() as a distinct proxy-facing drain method"`
 
@@ -2876,9 +3600,13 @@ spawn_detached(
 
 ---
 
-## Task 8 — Path B2/B3 记账接入：`update_cache`/`_batch_database_updates` 改用 `spawn_detached`
+## Task 8 — Path B2/B3/B4 记账接入：`update_cache`/`_batch_database_updates`/`async_post_call_failure_hook` 改用 `spawn_detached`/`ambient_or_root_scope`
 
-依赖 Task 2（`spawn_detached`/`current_accounting_scope`）、Task 4（`ManagedTaskSupervisor`/`AccountingLease`——具体是 Task 4 的两处补丁：全局单例注册、`_spawn_accounting_child` 的 scope 绑定；见 Task 4 "补充说明（Task 8 落笔时回填，如实记录）"）、Task 7（同一个 `spawn_detached` 在 B1 已经用过一次，这里是第二、三个真实调用点）。
+依赖 Task 2（`spawn_detached`/`current_accounting_scope`/`ambient_or_root_scope`）、Task 4（`ManagedTaskSupervisor`/`AccountingLease`——具体是 Task 4 的两处补丁：全局单例注册、`_spawn_accounting_child` 的 scope 绑定；见 Task 4 "补充说明（Task 8 落笔时回填，如实记录）"）、Task 7（同一个 `spawn_detached` 在 B1 已经用过一次，这里是第二、三个真实调用点）。
+
+**范围调整说明（本轮评审 blocker 4，如实记录）**：本 Task 原本只覆盖成功路径的 B2/B3 两个记账创建点。评审指出失败路径（`ProxyLogging.post_call_failure_hook` → `_ProxyDBLogger.async_post_call_failure_hook` → `db_spend_update_writer.update_database` → `_batch_database_updates`）虽然最终落到*同一个* `update_database` 方法、B3 的 `spawn_detached` 接入天然覆盖了它的内部调用点，但 `async_post_call_failure_hook` 自身从未 acquire 过 ambient scope——它是从请求自己的异常处理路径直接 `await` 进来的（不像 B2/B3 那样，从 Task 6/7 已经在更早时点 acquire 过 root 的同一条调用链上被 `await` 到），所以 `current_accounting_scope.get()` 在它执行期间恒为 `None`。这本身并不总是构成 bug——只要 root admission 仍开放（Task 10 第 3 步 `close_root_admission()` 严格排在 `wait_for_drain()` 之后才执行，而 `async_post_call_failure_hook` 执行期间这次请求自己必然仍计入 in-flight 计数——这一点已经用 `grep -n "close_root_admission\|wait_for_drain" ` 核对过 Task 10 的落笔顺序），`update_database` 内部 B3 的 `spawn_detached` 仍能通过自己的 ad hoc root 兜底正确拿到一条新 lease、正确追踪子任务。**唯一的残余风险**（如实记录，不是本 Task 声称已完全消除的东西）：如果 `wait_for_drain()` 因为 deadline 到期而提前放弃、仍有请求真正在途（`wait_for_drain` 自己的"timeout 分支"允许这种情况），`close_root_admission()` 会在这些"掉队"请求还没跑完的情况下提前触发；这些请求如果随后失败、落到 `async_post_call_failure_hook`，此时 root admission 已经关闭，`acquire_root_scope()` 会返回 `None`，`spawn_detached` 退化为裸 `create_task`——这个残余竞态在 B1/B2/B3 的成功路径上同样存在（同一个"掉队"流式请求，如果之后走成功收尾，`spawn_detached` 一样会在 root admission 已关闭的情况下退化为裸任务），不是本 Task 独有、也不是本 Task 能单独解决的架构性权衡（一旦 `wait_for_drain` 已经放弃等待，就已经进入"尽力而为"区间）——已在收尾报告"已知未决事项"一节里记录为已接受、非阻塞的残余风险，不要求本 Task 或后续 Task 新增机制去封堵。本 Task 能做到、也确实要做到的是：把"acquire scope on entry, settle on exit"这个模式补齐到 `async_post_call_failure_hook` 自己身上，把它从"完全没有任何 scope 意识、只能被动依赖 B3 内部 `spawn_detached` 的隐式 ad hoc 兜底"提升到和 B1/B2/B3 同一个显式水位——即使两者在 root admission 仍开放的绝大多数窗口期内实际效果相同，显式声明也让这条失败记账路径不再单方面依赖一个深埋在 `update_database` 内部、自己完全看不见的隐式兜底，并为未来这条路径上新增更多 Path B 调用点（目前只有 B3 一处）打好可复用的基础。
+
+**Files**: `litellm/proxy/hooks/proxy_track_cost_callback.py`（改）, `litellm/proxy/db/db_spend_update_writer.py`（改）, `tests/test_litellm/proxy/hooks/test_proxy_track_cost_callback.py`（改，扩展既有文件）, `tests/test_litellm/proxy/db/test_db_spend_update_writer.py`（改，扩展既有文件 + 修正一处因本 Task 而失真的既有测试）
 
 **站点确认（已读码）**：
 - **B2**：`litellm/proxy/hooks/proxy_track_cost_callback.py:248`，在 `_ProxyDBLogger._PROXY_track_cost_callback` 的成功分支里，`await _update_database_and_spend_counters(...)` 之后、`await proxy_logging_obj.slack_alerting_instance.customer_spend_alert(...)` 之前，裸 `asyncio.create_task(update_cache(token=..., user_id=..., end_user_id=..., response_cost=..., team_id=..., parent_otel_span=..., tags=...))`。`update_cache`/`proxy_logging_obj` 都是函数体内部对 `litellm.proxy.proxy_server` 的惰性 import（第 180-181 行，为绕开 proxy_server 的循环 import，不是本 Task 要改的东西）。
@@ -3135,6 +3863,230 @@ spawn_detached(
 5. 提交：`git add litellm/proxy/hooks/proxy_track_cost_callback.py litellm/proxy/db/db_spend_update_writer.py tests/test_litellm/proxy/hooks/test_proxy_track_cost_callback.py tests/test_litellm/proxy/db/test_db_spend_update_writer.py && git commit -m "feat: route update_cache/_batch_database_updates through spawn_detached (Path B2/B3)"`
 
 （`managed_task_supervisor.py`/`accounting_outcome.py`/`test_managed_task_supervisor.py` 不在本 Task 的提交范围内——Task 4"补充说明"里记录的两处补丁，文字上是"Task 8 落笔时才发现"，但已经直接改写进了 Task 4 自己的 Steps §3 正文，实际执行本计划的人在执行 Task 4 时就会写出已经修正过的版本、随 Task 4 自己的commit 一并提交；这里的"补充说明"只是如实记录*撰写*这份计划过程中的发现顺序，不代表*执行*这份计划时还需要一次单独的 Task 4 追加提交。）
+
+### Task 8 续 — B4：`async_post_call_failure_hook` 记账接入（本轮评审 blocker 4）
+
+依赖上面已经落笔的 Task 2 `ambient_or_root_scope()`（本 Task 复用，不重新实现 is_ambient 判定）。
+
+6. 写失败测试（追加到 `tests/test_litellm/proxy/hooks/test_proxy_track_cost_callback.py`，复用文件顶部已有的 `_ProxyDBLogger`/`UserAPIKeyAuth`/`AsyncMock`/`MagicMock`/`patch`/`pytest` import；`Usage` 沿用 `test_async_post_call_failure_hook_records_recovered_partial_spend` 已经确立的 `from litellm.types.utils import Usage` 局部导入方式）。三个场景对应评审要求的"stream interruption / provider failure / post-auth failure"，验证手法相同：patch 掉 `update_database`，在替身实现里读一次 `current_accounting_scope.get()`，断言读到的正是 `register_root_scope_provider` 注入的假 root token，且这条 token 在整个 `async_post_call_failure_hook` 调用结束后被 `settle()` 恰好一次：
+
+```python
+class TestAsyncPostCallFailureHookAccountingScope:
+    """blocker 4（本轮评审）：async_post_call_failure_hook 必须自己在入口
+    acquire scope、在出口 settle，而不是被动依赖 update_database 内部
+    spawn_detached 那次调用点自己的隐式 ad hoc 兜底。三个场景覆盖评审列出的
+    stream interruption / provider failure / post-auth failure，机制完全相同
+    （async_post_call_failure_hook 本身不按异常类型分支 scope 处理逻辑），
+    分别验证是因为它们是评审明确要求覆盖的、真实会触达这条路径的三种触发方式。
+    """
+
+    @staticmethod
+    def _make_fake_root_token():
+        class _FakeRootToken:
+            def __init__(self):
+                self.settled = []
+
+            def is_valid(self):
+                return True
+
+            def spawn(self, coro, *, name, kind):
+                coro.close()
+
+            def settle(self, outcome):
+                self.settled.append(outcome)
+
+        return _FakeRootToken()
+
+    @pytest.mark.asyncio
+    async def test_stream_interruption_threads_ambient_scope_into_update_database(self):
+        from litellm.litellm_core_utils.accounting_scope import (
+            current_accounting_scope,
+            register_root_scope_provider,
+        )
+        from litellm.types.utils import Usage
+
+        fake_token = self._make_fake_root_token()
+        seen_scope_during_call = []
+
+        async def _fake_update_database(**kwargs):
+            seen_scope_during_call.append(current_accounting_scope.get())
+
+        logger = _ProxyDBLogger()
+        user_api_key_dict = UserAPIKeyAuth(api_key="test_api_key", user_id="u", team_id="t")
+        request_data = {
+            "model": "anthropic/claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "metadata": {},
+            "proxy_server_request": {"request_id": "rid"},
+            "response_cost": 3.5e-05,
+            "combined_usage_object": Usage(prompt_tokens=30, completion_tokens=1, total_tokens=31),
+        }
+
+        register_root_scope_provider(lambda: fake_token)
+        try:
+            with patch(
+                "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+                side_effect=_fake_update_database,
+            ):
+                await logger.async_post_call_failure_hook(
+                    request_data=request_data,
+                    original_exception=Exception("MidStreamFallbackError: read timeout"),
+                    user_api_key_dict=user_api_key_dict,
+                )
+        finally:
+            register_root_scope_provider(None)
+
+        assert seen_scope_during_call == [fake_token]
+        assert len(fake_token.settled) == 1
+        assert fake_token.settled[0].kind == "completed"
+
+    @pytest.mark.asyncio
+    async def test_provider_failure_threads_ambient_scope_into_update_database(self):
+        from litellm.litellm_core_utils.accounting_scope import (
+            current_accounting_scope,
+            register_root_scope_provider,
+        )
+
+        fake_token = self._make_fake_root_token()
+        seen_scope_during_call = []
+
+        async def _fake_update_database(**kwargs):
+            seen_scope_during_call.append(current_accounting_scope.get())
+
+        logger = _ProxyDBLogger()
+        user_api_key_dict = UserAPIKeyAuth(
+            api_key="test_api_key",
+            key_alias="test_alias",
+            user_id="test_user_id",
+            team_id="test_team_id",
+            org_id="test_org_id",
+        )
+        request_data = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "metadata": {"original_key": "original_value"},
+            "proxy_server_request": {"request_id": "test_request_id"},
+        }
+
+        register_root_scope_provider(lambda: fake_token)
+        try:
+            with patch(
+                "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+                side_effect=_fake_update_database,
+            ):
+                await logger.async_post_call_failure_hook(
+                    request_data=request_data,
+                    original_exception=Exception("APIConnectionError: upstream provider unreachable"),
+                    user_api_key_dict=user_api_key_dict,
+                )
+        finally:
+            register_root_scope_provider(None)
+
+        assert seen_scope_during_call == [fake_token]
+        assert len(fake_token.settled) == 1
+        assert fake_token.settled[0].kind == "completed"
+
+    @pytest.mark.asyncio
+    async def test_post_auth_failure_threads_ambient_scope_into_update_database(self):
+        """post-auth failure（401，仅 api_key 已知）：沿用
+        test_async_post_call_failure_hook_enriches_auth_error_metadata 已确立的
+        mock 形状（get_key_object/get_team_object 惰性 import 需要一并 patch），
+        额外验证 scope acquire/settle。"""
+        from litellm.litellm_core_utils.accounting_scope import (
+            current_accounting_scope,
+            register_root_scope_provider,
+        )
+
+        fake_token = self._make_fake_root_token()
+        seen_scope_during_call = []
+
+        async def _fake_update_database(**kwargs):
+            seen_scope_during_call.append(current_accounting_scope.get())
+
+        logger = _ProxyDBLogger()
+        user_api_key_dict = UserAPIKeyAuth(api_key="hashed_key")
+        request_data = {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "metadata": {},
+            "litellm_params": {},
+        }
+
+        mock_key_obj = MagicMock()
+        mock_key_obj.key_alias = "my-key-alias"
+        mock_key_obj.user_id = "my-user-id"
+        mock_key_obj.team_id = "my-team-id"
+        mock_key_obj.org_id = None
+
+        mock_team_obj = MagicMock()
+        mock_team_obj.team_alias = "my-team-alias"
+
+        register_root_scope_provider(lambda: fake_token)
+        try:
+            with (
+                patch(
+                    "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+                    side_effect=_fake_update_database,
+                ),
+                patch(
+                    "litellm.proxy.hooks.proxy_track_cost_callback.get_key_object",
+                    new_callable=AsyncMock,
+                    return_value=mock_key_obj,
+                ),
+                patch(
+                    "litellm.proxy.hooks.proxy_track_cost_callback.get_team_object",
+                    new_callable=AsyncMock,
+                    return_value=mock_team_obj,
+                ),
+            ):
+                await logger.async_post_call_failure_hook(
+                    request_data=request_data,
+                    original_exception=Exception("401 - model not allowed"),
+                    user_api_key_dict=user_api_key_dict,
+                )
+        finally:
+            register_root_scope_provider(None)
+
+        assert seen_scope_during_call == [fake_token]
+        assert len(fake_token.settled) == 1
+        assert fake_token.settled[0].kind == "completed"
+```
+
+7. 确认失败：对三个新测试各跑一次 `pytest tests/test_litellm/proxy/hooks/test_proxy_track_cost_callback.py -v -k accounting_scope`——均因 `seen_scope_during_call == [None]`（`async_post_call_failure_hook` 从未 acquire 任何 scope，`current_accounting_scope.get()` 恒为 `None`）而 `AssertionError`，且 `fake_token.settled == []`（从未被调用过）。
+
+8. 实现。`litellm/proxy/hooks/proxy_track_cost_callback.py`：
+
+```python
+# 顶部 import 追加
+from litellm.litellm_core_utils.accounting_scope import ambient_or_root_scope
+```
+
+```python
+# async_post_call_failure_hook 整个既有方法体（第 48-168 行，从 "try: await _release_budget_reservation(...)"
+# 到最后一次 "await proxy_logging_obj.db_spend_update_writer.update_database(...)"）
+# 缩进一级，套进这一层 async with；方法体内部逻辑不做任何其他改动
+async def async_post_call_failure_hook(
+    self,
+    request_data: dict,
+    original_exception: Exception,
+    user_api_key_dict: UserAPIKeyAuth,
+    traceback_str: Optional[str] = None,
+):
+    async with ambient_or_root_scope():
+        try:
+            await _release_budget_reservation(budget_reservation=user_api_key_dict.budget_reservation)
+        except Exception:
+            ...  # 既有异常处理逻辑不变
+        # ... 既有方法体其余部分原样保留，只是多缩进一级 ...
+```
+
+（这里没有引入任何新的分支或异常处理路径——`async with ambient_or_root_scope():` 本身在 `__aexit__` 里已经处理了正常返回与异常两种收尾情形，见 Task 2 Steps §3 的 `try/finally`，方法体内部原有的 `try/except` 结构不受影响、无需改动。）
+
+9. 确认转绿：
+   - `pytest tests/test_litellm/proxy/hooks/test_proxy_track_cost_callback.py -v`——全量跑一次该文件，确认三个新测试与全部既有 `async_post_call_failure_hook` 相关测试（`test_async_post_call_failure_hook`、`test_async_post_call_failure_hook_non_llm_route`、`test_async_post_call_failure_hook_releases_budget_reservation_before_route_skip`、`test_async_post_call_failure_hook_propagates_trace_id_from_logging_obj`、`test_async_post_call_failure_hook_enriches_auth_error_metadata`、`test_async_post_call_failure_hook_enriches_missing_team_alias`、`test_async_post_call_failure_hook_uses_actual_start_time`、`test_async_post_call_failure_hook_records_recovered_partial_spend` 等）都保持全绿——这些既有测试都没有注入 `register_root_scope_provider`，所以走 `ambient_or_root_scope()` 的"无 provider、无 ambient scope"分支（`acquire_root_scope()` 返回 `None`，`yield None`，`finally` 里两个 `if` 都不成立），方法体本身逐字节行为不变。
+   - `pytest tests/test_litellm/litellm_core_utils/test_accounting_scope.py -v`——确认 Task 2 新增的 `ambient_or_root_scope` 测试仍然全绿，没有被本 Task 的真实调用点破坏。
+
+10. 提交：`git add litellm/proxy/hooks/proxy_track_cost_callback.py tests/test_litellm/proxy/hooks/test_proxy_track_cost_callback.py && git commit -m "feat: acquire and settle an explicit accounting scope around async_post_call_failure_hook (Path B4)"`
 
 ---
 
@@ -3651,8 +4603,6 @@ GLOBAL_MANAGED_TASK_SUPERVISOR.spawn_telemetry(  # background task to update use
 
 **规划前提说明（如实记录，不是当前仓库事实）**：本计划撰写时，Phase 1a 全部 Task、以及本计划自身的 Task 1-9，在真实仓库里都**尚未落地实现**（`git log` 只有各阶段的 "docs:" 计划提交；`litellm/proxy/proxy_server.py` 现在的关停块仍是重排前的旧顺序，`GracefulShutdownManager` 现在只有 `is_shutting_down`/`get_timeout`/`start_shutdown`/`wait_for_drain`/`reset` 五个方法，没有 `deadline_remaining`/`is_force_exit`；`litellm/litellm_core_utils/logging_worker.py` 只有 `flush`，没有 `quiesce`/`queue_size`；`litellm/proxy/shutdown/` 目录下没有 `managed_task_supervisor.py`）。这是**正常的顺序执行前提**（Phase 1a 先落地，Phase 1b 才接着落地），不是需要上报的矛盾——本 Task 的失败测试、实现代码，都写成"假设 Phase 1a Task 7 与本计划 Task 4/5 已经落地"之后的目标状态，供未来按顺序执行的 implementer 使用，而不是针对当前 HEAD 状态可以直接跑通的代码。
 
-**补充说明（Task 10 落笔时发现的 spec 措辞分歧，不在本 Task 内部自行拍板，留待收尾时集中汇报主会话）**：spec 第 140 行与第 176 行两处字面写"`drain()`/`quiesce()` 返回冻结 tagged outcome：`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`"，比 Task 4/Task 5 已落笔并测试覆盖的两态 `DrainOutcome = Drained | DeadlineExceeded(remaining_accounting_tasks, remaining_admissions_in_progress)` / `LoggingDrainOutcome = LoggingDrained | LoggingDeadlineExceeded(dropped_queue_items, cancelled_running_tasks, cancelled_helper_tasks)` 多出一个 `ForcedExit` 变体，且 `DeadlineExceeded` 的字段名也不同（spec 是 `cancelled`/`cancellation_failed`，已落笔版本是"剩余未清空数量"）。逐字对照 Phase 1a Task 1 的 `deadline_remaining()` 设计说明——"force-exit 与自然到期在这个方法自己看来完全一样，都是返回 `0.0`，专门设计成让 `while deadline_remaining() > 0` 这一类 drain 循环不用额外穿一个标志位就能统一坍缩成'已过期'"——这意味着 `drain()`/`quiesce()` 的**唯一**输入 `deadline_remaining: Callable[[], float]` 从内部看根本无法反推出"是自然到期还是被摁了第二次 SIGINT"，除非再给两者的签名各加一个 `is_force_exit: Callable[[], bool]` 参数（这会改变 Task 4/5 已经落笔并测试覆盖的跨任务契约，属于本 Task 无权自行拍板的范围）。本 Task 采用的过渡解读是：`ForcedExit` 不做成 `DrainOutcome`/`LoggingDrainOutcome` 自身的第三个 tagged 变体，而是在**本 Task（lifespan 接线层）**收到 `DeadlineExceeded` 之后，另外单独读一次 `GracefulShutdownManager.is_force_exit()`，只在日志文案的 tag 上区分"deadline_exceeded"和"forced_exit"两种可观测结果（见下面 Step 3 的 `match` 分支）——这满足 spec 想要的"运维能从日志里分清两种关停原因"这一可观测性目标，同时不触碰已落笔并有测试覆盖的类型契约。是否要反过来改 Task 4/5 引入真正的三态 union + 改字段名，作为待决项在收尾报告里列出两个方案及取舍，由主会话裁决。
-
 **Files**: `litellm/proxy/proxy_server.py`（改，lifespan 关停块，在 Phase 1a Task 7 已重排的基础上再插入 spec 第 3-8 步）, `tests/test_litellm/proxy/proxy_server/test_lifecycle.py`（改，复用 Phase 1a Task 7 已写入的 `_FakeShutdownPrisma`/`_FakeShutdownDb`）
 
 **设计说明——`admission_policy` 怎么接线**：`LoggingWorker.quiesce()` 的 `admission_policy: Callable[[], bool]` 语义是"这一轮循环里，日志队列是否还应该继续接受新 enqueue"（见 Task 5 测试：`admission_policy=lambda: False` 时，新 enqueue 立即被结算为 `skipped_during_shutdown` 而不进队列）。quiesce()（spec 第 4 步）在 supervisor `drain()`（第 5 步）**之前**跑，此时 supervisor 还没开始排空、已登记的 accounting child 仍在正常运行，它们随时可能产生新的 logging enqueue（比如一个仍在跑的 `update_cache` 协程末尾要写一条 spend 日志）——如果这时候就把 admission 关掉，会把这些本该能正常完成的 enqueue 错误地当成"关停期新流量"直接丢弃，与 spec 第 4 步"flush 仍持 accounting lease 的 logging queue，让顶层 success/failure callback 真正开始并完成"这句话矛盾。因此 `admission_policy` 不接 `GLOBAL_MANAGED_TASK_SUPERVISOR.is_shutting_down_hard()`（那个标志在第 3 步就已经被 `close_root_admission()` 设为 `True`，如果拿来做 `admission_policy` 会导致 quiesce 从第一轮循环起就直接关闭 admission，等于让第 3/4 两步之间的"允许已登记 child 继续派生"名存实亡），而是直接复用与 `deadline_remaining` 同一把时钟：`admission_policy=lambda: GracefulShutdownManager.deadline_remaining() > 0`——只要 deadline 还没到，admission 就保持开放；deadline 一到，两个回调（`deadline_remaining`本身与`admission_policy`）在同一次循环迭代里同时翻面，quiesce() 自己的到期分支与 admission 关闭同步生效，不需要引入第二根时钟或额外参数。
@@ -3701,6 +4651,9 @@ async def test_lifespan_shutdown_wires_9_step_quiesce_protocol_in_order(monkeypa
 
     mock_logging_worker.quiesce = AsyncMock(side_effect=_fake_quiesce)
     mock_logging_worker.queue_size = MagicMock(return_value=0)
+    mock_logging_worker.stop_after_quiesce = AsyncMock(
+        side_effect=lambda: call_order.append("stop_after_quiesce")
+    )
 
     monkeypatch.setattr(ps.GracefulShutdownManager, "start_shutdown", lambda: None)
     monkeypatch.setattr(ps.GracefulShutdownManager, "wait_for_drain", _fake_wait_for_drain)
@@ -3723,19 +4676,23 @@ async def test_lifespan_shutdown_wires_9_step_quiesce_protocol_in_order(monkeypa
         "close_root_admission",
         "logging_quiesce",
         "supervisor_drain",
+        "stop_after_quiesce",
         "close_aiohttp_session",
     ]
 
 
 @pytest.mark.asyncio
 async def test_lifespan_shutdown_wires_quiesce_and_drain_callables_to_shared_deadline_clock(monkeypatch):
-    """Pins 三处易错的接线细节：(1) quiesce()/drain() 必须共享
+    """Pins 四处易错的接线细节：(1) quiesce()/drain() 必须共享
     GracefulShutdownManager 同一把冻结 deadline 时钟，而不是各自起一个独立
     计时器；(2) quiesce() 的 admission_policy 必须在 deadline 耗尽的那一刻才
     翻面关闭，而不是从一开始就常闭（那样会让第 3/4 步之间"允许已登记 child
     继续派生"名存实亡）；(3) drain() 的 root_queue_unfinished 必须绑定
     GLOBAL_LOGGING_WORKER.queue_size，否则 supervisor 会在 LoggingWorker 队列
-    里还有未 flush 完的 item 时就误判 fixed point 已达成。"""
+    里还有未 flush 完的 item 时就误判 fixed point 已达成；(4) 两处调用都必须
+    显式传 is_force_exit=GracefulShutdownManager.is_force_exit——不依赖 Task 4
+    `drain()` 自带的默认值，因为本轮评审要求两个调用点都不能让"是否强制退出"
+    这件事隐式发生。"""
     fake_prisma = _FakeShutdownPrisma([])
     captured_quiesce_kwargs: dict = {}
     captured_drain_kwargs: dict = {}
@@ -3755,6 +4712,7 @@ async def test_lifespan_shutdown_wires_quiesce_and_drain_callables_to_shared_dea
     mock_logging_worker = MagicMock()
     mock_logging_worker.quiesce = AsyncMock(side_effect=_fake_quiesce)
     mock_logging_worker.queue_size = MagicMock(return_value=42)
+    mock_logging_worker.stop_after_quiesce = AsyncMock()
 
     monkeypatch.setattr(ps.GracefulShutdownManager, "start_shutdown", lambda: None)
     monkeypatch.setattr(ps.GracefulShutdownManager, "wait_for_drain", AsyncMock())
@@ -3782,6 +4740,10 @@ async def test_lifespan_shutdown_wires_quiesce_and_drain_callables_to_shared_dea
     # root_queue_unfinished 绑定 LoggingWorker.queue_size，不是常量 0 或另起的计数器。
     assert captured_drain_kwargs["root_queue_unfinished"] == mock_logging_worker.queue_size
 
+    # 两处调用都显式传 is_force_exit，不依赖 drain() 自带的默认值。
+    assert captured_quiesce_kwargs["is_force_exit"] == ps.GracefulShutdownManager.is_force_exit
+    assert captured_drain_kwargs["is_force_exit"] == ps.GracefulShutdownManager.is_force_exit
+
     # admission_policy 与 deadline_remaining 同步翻面：还没到期时开放，到期后关闭。
     monkeypatch.setattr(ps.GracefulShutdownManager, "deadline_remaining", lambda: 3.0)
     assert captured_quiesce_kwargs["admission_policy"]() is True
@@ -3789,7 +4751,7 @@ async def test_lifespan_shutdown_wires_quiesce_and_drain_callables_to_shared_dea
     assert captured_quiesce_kwargs["admission_policy"]() is False
 ```
 
-（`Drained`、`LoggingDrained` 需要在文件顶部补两行 import：`from litellm.proxy.shutdown.managed_task_supervisor import Drained` 与 `from litellm.litellm_core_utils.logging_worker import LoggingDrained`；其余 `ps`/`FastAPI`/`AsyncMock`/`MagicMock`/`patch` 均已在该文件顶部导入，直接复用。）
+（`Drained`、`ForcedExit`、`LoggingDrained`、`LoggingForcedExit` 需要在文件顶部补两行 import：`from litellm.proxy.shutdown.managed_task_supervisor import Drained, ForcedExit` 与 `from litellm.litellm_core_utils.logging_worker import LoggingDrained, LoggingForcedExit`；其余 `ps`/`FastAPI`/`AsyncMock`/`MagicMock`/`patch` 均已在该文件顶部导入，直接复用。）
 
 跑一下确认失败：此刻 `ps.GLOBAL_MANAGED_TASK_SUPERVISOR`/`ps.GLOBAL_LOGGING_WORKER` 在 `proxy_server.py` 里还不存在（`monkeypatch.setattr` 会因找不到目标属性抛 `AttributeError`），且即便先假设它们已 import 进来，lifespan 关停块此刻也根本不会调用 `close_root_admission`/`quiesce`/`drain`，`call_order` 断言必然不匹配。
 
@@ -3801,11 +4763,13 @@ from litellm.litellm_core_utils.logging_worker import (
     GLOBAL_LOGGING_WORKER,
     LoggingDeadlineExceeded,
     LoggingDrained,
+    LoggingForcedExit,
 )
 from litellm.proxy.shutdown.managed_task_supervisor import (
     GLOBAL_MANAGED_TASK_SUPERVISOR,
     DeadlineExceeded,
     Drained,
+    ForcedExit,
 )
 ```
 
@@ -3818,28 +4782,39 @@ from litellm.proxy.shutdown.managed_task_supervisor import (
 
     # Shutdown event - quiesce protocol steps 3-8 (frozen spec section C):
     # close new root accounting admission, flush the logging queue, then
-    # fixed-point drain any remaining accounting children -- strictly before
-    # the shared aiohttp session (and prisma/redis, via proxy_shutdown_event
-    # below) get torn out from under them.
+    # fixed-point drain any remaining accounting children, then stop the
+    # logging worker's own background loop -- strictly before the shared
+    # aiohttp session (and prisma/redis, via proxy_shutdown_event below) get
+    # torn out from under them.
     GLOBAL_MANAGED_TASK_SUPERVISOR.close_root_admission()  # step 3
 
     logging_outcome = await GLOBAL_LOGGING_WORKER.quiesce(  # step 4
         deadline_remaining=GracefulShutdownManager.deadline_remaining,
         admission_policy=lambda: GracefulShutdownManager.deadline_remaining() > 0,
+        is_force_exit=GracefulShutdownManager.is_force_exit,
     )
     match logging_outcome:
         case LoggingDrained():
             verbose_proxy_logger.info("graceful_shutdown_logging_drained")
         case LoggingDeadlineExceeded(
-            dropped_queue_items=dropped, cancelled_running_tasks=running, cancelled_helper_tasks=helpers
+            dropped_queue_items=dropped, cancelled=cancelled, cancellation_failed=cancellation_failed
         ):
             verbose_proxy_logger.warning(
-                "graceful_shutdown_logging_%s dropped_queue_items=%s cancelled_running_tasks=%s "
-                "cancelled_helper_tasks=%s",
-                "forced_exit" if GracefulShutdownManager.is_force_exit() else "deadline_exceeded",
+                "graceful_shutdown_logging_deadline_exceeded dropped_queue_items=%s cancelled=%s "
+                "cancellation_failed=%s",
                 dropped,
-                running,
-                helpers,
+                cancelled,
+                cancellation_failed,
+            )
+        case LoggingForcedExit(
+            dropped_queue_items=dropped, cancelled=cancelled, cancellation_failed=cancellation_failed
+        ):
+            verbose_proxy_logger.warning(
+                "graceful_shutdown_logging_forced_exit dropped_queue_items=%s cancelled=%s "
+                "cancellation_failed=%s",
+                dropped,
+                cancelled,
+                cancellation_failed,
             )
         case _ as unreachable:
             assert_never(unreachable)
@@ -3847,25 +4822,27 @@ from litellm.proxy.shutdown.managed_task_supervisor import (
     drain_outcome = await GLOBAL_MANAGED_TASK_SUPERVISOR.drain(  # step 5 (fixed-point), 6-7 (cancel+settle on deadline)
         deadline_remaining=GracefulShutdownManager.deadline_remaining,
         root_queue_unfinished=GLOBAL_LOGGING_WORKER.queue_size,
+        is_force_exit=GracefulShutdownManager.is_force_exit,
     )
     match drain_outcome:
         case Drained():
             verbose_proxy_logger.info("graceful_shutdown_accounting_drained")
-        case DeadlineExceeded(
-            remaining_accounting_tasks=remaining_accounting, remaining_admissions_in_progress=remaining_admissions
-        ):
+        case DeadlineExceeded(cancelled=cancelled, cancellation_failed=cancellation_failed):
             verbose_proxy_logger.warning(
-                "graceful_shutdown_accounting_%s remaining_accounting_tasks=%s "
-                "remaining_admissions_in_progress=%s",
-                "forced_exit" if GracefulShutdownManager.is_force_exit() else "deadline_exceeded",
-                remaining_accounting,
-                remaining_admissions,
+                "graceful_shutdown_accounting_deadline_exceeded cancelled=%s cancellation_failed=%s",
+                cancelled,
+                cancellation_failed,
+            )
+        case ForcedExit(cancelled=cancelled, cancellation_failed=cancellation_failed):
+            verbose_proxy_logger.warning(
+                "graceful_shutdown_accounting_forced_exit cancelled=%s cancellation_failed=%s",
+                cancelled,
+                cancellation_failed,
             )
         case _ as unreachable:
             assert_never(unreachable)
-    # step 8 (stop logging worker) is a no-op here: quiesce() above already
-    # drained/cancelled the worker's own running+helper tasks to completion;
-    # there is no separate GLOBAL_LOGGING_WORKER.stop() call left to make.
+
+    await GLOBAL_LOGGING_WORKER.stop_after_quiesce()  # step 8
 
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:
@@ -3878,12 +4855,12 @@ from litellm.proxy.shutdown.managed_task_supervisor import (
     await proxy_shutdown_event()  # type: ignore[reportGeneralTypeIssues]  # step 9 (prisma + redis)
 ```
 
-（`assert_never` 需要从 `typing_extensions`（或 3.11+ 的 `typing`）import；`proxy_server.py` 里如果尚未 import，本 Task 一并在顶部补一行——本仓库遵循的"不 throw、tagged union + 穷举 match"约定，`assert_never` 是让 basedpyright 在未来新增变体时对漏 `case` 报类型错误的标准写法，不是本 Task 新发明的模式。）
+（`assert_never` 需要从 `typing_extensions`（或 3.11+ 的 `typing`）import；`proxy_server.py` 里如果尚未 import，本 Task 一并在顶部补一行——本仓库遵循的"不 throw、tagged union + 穷举 match"约定，`assert_never` 是让 basedpyright 在未来新增变体时对漏 `case` 报类型错误的标准写法，不是本 Task 新发明的模式。两处日志分支都直接从 `match` 命中的变体标签取文案——`LoggingForcedExit`/`ForcedExit`各自单独一支`case`——不再像上一稿那样在 `DeadlineExceeded`/`LoggingDeadlineExceeded` 分支内部另外调用一次 `GracefulShutdownManager.is_force_exit()` 去猜文案：三态 union 本身已经在 Task 4/Task 5 把"是否强制退出"这件事编码进了变体标签，`match` 只需要照抄，不需要重新查询一次管理器状态——这正是本轮评审"不得二次查询猜测原因"的字面要求。）
 
-**关于"step 8 是 no-op"的说明**：spec 第 8 步字面是"stop logging worker"，容易让人以为还需要额外调用一次 `GLOBAL_LOGGING_WORKER.stop()`。但读 Task 5 已落笔的 `quiesce()` 实现——它在 `LoggingDrained`（正常路径）和 `LoggingDeadlineExceeded`（到期路径）两个分支下，都已经把 `_running_tasks`/`_helper_tasks` 排空或取消到底、并且（正常路径下）`queue.join()` 已确认队列见底——`stop()` 现有语义只是"取消 `_running_tasks` 再 `clear_queue()`"，quiesce() 到期分支已经不允许再 `clear_queue()` 执行业务 callback（这正是 round-2 blocker 的教训），所以在 `quiesce()` 之后再调用一次 `stop()` 要么是重复劳动（正常路径），要么会违反"到期后不再执行 queued callback"的约定（到期路径，因为 `stop()` 内部路径与 quiesce 已经做的事冲突）。因此第 8 步在本 Task 的接线里就是"`quiesce()` 已经把这件事做完了"，不再有单独的调用点——如果未来 code review 觉得这里应该有一个显式的哨兵调用（哪怕是空操作）来对齐 spec 逐字顺序，可以在实现时补一行注释级别的占位，不改变行为。
+**关于 step 8：`stop_after_quiesce()`（major 8，Task 5 已实现）**：spec 第 8 步"stop logging worker"现在有了明确的调用点——Task 5 的 `stop_after_quiesce()`——而不是复用既有的 `stop()`（那个方法的 `clear_queue()` 兜底路径仍然会真正执行 queued 业务回调，与"到期后绝不执行 queued 业务回调"的约定冲突，见 Task 5 该方法自身的 docstring）。调用时机被 Task 5 明确约束为"只有在 `quiesce()` 与 `drain()` 都已返回之后调用一次"——因为 `drain()` 的 `root_queue_unfinished` 参数依赖 `_worker_loop` 仍然存活才能继续处理 `drain()` 自己窗口期内姗姗来迟的队列项；本 Task 因此把这次调用放在 `drain()` 的 `match` 块结束之后、关闭共享 aiohttp session 之前，与 Task 5 的约束严格对齐。
 
 3. 确认转绿：
-   - `pytest tests/test_litellm/proxy/proxy_server/test_lifecycle.py -v`——确认新增两个测试转绿，且 Phase 1a Task 7 写的顺序测试依旧转绿（本 Task 插入的四行新步骤不能打乱 Task 7 已经断言过的四段相对顺序）。
+   - `pytest tests/test_litellm/proxy/proxy_server/test_lifecycle.py -v`——确认新增两个测试转绿，且 Phase 1a Task 7 写的顺序测试依旧转绿（本 Task 插入的 `close_root_admission`/`quiesce`/`drain`/`stop_after_quiesce` 四步不能打乱 Task 7 已经断言过的四段相对顺序）。
    - `pytest tests/test_litellm/proxy/test_proxy_server.py -k startup_master_key -v`——Phase 1a Task 7 的 Steps 1 已经确认这是仓库里唯一一处完整驱动 `proxy_startup_event` 的既有测试，本 Task 再次触碰同一段代码，必须确认它没被打破。
    - `make pre-commit`。
 
@@ -3893,7 +4870,7 @@ from litellm.proxy.shutdown.managed_task_supervisor import (
 
 ## Task 11 — E2E 套件扩展：完整 9 步 quiesce 的进程级验收
 
-依赖 Task 10（新增的 `graceful_shutdown_logging_drained`/`graceful_shutdown_logging_deadline_exceeded`/`graceful_shutdown_accounting_drained`/`graceful_shutdown_accounting_deadline_exceeded` 四条日志），依赖 Phase 1a Task 8（`tests/e2e/shutdown/` 整套 harness——`subprocess_harness.py`/`fake_upstream.py`/`conftest.py`/`test_graceful_shutdown_e2e.py`——已落地；本 Task **扩展**既有文件，不新建套件）。
+依赖 Task 10（新增的 `graceful_shutdown_logging_drained`/`graceful_shutdown_logging_deadline_exceeded`/`graceful_shutdown_logging_forced_exit`/`graceful_shutdown_accounting_drained`/`graceful_shutdown_accounting_deadline_exceeded`/`graceful_shutdown_accounting_forced_exit` 六条日志），依赖 Phase 1a Task 8（`tests/e2e/shutdown/` 整套 harness——`subprocess_harness.py`/`fake_upstream.py`/`conftest.py`/`test_graceful_shutdown_e2e.py`——已落地；本 Task **扩展**既有文件，不新建套件）。
 
 **范围澄清（承接 Phase 1a"承诺的后续"一节）**：Phase 1a 计划正文明确写道，Phase 1b 要把 1a 留下的"关停短路"（`AccountingSkippedDuringShutdown` 提前返回）升级为完整 9 步 quiesce；本 Task 是这句承诺在 E2E 验收层面的落地——把 spec 第 186 行"uvicorn 入口"验收标准里，Phase 1a 当时还没有对应生产代码、因而没法断言的"记账 settled/skipped 单行日志"与"quiesce 顺序"两项，补进已有的 E2E 用例。
 
@@ -3902,6 +4879,13 @@ from litellm.proxy.shutdown.managed_task_supervisor import (
 **设计说明——为什么不额外写一个"E2E 级 deadline-exceeded 记账 drain"用例（记录未采纳方案，附理由）**：spec 第 176 行要求"quiesce 顺序断言"与"deadline 到期 cancel + settle"两类断言都要有覆盖，但没有规定必须在哪个测试层级覆盖。Task 4（`ManagedTaskSupervisor.drain()`）、Task 5（`LoggingWorker.quiesce()`）、Task 10（lifespan 接线）三处都已经用**注入的** `deadline_remaining=lambda: -1.0` 或 `lambda: 0.0` 这类确定性 fixture，在单元测试层面完整覆盖了"到期后联合 cancel + settle、不再执行 queued callback"这条路径——不依赖真实时钟、不依赖真实 DB/Redis 延迟，每次跑结果都确定。反过来，如果要在 E2E 层面（真实子进程、真实 DB/Redis）真正逼出"记账任务还没跑完、deadline 就到了"这个状态，唯一现实的手段是把 `GRACEFUL_SHUTDOWN_TIMEOUT` 设得极短（比如 10ms），赌真实 Postgres/Redis 往返来不及在这个窗口内完成——这是一场跟真实时钟和真实网络延迟的赛跑，本机、CI、不同负载下的真实往返时延本就不稳定，跑出来的测试会不可靠：负载低时这个"deadline exceeded"分支可能根本不会被触发（写操作 10ms 内就完成了），测试要么变成偶发 flaky，要么为了"保证触发"进一步压低超时到不现实的数值、反而让人怀疑这是否还是"真实场景"。这类不可靠信号正是 `CLAUDE.md`"宁可没有信号，也不要不会在代码坏时报警的测试"明确要拒绝的模式——一个大多数时候通过、只在特定负载下才断言到期分支的测试，无法在代码回归时可靠报警，等同于虚假信号。因此本 Task **不**在 E2E 层引入这类真实时钟竞速测试；deadline-exceeded 路径的验收保留在 Task 4/5/10 已经完成的确定性单元测试里，E2E 层只覆盖"进程真的会启动、真的会跑完整套 quiesce 协议、真的不会残留 reconnect/traceback"这类必须依赖真实子进程才能验证、且不依赖时钟竞速就能确定性触发的部分（正常路径下 `drain()`/`quiesce()` 必然落在 `Drained`/`LoggingDrained` 分支，不需要故意逼近 deadline）。
 
 **设计说明——为什么严格的"日志行先后顺序"断言只加到 `direct` 单进程模式**：`reload`/`workers` 模式下，关停时是每个 worker 子进程各自独立执行同一套 `GracefulShutdownManager`/`ManagedTaskSupervisor`/`GLOBAL_LOGGING_WORKER`（进程级单例，不跨进程同步——这是 Phase 1a 自检里已经确认过的既定非目标），多个 worker 的 stdout/stderr 交织写进同一个捕获文件，"整份合并文本里 A 子串第一次出现的位置早于 B 子串"不能保证反映"同一个 worker 内部 A 确实先于 B 发生"——可能是 worker 1 的 `graceful_shutdown_accounting_drained` 先打印出来，而 worker 2 的 `graceful_shutdown_started` 才刚刚开始交织进来，顺序断言这时候是对交织噪音的误读，不是对真实执行顺序的验证。`direct` 模式是唯一的单进程场景，日志天然是单一时间线，顺序断言在这里有真实意义；`reload`/`workers` 模式改用弱一档的"存在性"断言（新增的四条日志里，"drained"这一对至少各出现一次，且"deadline_exceeded"这一对**不**出现——因为正常路径不该触发到期分支），不做强顺序断言。
+
+**设计说明——`ForcedExit` 分支的可达性边界（已裁决，供未来读者理解这条不变量）**：本轮评审曾要求给第二次 SIGINT 的既有 E2E 用例（Phase 1a Task 8 的 `test_second_signal_forces_immediate_exit_without_waiting_full_deadline`）追加一条 `ForcedExit` 专属日志行断言。撰写本 Task 时直接读了真实 uvicorn 源码（`.venv/lib/python3.13/site-packages/uvicorn/server.py`），发现并向主协调者报告了一处架构事实——主协调者已核实并裁决如下，不再是待定问题：
+
+- 事实：`Server.shutdown()`（第 261-294 行）里，"Send the lifespan shutdown event"那一步写的是 `if not self.force_exit: await self.lifespan.shutdown()`（第 293-294 行）——`force_exit` 为真时，uvicorn 自己的基类直接跳过整个 ASGI lifespan shutdown 事件；`_wait_tasks_to_complete`（连接排空阶段）同样在 `force_exit` 时提前 bail。`Server.handle_exit()`（第 334-339 行）只有"已经 `should_exit` 且这次信号还是 `SIGINT`"（第二次 SIGINT）才会把 `self.force_exit` 置 `True`；Phase 1a 的 `DrainingServer.handle_exit()` 同样只在这个分支调用 `GracefulShutdownManager.request_force_exit()`。
+- **裁决 1——不改 Phase 1a 的 `DrainingServer`**：uvicorn 在 `force_exit` 时跳过 `lifespan.shutdown()` 是**正确语义**：第二次 SIGINT 的 operator 意图就是"别排空了，立刻退"，我们的记账 drain 本就是 best-effort（spec 非目标已明确"关停期允许少量未 flush spend 丢失"）。强行让 lifespan 在 `force_exit` 下仍然跑完，等于让"强退"不强退，违背 operator 意图，因此拒绝此前列出的"改 `DrainingServer.shutdown()`"这个选项。
+- **裁决 2——保留三变体 `ForcedExit`，可达窗口真实存在但窄**：`ForcedExit` 可达当且仅当"第二次 SIGINT 落在我们的 quiesce 已经在 `lifespan.shutdown()` 里运行时"——即：请求已跑完、uvicorn 自己的连接排空阶段已过，Task 10 的 quiesce/drain 正在跑，operator 此时双击 Ctrl+C，drain 循环在下一次迭代看到 `deadline_remaining()==0` 且 `is_force_exit()` 为真 → 产出 `ForcedExit`。**不**可达：当第二次 SIGINT 落在 uvicorn 自己的 `_wait_tasks_to_complete`（连接排空）阶段时，那次调用会跳过 `lifespan.shutdown()`，本计划的整套 quiesce 协议根本不会开始跑——这是 uvicorn 架构决定的时序窗口，不是本计划的 bug，也不需要修复。
+- **裁决 3——Task 11 只断言 user-observable 行为，不断言 `ForcedExit` 专属日志**：要精确让第二次 SIGINT 落在"记账 drain 正在进行"这条窄窗口内，时序太脆，不适合当 E2E 断言；`ForcedExit`/`LoggingForcedExit` 两个变体及其日志由 **Task 4/5 单测**（注入 `is_force_exit=lambda: True` 与可控 `deadline_remaining`）确定性覆盖，已经完成。E2E 层只断言用户真正在意的事：双击 Ctrl+C 后，进程在远小于完整 deadline 的时间内退出——见下方 Step 2b。
 
 **Steps**
 
@@ -3965,10 +4949,26 @@ def _assert_quiesce_log_order_single_process(proxy: SpawnedProxy) -> None:
             _assert_quiesce_log_order_single_process(proxy)  # this test only ever spawns mode="direct"
 ```
 
-3. 实现：本 Task 在 `tests/e2e/` 侧没有生产代码要改——四条新日志已经由 Task 10 在 `proxy_server.py` 里落地；这一步纯粹是"确认 Task 10 已完成后，E2E 测试自然转绿"，不需要额外写生产代码。若在 Task 10 尚未落地时先跑本 Task 的测试，预期失败信息应精确指向缺失的日志文本（而不是进程崩溃/超时），从而确认新断言本身而非环境问题是失败原因。
+2b. 第二次 SIGINT 强制退出场景（**已定稿**，见上方"设计说明——`ForcedExit` 分支的可达性边界"）：主协调者裁决不要求 E2E 断言 `ForcedExit` 专属日志，只要求断言 user-observable 行为——第二次 SIGINT 后进程在远小于完整 deadline 的时间内退出。这条断言 Phase 1a Task 8 的 `test_second_signal_forces_immediate_exit_without_waiting_full_deadline` 早已具备（`elapsed < 2.0`，对比配置的 30s deadline；`exit_code != 0`），本 Task **不需要改动这条既有测试的核心断言**。
+
+额外给这条既有测试追加一处"缺席性"断言，把"uvicorn 在 force_exit 时正确跳过 `lifespan.shutdown()`、Task 10 全套 quiesce 协议这次根本不会执行"这条不变量钉成一条确定性回归测试，而不只是文档里的一句话——这条断言复用 Step 1 已经定义好的 `_QUIESCE_DRAINED_LOG_PATTERNS`/`_QUIESCE_DEADLINE_EXCEEDED_LOG_PATTERNS` 常量，不依赖任何时序竞速，只在进程退出后检查一次完整捕获的输出：
+
+```python
+# 追加在既有 test_second_signal_forces_immediate_exit_without_waiting_full_deadline 里
+# `assert exit_code != 0` 之后：
+text = _combined_output(proxy)
+# 强制退出路径下，lifespan.shutdown() 被 uvicorn 有意跳过，Task 10 的整套 9 步
+# quiesce 协议因此根本不会执行——这条断言把上方"设计说明"里的不变量钉成一条
+# 确定性回归测试：未来如果有人不小心让 lifespan 在 force_exit 下也跑了起来
+# （无论是改坏 DrainingServer.shutdown()，还是引入了新的调用路径），这里会先报警。
+for pattern in _QUIESCE_DRAINED_LOG_PATTERNS + _QUIESCE_DEADLINE_EXCEEDED_LOG_PATTERNS:
+    assert pattern not in text, f"unexpected {pattern!r}: lifespan.shutdown() should have been skipped on force_exit"
+```
+
+3. 实现：本 Task 在 `tests/e2e/` 侧没有生产代码要改——四条新日志已经由 Task 10 在 `proxy_server.py` 里落地；这一步纯粹是"确认 Task 10 已完成后，E2E 测试自然转绿"，不需要额外写生产代码。若在 Task 10 尚未落地时先跑本 Task 的测试，预期失败信息应精确指向缺失的日志文本（而不是进程崩溃/超时），从而确认新断言本身而非环境问题是失败原因；Step 2b 的缺席性断言在 Task 10 未落地时天然为真（此时全部日志本来就不存在），因此该断言只有在 Task 10 落地之后才具备真正的区分力，需配合"若强行让 lifespan 在 force_exit 下也执行，本断言必须变红"这条心智模型去读。
 
 4. 确认转绿（要求 Task 10 已经落地）：
-   - `pytest tests/e2e/shutdown/test_graceful_shutdown_e2e.py -m spawned_proxy_e2e -v -k "TestSignalDrivenShutdown or TestSelfTriggeredShutdown"`——确认扩展后的断言全部通过，尤其确认 `direct` 模式下的顺序断言、`reload`/`workers` 模式下的存在性断言都覆盖到（`reload`/`workers` 各自至少有一个 parametrize case 命中，见既有 `@pytest.mark.parametrize`）。
+   - `pytest tests/e2e/shutdown/test_graceful_shutdown_e2e.py -m spawned_proxy_e2e -v -k "TestSignalDrivenShutdown or TestSelfTriggeredShutdown"`——确认扩展后的断言全部通过，尤其确认 `direct` 模式下的顺序断言、`reload`/`workers` 模式下的存在性断言、以及 Step 2b 新增的缺席性断言都覆盖到（`reload`/`workers` 各自至少有一个 parametrize case 命中，见既有 `@pytest.mark.parametrize`）。
    - 跑 `TestShutdownRaceWithRealInfra`（有 `DATABASE_URL`/`REDIS_HOST` 时）：确认真实 DB/Redis 场景下同样能观察到 `graceful_shutdown_accounting_drained`（而不是 skip 或异常）——这条断言复用 Phase 1a 已完成的该测试体，若发现该测试体尚未按 Phase 1a 自己的说明补全（仍是 `...` 占位），先回 Phase 1a 计划补全它、再叠加本 Task 的新断言，不在本 Task 里重新设计这个测试。
    - `make pre-commit`。
 
@@ -3981,7 +4981,7 @@ def _assert_quiesce_log_order_single_process(proxy: SpawnedProxy) -> None:
 以下每条在对应 Task 正文里都有完整推理，这里只做汇总索引，方便评审一次性看全，不代表这里的一句话摘要可以脱离原文单独引用。
 
 1. **不新增 `ManagedTaskSupervisor.spawn_child` 专用入口**（Task 8）——B2/B3 两个记账创建点直接复用 Task 2 已有的 `spawn_detached`，理由是两处调用点都天然处在 Task 6/7 已经建立的同一条真实调用链路上、`current_accounting_scope.get()` 能直接看到上游绑定的 lease，专门再开一个 `spawn_child` 入口只是给同一件事起第二个名字，不提供额外能力。
-2. **不追加 `ForcedExit` 作为 `DrainOutcome`/`LoggingDrainOutcome` 的第三个 tagged 变体**（Task 10，**尚未最终定案，见下方"自检"一节的"已知未决事项"**）——采用 Task-10 层面按 `GracefulShutdownManager.is_force_exit()` 给日志行打不同文本标签的临时方案，不改动 Task 4/5 已写好、已测试的两变体类型契约。
+2. **不采用"两变体 `DrainOutcome`/`LoggingDrainOutcome` + Task 10 层面按 `is_force_exit()` 查询结果给日志文本打标签"这一早期临时方案**（Task 4/5/10，本轮评审已裁决改判）——早期草稿曾计划保留两变体 union，只在 Task 10 的 lifespan 层单独反查 `GracefulShutdownManager.is_force_exit()` 来决定日志文案，不改动 Task 4/5 已写好的两变体类型契约；本轮评审明确要求改为 spec 第 140/176 行字面写的三变体 tagged union（`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`），且两处调用点（`quiesce()`/`drain()`）必须显式传入 `is_force_exit=...`、`match` 分支内部不得再反查——已在 Task 4/5/10 落实，两变体+反查方案不再采用。
 3. **不在 Task 11 里新增一条 E2E 级"deadline-exceeded 记账 drain"用例**——理由是可靠地把真实子进程逼进这条分支需要用一个人为极短的 `GRACEFUL_SHUTDOWN_TIMEOUT` 去赛真实 DB/Redis 网络延迟，本质上不可靠（本地快速 DB 写入完全可能在任意短 deadline 内提前完成，取决于机器/CI 负载），与项目 CLAUDE.md「测试要在代码坏的时候确实失败」的原则冲突；deadline-exceeded 路径已经被 Task 4/5/10 的单元测试用注入的 `deadline_remaining=lambda: -1.0` 类 fixture 完全且确定性地覆盖。
 4. **`reload`/`workers` 模式下不加严格的日志行先后顺序断言**（Task 11）——这两种模式各自派生独立子进程、各自持有进程级单例（`GracefulShutdownManager`/`ManagedTaskSupervisor`/`GLOBAL_LOGGING_WORKER` 不跨进程同步，Phase 1a 自检里已确认的既定非目标），多进程 stdout/stderr 交织进同一份捕获文件后，子串先后位置不能反映单进程内部真实时序；改用较弱的"两条 drained 日志都出现、两条 deadline_exceeded 日志都不出现"存在性断言。
 5. **不合并 `LoggingWorker.quiesce()` 与 `ManagedTaskSupervisor.drain()` 为跨两个组件的单一计数器**（Architecture 一节）——严格顺序组合（先 `quiesce()` 跑到底或到 deadline，再 `drain()` 用剩余 `deadline_remaining` 排空 supervisor 自己的 fixed point），呼应 spec"先 flush 产出的工作，再排空 child，方向不可反"的顺序约束；顺序编排放在 Task 10（lifespan 接线），不塞进任一组件内部，保持两者各自独立可测。
@@ -4009,7 +5009,7 @@ def _assert_quiesce_log_order_single_process(proxy: SpawnedProxy) -> None:
 | 第 C 节步骤 5（supervisor fixed-point drain：先冲刷产出工作，再排空 child，顺序不可反） | Task 4（`drain()`）+ Architecture 一节的顺序组合裁决 + Task 10（接线） |
 | 第 C 节步骤 6（deadline 到期 → 联合 cancel `LoggingWorker` 队列项/运行中任务/重试与激进清理 helper/supervisor child，然后 `gather(return_exceptions=True)`） | Task 5（`LoggingDeadlineExceeded`）+ Task 4（`DeadlineExceeded`）+ Task 10（接线，`match`/`assert_never` 分支处理两种到期结果） |
 | 第 C 节步骤 7（未完成记录写 `shutdown_dropped`，结清剩余 lease） | Task 3（每条 drop/rebind 路径 settle）+ Task 5（`LoggingDeadlineExceeded` 内部结清逻辑） |
-| 第 C 节步骤 8（停止 logging worker） | Task 10（说明：本步骤是 `quiesce()` 内部已处理的自然结果，接线层面是 no-op，已在 Task 10 正文注明） |
+| 第 C 节步骤 8（停止 logging worker） | Task 5（`stop_after_quiesce()` 实现）+ Task 10（在 `quiesce()`/`drain()` 均返回后显式调用一次，接线顺序见正文） |
 | 第 C 节步骤 9（关闭共享 aiohttp/prisma/redis） | Phase 1a 既有代码（未改）+ Task 10（确认接线顺序把这一步放在 quiesce 完成之后） |
 | 测试要求：记账生命周期全链路（lease 获取→派生→结清）单测覆盖 | Task 2/3/4（各自的单元测试） |
 | 测试要求：`drain()`/`quiesce()` 的 deadline-exceeded 分支必须可确定性触发、不依赖真实计时器 race | Task 4/5/10（注入 `deadline_remaining=lambda: -1.0` 类 fixture） |
@@ -4019,11 +5019,11 @@ def _assert_quiesce_log_order_single_process(proxy: SpawnedProxy) -> None:
 
 ### 占位符扫描
 
-对全文（约 3980 行）执行 `grep -n -E "TODO|TBD|类似|以此类推|同理省略"` 与逐行扫描裸 `\.\.\.`：仅命中 `Protocol`/抽象基类方法体的合法 `def foo(...) -> X: ...` 桩代码（`typing.Protocol` 惯用写法，本身就是最终形态，不是待补占位符），零命中真正意义上的未完成占位符（无遗留 `TODO`/`TBD`/裸省略号段落/"类似做法，此处省略"式模糊表述）。全部 11 个 Task 均以可直接执行的失败测试代码 + 实现 diff + 确认转绿步骤 + 提交命令收尾，没有任何一个 Task 只写了大纲。
+对全文（约 4000 余行）执行 `grep -n -E "TODO|TBD|类似|以此类推|同理省略"` 与逐行扫描裸 `\.\.\.`：命中分两类，均非未完成占位符——(1) `Protocol`/抽象基类方法体的合法 `def foo(...) -> X: ...` 桩代码（`typing.Protocol` 惯用写法，本身就是最终形态）；(2) Task 8 续 B4 的实现 diff 里，`async_post_call_failure_hook` 方法体内 `...  # 既有异常处理逻辑不变` 与 `# ... 既有方法体其余部分原样保留，只是多缩进一级 ...` 这两处——这是"展示 diff 时省略未改动的既有代码"的惯例写法，明确标注了"不变/原样保留"，不是待补内容；该方法完整的既有实现在真实代码库 `litellm/proxy/hooks/proxy_track_cost_callback.py` 里已经存在，本 Task 只要求把它整体缩进一级、套进 `async with ambient_or_root_scope():`，不要求重新誊写全文。全文零命中真正意义上的未完成占位符（无遗留 `TODO`/`TBD`/裸省略号段落/"类似做法，此处省略"式模糊表述）。全部 11 个 Task 均以可直接执行的失败测试代码 + 实现 diff + 确认转绿步骤 + 提交命令收尾，没有任何一个 Task 只写了大纲。
 
 ### 跨 Task 类型一致性核对
 
-- `DrainOutcome`（`Drained | DeadlineExceeded(remaining_accounting_tasks, remaining_admissions_in_progress)`）与 `LoggingDrainOutcome`（`LoggingDrained | LoggingDeadlineExceeded(dropped_queue_items, cancelled_running_tasks, cancelled_helper_tasks)`）两个两变体 tagged union，在定义处（Task 4、Task 5）与全部消费处（Task 10 的 `match`/`assert_never` 分支、Task 11 的日志断言）字段名与变体数量保持一致，没有任何消费点擅自假设第三个变体或不同字段名——**但这两个两变体形状本身与 spec 第 140/176 行字面写的三变体（`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`）不一致，这是一条尚未解决的已知事项，见下方"已知未决事项"，不是本次一致性核对的失败项，而是需要主协调者裁决的 spec-vs-plan 分歧**。
+- `DrainOutcome`（`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`）与 `LoggingDrainOutcome`（`LoggingDrained | LoggingDeadlineExceeded(dropped_queue_items, cancelled, cancellation_failed) | LoggingForcedExit(dropped_queue_items, cancelled, cancellation_failed)`）两个三变体 tagged union，在定义处（Task 4、Task 5）与全部消费处（Task 10 的三臂 `match`/`assert_never` 分支、Task 11 的日志断言）字段名与变体数量保持一致；`quiesce()`/`drain()` 两处调用都由 Task 10 显式传入 `is_force_exit=GracefulShutdownManager.is_force_exit`，`match` 分支内部没有任何一处再次反查 `is_force_exit()` 去猜测归因。字段名与变体数量已按本轮评审裁决对齐 spec 第 140/176 行字面写法，不再是未决事项（三变体本身是否在生产环境可达，是另一个新发现的独立问题，见下方"已知未决事项"）。
 - `AccountingOutcome`（`AccountingCompleted | AccountingSkippedDuringShutdown | AccountingFailed`）在 Task 4 定义、Task 6-9 的全部调用点（`AccountingLease.settle()` 的消费方）里字段与变体数量保持一致；`AccountingSkippedDuringShutdown` 是 Phase 1a 既有变体的直接复用，未重新定义。
 - `GracefulShutdownManager.deadline_remaining`/`is_force_exit` 的签名（Phase 1a Task 1 定义：`deadline_remaining() -> float` 无参 classmethod；`is_force_exit() -> bool` 无参 classmethod）与 Phase 1b Task 10 的实际调用方式（作为可调用对象整体传给 `quiesce(deadline_remaining=...)`/`drain(deadline_remaining=...)`，而非在 Task 10 内部重新包一层）完全一致；Task 10 第二条单测已用 PoC 验证过的 `==`（而非 `is`）语义正确断言了这层"透传同一个 classmethod 引用"的契约。
 - `AccountingScope`/`CompletionToken` 两个协议（Task 2 定义）在 `AccountingLease`（Task 4，同时实现两者）与 Path A/B 各接入点（Task 6-9）之间的方法签名（`is_valid()`/`spawn()`/`settle()`）保持一致，没有任何接入点对协议做隐式收窄或扩展。
@@ -4049,20 +5049,17 @@ Task 1（ManagedTaskSet）
 
 Task 4 与 Task 5 之间没有直接的类型依赖（`AccountingLease`不依赖`LoggingWorker`内部实现，反之亦然），理论上可以并行撰写/实现，但两者都依赖 Task 3 已经把 `LoggingTask.token` 落地，且 Task 6 起的接入工作需要两者都已完成，故排在图中同一层。Task 6-9（四个接入 Task）在文本顺序上是线性写的，但 Task 7（B1）/Task 8（B2/B3）之间除了都依赖 Task 6 建立的 scope 传播链路外没有相互依赖，实现时也可并行，是否并行执行属编排决策，不在本计划内裁定。
 
-### 已知未决事项（需要主协调者裁决，非本计划可自行拍板）
+### 已知未决事项（均已裁决/已接受，非阻塞——保留本节仅为向未来读者交代结论与理由，不再需要主协调者进一步拍板）
 
-**`DrainOutcome`/`LoggingDrainOutcome` 的 spec-vs-plan 变体分歧**：spec 第 140、176 行字面要求三变体 tagged union `Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`；Task 4/Task 5（在本计划撰写 Task 10 之前就已完整写好并配好测试）实际定义的是两变体、且字段名不同（`remaining_accounting_tasks`/`remaining_admissions_in_progress`，非 `cancelled`/`cancellation_failed`；无独立 `ForcedExit` 变体）。
+**`force_exit` 路径下 ASGI `lifespan.shutdown()` 从不执行，`ForcedExit`/`LoggingForcedExit` 在生产环境只有一个窄可达窗口（已裁决，见 Task 11 正文"设计说明——`ForcedExit` 分支的可达性边界"）**：撰写 Task 11 时读真实 uvicorn 源码（`uvicorn/server.py` 第 261-294、334-339 行）发现并上报了这一架构事实；主协调者已核实并裁决，结论要点（完整推理见 Task 11 正文，这里不重复全文，只记录结论，避免评审时漏看）：
 
-根因：Phase 1a Task 1 的 `deadline_remaining()` 设计特意让"强制退出"与"deadline 自然到期"两种情形都坍缩成同一个返回值 `0.0`，这样 `drain()`/`quiesce()` 的循环判断逻辑不需要额外多穿一个 flag 参数就能同时应对两种触发原因——但这也意味着 `drain()`/`quiesce()` 结构上**无法**在不破坏这条设计的前提下，自己内部区分出"是强制退出、还是单纯到期"，除非再给两者的签名加一个 `is_force_exit: Callable[[], bool]` 参数，而这会改变一个已经写好、已经测过的跨 Task 类型契约（`DrainOutcome`/`LoggingDrainOutcome` 是"公共 API/跨模块协议"性质的合同，按本角色的授权边界，改动它需要 architect-advisor 提案 + 主协调者拍板，不是 planner 可以自行决定的范围）。
+- 事实：`GracefulShutdownManager.is_force_exit()` 唯一能变为 `True` 的路径（第二次 SIGINT），恰好也是 uvicorn 基类 `Server.shutdown()` 里 `if not self.force_exit: await self.lifespan.shutdown()` 跳过 lifespan shutdown 事件的唯一路径。
+- **裁决 1**：不改 Phase 1a 已冻结的 `DrainingServer`——uvicorn 在 `force_exit` 时跳过 `lifespan.shutdown()` 是正确语义（第二次 SIGINT 的 operator 意图就是"别排空了，立刻退"），强行让 lifespan 在 `force_exit` 下仍跑完，等于让"强退"不强退。
+- **裁决 2**：保留三变体 `ForcedExit`——它的可达窗口真实存在但窄，仅当第二次 SIGINT 落在"quiesce 已经在 `lifespan.shutdown()` 里运行"这个时间点才会命中；落在 uvicorn 自己的连接排空阶段（`_wait_tasks_to_complete`）则不可达，这是 uvicorn 架构决定的时序窗口，不是本计划的 bug。
+- **裁决 3**：Task 11 的 E2E 只断言 user-observable 行为（第二次 SIGINT 后进程远快于完整 deadline 退出），不断言 `ForcedExit` 专属日志；`ForcedExit`/`LoggingForcedExit` 两个变体由 Task 4/5 的确定性单测（注入 `is_force_exit=lambda: True`）覆盖，已经完成。Task 11 的 Step 2b 已按此定稿，不再是 pending 状态。
+- 与"已定裁决：三变体"的关系：三变体 union 本身的裁决（`Drained | DeadlineExceeded | ForcedExit`，字段名 `cancelled`/`cancellation_failed`）与本项是两件独立已裁决事项，均不影响 Task 4/5/10 已经完成的类型契约与实现，无需回头改动。
 
-本计划在 Task 10 采用的临时解法（已在 Task 10 正文写明"补充说明"）：不新增 `ForcedExit` 变体，改为在 Task 10 的 lifespan 层（这一层天然拿得到 `GracefulShutdownManager.is_force_exit()`）对 `DeadlineExceeded`/`LoggingDeadlineExceeded` 结果做一次额外判断，仅在日志文本上区分 `"forced_exit"` 与 `"deadline_exceeded"` 两种归因——满足 spec"运维人员能从日志区分两种原因"这条可观测性意图，但不触碰已冻结的类型契约。
-
-两个选项交给主协调者裁决：
-
-- **选项 A（维持现状，无需返工）**：保留 Task 4/5 已写好的两变体 union，Task 10 层面用日志文本区分强制退出/到期。优点：零返工成本，Task 4/5/10/11 全部已完成且已测试。缺点：调用方若只看 `DrainOutcome`/`LoggingDrainOutcome` 的类型本身（不看日志），无法程序化区分两种原因（比如未来要给这两种情形接不同的告警级别/重试策略时，需要额外读日志文本而非类型本身）。
-- **选项 B（返工 Task 4/5，改成真正的三变体 union，字段名对齐 spec 原文）**：需要改动已写好、已提交进本计划文档的 Task 4/5 章节（类型定义、测试、Task 6-9/10/11 里所有消费点的 `match`/`assert_never` 分支），并且仍需解决"`drain()`/`quiesce()` 内部如何区分两种触发原因"这个结构性问题（大概率仍需要给两者签名加一个 `is_force_exit` 判定参数，这本身也是一次跨 Task 协议改动）。优点：类型契约字面对齐 spec，调用方可程序化区分两种原因。缺点：返工成本覆盖已完成的 4 个 Task，且不消除"要不要多穿一个参数"这个设计决策，只是把它从"日志层面"挪到"类型层面"。
-
-**本计划撰写者（planner）的推荐**：选项 A。理由：spec 意图的核心是"运维可观测性"（能区分两种原因），而不是"类型系统层面的强制区分"——选项 A 已经满足这条意图，且 spec 全文没有任何一处显式要求调用方必须以程序化方式（而非日志）分支处理这两种原因；选项 B 的返工成本与其带来的边际收益不成比例，且并未真正消解"两种原因是否需要在 `drain()`/`quiesce()` 内部结构性区分"这一更深层的设计问题，只是把同一个决策从"日志文本"平移到"字段名"，収益有限。但这最终是 spec 措辞的字面准确性 vs 已有实现的权衡取舍，按本角色边界不能自行拍板，需主协调者确认。
+**Task 8 B4（`async_post_call_failure_hook`）"掉队请求"残余竞态：已接受、非阻塞**：`wait_for_drain()` 因 deadline 到期而提前放弃、但仍有请求真正在途时，`close_root_admission()` 会在这些"掉队"请求跑完前提前触发；若这些请求随后失败并落到 `async_post_call_failure_hook`，此时 root admission 已关闭，`acquire_root_scope()` 返回 `None`，`spawn_detached`/`ambient_or_root_scope()` 退化为裸 `create_task`/无 ambient scope（完整推理见 Task 8 续"B4"小节"唯一的残余风险"段落）。这是一个 deadline 附近的窄时间窗口竞态，且与 B1/B2/B3 成功路径共享同一种"掉队请求"性质，不是 Task 8 独有、也不是 Task 8/本计划能单独消除的架构性权衡——spec 的非目标已明确"关停期允许少量未 flush spend 丢失"，deadline 机制本身加上 `spawn_detached` 的 ad hoc root 兜底已经把这条残余竞态收敛到一个有界（bounded）的尽力而为区间。按主协调者裁决，接受为已知残余、不再要求新增机制去封堵这个窗口。
 
 ## Kick-off Prompt
 
@@ -4100,10 +5097,15 @@ docs/superpowers/plans/2026-07-14-graceful-shutdown-phase1b.md
 修正并在 commit message 或 Task 旁注里说明；如果偏差会改变验收范围、架构合同、或某个已经写死的接口
 形状，停下来向主协调者报告，不要自行拍板。
 
-本计划文档末尾"自检"一节的"已知未决事项"记录了一个尚未解决的 spec-vs-plan 分歧（DrainOutcome/
-LoggingDrainOutcome 的两变体 vs spec 字面要求的三变体 ForcedExit），计划采用的是"选项 A"（维持两
-变体、Task 10 层面用日志文本区分强制退出/到期）。除非主协调者明确改判为选项 B，否则按选项 A 实现
-Task 4/5/10 即可，不需要在实现阶段重新纠结这个问题。
+Task 4/5/10 已经按 spec 第 140/176 行字面要求实现了三变体 `DrainOutcome`/`LoggingDrainOutcome`
+（`Drained | DeadlineExceeded(cancelled, cancellation_failed) | ForcedExit`），这部分不需要在实现
+阶段重新纠结。本计划文档末尾"自检"一节的"已知未决事项"记录了撰写 Task 11 时才浮现的一个架构
+问题——uvicorn 基类在"第二次 SIGINT 强制退出"这条路径上会跳过整个 ASGI `lifespan.shutdown()` 事件，
+而 Task 10 的整套 quiesce 协议（含 `ForcedExit` 分支）恰好就活在这个事件里——主协调者已经就此裁决
+并定稿：不改 Phase 1a 的 `DrainingServer`；保留三变体 `ForcedExit`（生产环境有窄但真实的可达窗口）；
+Task 11 的 E2E 只断言"第二次 SIGINT 后进程远快于完整 deadline 退出"这一 user-observable 行为，不
+断言 `ForcedExit` 专属日志（那两个变体由 Task 4/5 的确定性单测覆盖）。Task 11 的 Step 2b 已按此定稿
+写好，实现阶段按 Step 2b 原文执行即可，不需要再做任何选择或等待进一步裁决。
 
 每完成一个 Task 就更新一次本计划文档里对应 Task 的状态（如果计划文档还没有状态追踪字段，建议在每个
 Task 标题后追加 "（已完成，commit <hash>）"，保持 sync-plan-with-impl）。全部 11 个 Task 完成后，
