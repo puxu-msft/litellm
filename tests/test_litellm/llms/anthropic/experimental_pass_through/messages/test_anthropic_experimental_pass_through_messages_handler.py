@@ -892,3 +892,36 @@ class TestCopilotMergedStateRouting:
     def test_chat_only_model_hits_chat_bridge(self, monkeypatch):
         called = self._run(monkeypatch, "github_copilot/gpt-4o", False, False)
         assert called == (False, False, True)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_maps_deadline_exceeded_to_litellm_timeout():
+    """Fix E regression: unlike chat/responses, the messages face has NO exception_type()
+    wrapper anywhere in its call chain. A raw DeadlineExceeded surfacing from the native
+    handler's internal await must be converted to litellm.Timeout right here, or it leaks to
+    direct-SDK callers of litellm.anthropic_messages() as an internal exception type."""
+    import litellm
+    from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+    from litellm.llms.anthropic.experimental_pass_through.messages import handler
+
+    async def _raise_deadline_exceeded():
+        raise DeadlineExceeded("simulated total_timeout deadline exceeded")
+
+    def fake_handler(*args, **kwargs):
+        return _raise_deadline_exceeded()
+
+    fake_loop = MagicMock()
+    fake_loop.run_in_executor = lambda _e, func: _async_return(func())
+
+    with (
+        patch.object(handler, "anthropic_messages_handler", side_effect=fake_handler),
+        patch("asyncio.get_event_loop", return_value=fake_loop),
+    ):
+        with pytest.raises(litellm.Timeout):
+            await handler.anthropic_messages(
+                max_tokens=100,
+                messages=[{"role": "user", "content": "hi"}],
+                model="anthropic/claude-sonnet-4-5-20250929",
+                custom_llm_provider="anthropic",
+                api_key="k",
+            )

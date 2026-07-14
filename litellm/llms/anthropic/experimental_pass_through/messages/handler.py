@@ -22,6 +22,7 @@ from typing import (
 )
 
 import litellm
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.anthropic.common_utils import (
     sanitize_tool_use_ids_in_anthropic_messages,
@@ -372,7 +373,14 @@ async def anthropic_messages(
     init_response = await loop.run_in_executor(None, func_with_context)
 
     if asyncio.iscoroutine(init_response):
-        response = await init_response
+        try:
+            response = await init_response
+        except DeadlineExceeded as e:
+            raise litellm.Timeout(
+                message=str(e),
+                model=model,
+                llm_provider=custom_llm_provider or "anthropic",
+            ) from e
     else:
         response = init_response
     return response
