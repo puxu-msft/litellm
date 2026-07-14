@@ -180,6 +180,27 @@ async def test_try_waitpid_watch_handles_already_dead_pid(
     }
 
 
+@pytest.mark.asyncio
+async def test_try_waitpid_watch_already_dead_by_sigint_skips_reconnect(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watch-start WNOHANG probe reaps the child and thus holds its exit
+    status. If the engine was already killed by SIGINT before the watcher armed
+    (the Ctrl+C race), that status must be decoded and the reconnect suppressed
+    -- not dropped on the floor while the shutdown flag is still False."""
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr("os.waitpid", MagicMock(return_value=(8888, signal.SIGINT)))
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    result = prisma_client._try_waitpid_watch(8888)
+    await asyncio.sleep(0)
+
+    assert result is True
+    assert prisma_client.attempt_db_reconnect.await_count == 0
+
+
 def test_waitpid_thread_func_swallows_child_process_error(
     prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -214,18 +235,53 @@ def test_waitpid_thread_func_invokes_on_engine_death_on_normal_exit(
     }
 
 
+def test_term_signal_from_wait_status_decodes_via_wtermsig() -> None:
+    """The decoder must use WTERMSIG, not the raw status: a core-dumping signal
+    sets the 0x80 bit, so a SIGSEGV status is 139 while the true signal is 11.
+    Reading the raw status would misclassify it."""
+    core_dump_status = signal.SIGSEGV | 0x80  # 139
+    pinned = {
+        "sigsegv_core_dump": PrismaClient._term_signal_from_wait_status(core_dump_status),
+        "raw_status_would_be": core_dump_status,
+        "sigint": PrismaClient._term_signal_from_wait_status(signal.SIGINT),
+        "clean_exit": PrismaClient._term_signal_from_wait_status(0),
+        "exit_code_1": PrismaClient._term_signal_from_wait_status(1 << 8),
+    }
+    assert pinned == {
+        "sigsegv_core_dump": signal.SIGSEGV,
+        "raw_status_would_be": 139,
+        "sigint": signal.SIGINT,
+        "clean_exit": None,
+        "exit_code_1": None,
+    }
+
+
 def test_waitpid_thread_func_passes_term_signal_on_signaled_exit(
     prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A child killed by a signal exits with a status whose low 7 bits are the
-    terminating signal; the thread must forward that signal number so the death
-    handler can tell an external SIGINT/SIGTERM apart from a crash."""
-    monkeypatch.setattr("os.waitpid", MagicMock(return_value=(123, signal.SIGINT)))
+    """The thread forwards the *decoded* terminating signal. Use a core-dumping
+    status (0x80 bit set) so a mutant that forwards the raw status instead of
+    WTERMSIG would be caught (raw 139 != SIGSEGV 11)."""
+    monkeypatch.setattr("os.waitpid", MagicMock(return_value=(123, signal.SIGSEGV | 0x80)))
     loop = MagicMock()
     received: list[Any] = []
     loop.call_soon_threadsafe = lambda fn, pid, term_signal: received.append((fn, pid, term_signal))
     prisma_client._waitpid_thread_func(123, loop)
-    assert received[0][1:] == (123, signal.SIGINT)
+    assert received[0][1:] == (123, signal.SIGSEGV)
+
+
+def test_waitpid_thread_func_passes_none_when_status_unavailable(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the loop reaped the child first (ChildProcessError), no status is
+    available, so the forwarded signal is None and the handler falls back to the
+    shutdown flag rather than guessing."""
+    monkeypatch.setattr("os.waitpid", MagicMock(side_effect=ChildProcessError()))
+    loop = MagicMock()
+    received: list[Any] = []
+    loop.call_soon_threadsafe = lambda fn, pid, term_signal: received.append((fn, pid, term_signal))
+    prisma_client._waitpid_thread_func(123, loop)
+    assert received[0][1:] == (123, None)
 
 
 def test_waitpid_thread_func_swallows_loop_runtime_error(
@@ -909,12 +965,36 @@ async def test_engine_death_killed_by_sigint_skips_reconnect(
 
 
 @pytest.mark.asyncio
-async def test_engine_death_killed_by_sigterm_skips_reconnect(
+async def test_engine_death_by_sigterm_while_healthy_reconnects(
     prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """SIGTERM is NOT treated as an unconditional shutdown: in the normal
+    shutdown path the engine is not signalled directly, so a SIGTERM reaching
+    the engine while the proxy is healthy is an individual kill (a real failure)
+    that must reconnect. Only a process-group SIGTERM -- caught by the shutdown
+    flag -- is a shutdown."""
     prisma_client._engine_pid = 7777
     prisma_client._engine_confirmed_dead = False
     prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777, signal.SIGTERM)
+    await asyncio.sleep(0)
+
+    assert prisma_client.attempt_db_reconnect.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_engine_death_by_sigterm_during_shutdown_skips_reconnect(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process-group SIGTERM during shutdown (flag already set by the runner)
+    is a shutdown: suppress the reconnect."""
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: True
     prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
     monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
     monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())

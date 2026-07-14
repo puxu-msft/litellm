@@ -4167,7 +4167,7 @@ class PrismaClient:
         if sys.platform == "win32":
             return False
         try:
-            probe_pid, _ = os.waitpid(pid, os.WNOHANG)
+            probe_pid, probe_status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             verbose_proxy_logger.debug(
                 "PID %s is not a child process; skipping waitpid watch.",
@@ -4181,9 +4181,12 @@ class PrismaClient:
                 pid,
             )
             # We are watching `pid`; keep _engine_pid in sync so the shared
-            # death handler's identity guard accepts it.
+            # death handler's identity guard accepts it. The WNOHANG probe just
+            # reaped the child, so its terminating signal is in probe_status --
+            # forward it (same as the blocking-wait branch) so a Ctrl+C that
+            # killed the engine before the watcher armed is still recognized.
             self._engine_pid = pid
-            self._handle_engine_death(pid, "watch start")
+            self._handle_engine_death(pid, "watch start", self._term_signal_from_wait_status(probe_status))
             return True
 
         try:
@@ -4209,17 +4212,16 @@ class PrismaClient:
         we still notify the event loop because the engine is dead either way.
 
         The child's exit status tells us *why* it died: a child terminated by
-        SIGINT/SIGTERM was almost certainly caught by the same process-group
-        signal that is shutting the whole proxy down (local Ctrl+C), not a
-        crash. We forward the terminating signal (``None`` when unavailable, e.g.
-        the loop reaped it first) so the death handler can suppress the reconnect
-        without depending on the shutdown flag being set in time.
+        the terminal's SIGINT (local Ctrl+C to the whole process group) is a
+        shutdown, not a crash. We forward the terminating signal (``None`` when
+        unavailable, e.g. the loop reaped it first) so the death handler can
+        suppress the reconnect without depending on the shutdown flag being set
+        in time.
         """
         term_signal: Optional[int] = None
         try:
             _, status = os.waitpid(pid, 0)
-            if os.WIFSIGNALED(status):
-                term_signal = os.WTERMSIG(status)
+            term_signal = self._term_signal_from_wait_status(status)
         except ChildProcessError:
             pass
         except OSError:
@@ -4228,6 +4230,17 @@ class PrismaClient:
             loop.call_soon_threadsafe(self._on_engine_death_from_thread, pid, term_signal)
         except RuntimeError:
             pass
+
+    @staticmethod
+    def _term_signal_from_wait_status(status: int) -> Optional[int]:
+        """The signal that terminated a child, or ``None`` for a clean exit.
+
+        Must go through ``WIFSIGNALED``/``WTERMSIG``: the raw wait status is not
+        the signal number -- a core-dumping signal sets the 0x80 bit (e.g. a
+        SIGSEGV status is 139, not 11), so reading the raw status would
+        misclassify it. ``WTERMSIG`` strips that and returns the true signal.
+        """
+        return os.WTERMSIG(status) if os.WIFSIGNALED(status) else None
 
     def _consume_expected_death(self, pid: int) -> bool:
         """True iff ``pid`` was killed on purpose by a planned recreate.
@@ -4291,22 +4304,29 @@ class PrismaClient:
         Two things suppress the reconnect (each logs at INFO, not ERROR, and
         never resurrects the engine mid-shutdown):
 
-        - ``term_signal`` is SIGINT/SIGTERM: the engine was killed by the
-          process-group shutdown signal (local Ctrl+C / orchestrator SIGTERM).
-          This is the deterministic gate -- it does not depend on the shutdown
-          flag, which under Ctrl+C is set only after the engine already died.
-        - ``_is_shutting_down()`` is set: covers detectors that cannot read the
-          exit status (pidfd / poll) once the shutdown flag has landed.
+        - ``term_signal`` is SIGINT: the terminal delivered Ctrl+C to the whole
+          foreground process group, so the engine died from the same signal
+          shutting the proxy down. This is the deterministic gate -- it does not
+          depend on the shutdown flag, which under Ctrl+C is set only after the
+          engine already died. SIGTERM is deliberately *not* treated this way:
+          in the normal shutdown path the engine is not signalled directly, so a
+          SIGTERM reaching the engine while ``_is_shutting_down()`` is False is
+          an individual kill (a real failure) that must reconnect -- a
+          process-group SIGTERM is instead caught by the shutdown-flag gate
+          below, which the runner sets early.
+        - ``_is_shutting_down()`` is set: covers a process-group SIGTERM and the
+          detectors that cannot read the exit status (pidfd / poll) once the
+          shutdown flag has landed.
 
-        Anything else (a crash signal like SIGSEGV, or a clean exit while the
-        proxy is healthy) is a real failure and triggers the reconnect.
+        Anything else (a crash signal like SIGSEGV, an individually-killed
+        engine, or a clean exit while the proxy is healthy) is a real failure and
+        triggers the reconnect.
         """
-        if term_signal in (signal.SIGINT, signal.SIGTERM):
+        if term_signal == signal.SIGINT:
             verbose_proxy_logger.info(
-                "prisma-query-engine PID %s was terminated by %s (%s); treating as "
-                "shutdown, not reconnecting.",
+                "prisma-query-engine PID %s was terminated by SIGINT (%s); treating as "
+                "Ctrl+C shutdown, not reconnecting.",
                 dead_pid,
-                signal.Signals(term_signal).name,
                 source,
             )
             return

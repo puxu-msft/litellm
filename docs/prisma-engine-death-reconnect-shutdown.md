@@ -8,22 +8,31 @@ Under a local Ctrl+C, SIGINT reaches the whole foreground process group, so the 
 
 Independently verified against uvicorn 0.33.0 (real subprocess + process-group SIGINT): death callback and its deferred task both run at `flag=False`; `start_shutdown` lands ~180ms later.
 
-## What is fixed (commit 898d6a6a26)
+## What is fixed (commits 898d6a6a26 + follow-up)
 
-The waitpid detector now reads the child's terminating signal off the exit status (`os.WIFSIGNALED` / `os.WTERMSIG`) and forwards it to the death handler. A `SIGINT`/`SIGTERM` there means the engine was killed by the process-group shutdown signal, so the death is treated as a shutdown and the reconnect is suppressed deterministically; it does not depend on the shutdown flag being set in time or on any particular server runner (works for `uvicorn.run` and Granian alike). A crash signal (e.g. SIGSEGV) or a clean exit while the proxy is healthy still reconnects.
+The waitpid detector reads the child's terminating signal off the exit status via `WIFSIGNALED`/`WTERMSIG` (a core-dumping signal sets the 0x80 bit, so the raw status is not the signal number) and forwards it to the death handler. Both waitpid entry points do this: the blocking wait thread and the watch-start `WNOHANG` probe (which reaps an already-dead child and so holds its status too).
 
-This directly kills the exact symptom in the reported log (the `waitpid thread` detector under Ctrl+C).
+Suppression rule in `_reconnect_after_engine_death`:
+
+- `SIGINT` -> unconditional suppress. The terminal delivered Ctrl+C to the whole foreground process group, so this is deterministic and does not depend on the shutdown flag's timing or the server runner.
+- `SIGTERM` -> suppress only when `_is_shutting_down()` is also set. In the normal shutdown path the engine is not signalled directly, so a SIGTERM reaching the engine while the flag is False is an individual kill (a real failure) that must reconnect; a process-group SIGTERM during a known shutdown is caught by the flag gate.
+- Anything else (crash signal like SIGSEGV, individually-killed engine, clean exit while healthy) reconnects.
+
+This kills the exact symptom in the reported log (the `waitpid thread` detector under Ctrl+C).
 
 ## Still open (deferred; coordinate with Phase 1a/1b)
 
-These came out of the adversarial review and are intentionally not in the narrow fix above, because they overlap the fleet's in-flight shutdown/deadline framework and should reuse it rather than duplicate it.
-
-- Health-watchdog resurrection path. `_db_health_watchdog_loop` calls `attempt_db_reconnect` on probe failure and is only cancelled after drain. During shutdown a failed probe can still heavy-reconnect and spawn a new engine (the death handler already set `_engine_confirmed_dead`). Gate this on shutdown.
-- TOCTOU in the reconnect path. The reconnect decision checks shutdown once; a task can then wait on `_db_reconnect_lock`, acquire it after shutdown starts, and still recreate. Re-check shutdown inside the lock, right before `recreate_prisma_client`. Placing that single check at the top of `_run_reconnect_cycle` covers every caller (death path, health watchdog, request-driven) and is TOCTOU-safe.
+- Health-watchdog resurrection path. `_db_health_watchdog_loop` calls `attempt_db_reconnect` on probe failure. On uvicorn this is now blocked from doing damage: `DrainingServer` sets the shutdown flag at signal time and `_attempt_reconnect_inside_lock` re-checks it after taking the lock, so a shutdown probe failure no longer recreates the engine. Still open: unify the watchdog's own lifecycle (stop it promptly on shutdown rather than after drain) and confirm the same holds for runners without an early-GSM signal.
 - Reconnect task lifecycle. The engine-death reconnect is a bare `asyncio.create_task` with no stored reference (can be GC'd mid-flight) and is not cancelled by `stop_db_health_watchdog_task`. Track it and cancel on stop.
-- pidfd / os.kill-poll detectors cannot read an exit status, so they still race under a pre-DrainingServer Ctrl+C. Mitigated once `DrainingServer` is wired into the serve path: its `handle_exit` calls `start_shutdown()` synchronously at signal time, so the GSM gate fires before the death callback. These are fallback detectors (used only when the waitpid thread can't be set up), so the primary path is already covered.
+- Non-uvicorn runners. Granian (`Granian(**kwargs).serve()`) has no early-GSM wiring, so its pidfd / os.kill-poll detectors (which cannot read an exit status) still race a process-group signal there. The waitpid detector's SIGINT gate already covers the common path on any runner.
 - Integration coverage at the real-uvicorn level (spawn uvicorn + child + process-group SIGINT, assert no reconnect / no `triggering reconnect` log / no new engine PID). The current regression test spawns a real child and sends SIGINT to exercise the real `os.waitpid` -> `WTERMSIG` path, but does not stand up uvicorn.
+
+## Already landed by the shutdown fleet
+
+- TOCTOU. `_attempt_reconnect_inside_lock` now re-checks `_is_shutting_down()` after acquiring `_db_reconnect_lock`, covering every reconnect caller (death path, health watchdog, request-driven) at the destructive point.
+- Early-shutdown signal on uvicorn. `DrainingServer` overrides `handle_exit` to call `GracefulShutdownManager.start_shutdown()` synchronously at signal-delivery time; `litellm/proxy/shutdown/uvicorn_runner.py` + `proxy_cli` wire it into the serve path. So on uvicorn the shutdown flag is set before the death callback runs, making the flag-based gate effective for the pidfd/poll detectors and SIGTERM too.
 
 ## Dependency
 
-The general early-shutdown signal is `DrainingServer` (Phase 1a): it wires uvicorn's `handle_exit` into `GracefulShutdownManager.start_shutdown()` at signal-delivery time. Once it is wired into `proxy_cli`'s serve path, the GSM-based gates above become effective for the non-waitpid detectors too. The deferred items should build on `GracefulShutdownManager.is_shutting_down()` / the frozen deadline rather than re-implement signal handling.
+Deferred items should build on `GracefulShutdownManager.is_shutting_down()` / the frozen deadline and, for non-uvicorn runners, an equivalent early-signal hook rather than re-implementing signal handling.
+
