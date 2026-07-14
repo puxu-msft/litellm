@@ -21,8 +21,11 @@ Linux-only tests are skipped on Windows; the production code uses
 from __future__ import annotations
 
 import asyncio
+import signal
+import subprocess
 import sys
 import threading
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -193,20 +196,36 @@ def test_waitpid_thread_func_invokes_on_engine_death_on_normal_exit(
     monkeypatch.setattr("os.waitpid", MagicMock(return_value=(123, 0)))
     loop = MagicMock()
     received: list[Any] = []
-    loop.call_soon_threadsafe = lambda fn, pid: received.append((fn, pid))
+    loop.call_soon_threadsafe = lambda fn, pid, term_signal: received.append((fn, pid, term_signal))
     prisma_client._waitpid_thread_func(123, loop)
     pinned = {
         "callbacks_received": len(received),
         "callback_target": received[0][0] == prisma_client._on_engine_death_from_thread,
         "pid_arg": received[0][1],
+        "term_signal_arg": received[0][2],
         "first_tuple_size": len(received[0]),
     }
     assert pinned == {
         "callbacks_received": 1,
         "callback_target": True,
         "pid_arg": 123,
-        "first_tuple_size": 2,
+        "term_signal_arg": None,
+        "first_tuple_size": 3,
     }
+
+
+def test_waitpid_thread_func_passes_term_signal_on_signaled_exit(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child killed by a signal exits with a status whose low 7 bits are the
+    terminating signal; the thread must forward that signal number so the death
+    handler can tell an external SIGINT/SIGTERM apart from a crash."""
+    monkeypatch.setattr("os.waitpid", MagicMock(return_value=(123, signal.SIGINT)))
+    loop = MagicMock()
+    received: list[Any] = []
+    loop.call_soon_threadsafe = lambda fn, pid, term_signal: received.append((fn, pid, term_signal))
+    prisma_client._waitpid_thread_func(123, loop)
+    assert received[0][1:] == (123, signal.SIGINT)
 
 
 def test_waitpid_thread_func_swallows_loop_runtime_error(
@@ -852,3 +871,132 @@ def test_handle_writer_engine_replaced_noop_during_shutdown(prisma_client: Prism
     prisma_client._cleanup_engine_watcher = MagicMock()
     prisma_client._handle_writer_engine_replaced()
     prisma_client._cleanup_engine_watcher.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Engine killed by the process-group shutdown signal (regression).
+#
+# Under a local Ctrl+C, SIGINT hits the whole foreground process group, so the
+# engine child dies from SIGINT ~200ms before the lifespan sets the shutdown
+# flag. The waitpid detector reads the child's terminating signal and, when it
+# is SIGINT/SIGTERM, treats the death as a shutdown and suppresses the reconnect
+# deterministically -- independent of the shutdown flag's timing. A crash signal
+# (or a clean exit while the proxy is healthy) still reconnects.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_engine_death_killed_by_sigint_skips_reconnect(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: False  # prove it's the signal gate, not GSM
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    with caplog.at_level("ERROR", logger="LiteLLM Proxy"):
+        prisma_client._on_engine_death_from_thread(7777, signal.SIGINT)
+        await asyncio.sleep(0)
+
+    pinned = {
+        "reconnect_called": prisma_client.attempt_db_reconnect.await_count,
+        "confirmed_dead": prisma_client._engine_confirmed_dead,
+        "error_logs": [r.getMessage() for r in caplog.records if r.levelname == "ERROR"],
+    }
+    assert pinned == {"reconnect_called": 0, "confirmed_dead": True, "error_logs": []}
+
+
+@pytest.mark.asyncio
+async def test_engine_death_killed_by_sigterm_skips_reconnect(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777, signal.SIGTERM)
+    await asyncio.sleep(0)
+
+    assert prisma_client.attempt_db_reconnect.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_death_crash_signal_still_reconnects(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash signal (SIGSEGV) is a real failure, not a shutdown: reconnect."""
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777, signal.SIGSEGV)
+    await asyncio.sleep(0)
+
+    assert prisma_client.attempt_db_reconnect.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_engine_death_clean_exit_reconnects_when_not_shutting_down(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No terminating signal (clean exit / status unavailable) and not shutting
+    down -> the engine crashed, so reconnect."""
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777, None)
+    await asyncio.sleep(0)
+
+    assert prisma_client.attempt_db_reconnect.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_real_child_killed_by_sigint_is_not_reconnected(
+    prisma_client: PrismaClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End-to-end on a real child process: start the real waitpid thread on a
+    live child, send it SIGINT (as the process group would under Ctrl+C), and
+    assert the death is classified as external termination -- the terminating
+    signal is read off the real exit status and no reconnect is scheduled. This
+    exercises the actual os.waitpid -> WTERMSIG path, not a mocked status."""
+    child = subprocess.Popen(["sleep", "30"])
+    prisma_client._engine_pid = child.pid
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+
+    with caplog.at_level("INFO", logger="LiteLLM Proxy"):
+        assert prisma_client._try_waitpid_watch(child.pid) is True
+        child.send_signal(signal.SIGINT)
+
+        # Wait for the real waitpid thread to observe the exit and hop onto the
+        # loop, then drain the scheduled reconnect-decision task.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not prisma_client._engine_confirmed_dead:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
+
+    messages = [r.getMessage() for r in caplog.records]
+    pinned = {
+        "confirmed_dead": prisma_client._engine_confirmed_dead,
+        "reconnect_called": prisma_client.attempt_db_reconnect.await_count,
+        "classified_as_sigint": any("terminated by SIGINT" in m for m in messages),
+        "no_reconnect_log": not any("triggering reconnect" in m for m in messages),
+    }
+    assert pinned == {
+        "confirmed_dead": True,
+        "reconnect_called": 0,
+        "classified_as_sigint": True,
+        "no_reconnect_log": True,
+    }
