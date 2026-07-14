@@ -1,8 +1,23 @@
 # Phase 0 PoC 结果 · gpt reasoning carrier 回放可行性
 
-状态: **server/wire 侧已验证（curl 探针，2026-07-14）；client 侧回放待真实 Claude Code gpt 会话**
+状态: **门禁 PASSED（A 载体）——R1 证实: Claude Code 逐字节存储私有载体、encrypted_content 跨轮完好（2026-07-14）**
 关联: `docs/superpowers/plans/2026-07-14-gpt-reasoning-thinking-fidelity.md` Task 6、spec §5。
-门禁作用: 证实/证伪 **Claude Code 是否原样存储并回放我们塞进 thinking 的私有载体**（signature_delta），后端是否接受还原的 reasoning item。**不过则停，回到载体/编码决策，不进 Phase 3。**
+门禁作用: 证实/证伪 **Claude Code 是否原样存储并回放我们塞进 thinking 的私有载体**（signature_delta），后端是否接受还原的 reasoning item。
+
+## 门禁结论: PASSED（默认载体 = A / signature）
+
+用 **gpt-souls 子代理**（本身就是真实 Claude Code gpt 客户端，跑 gpt-5.6-sol，多回合）驱动，绕开了「主会话是 opus」的限制，直接测到客户端存储/回放路径。子代理 transcript `.../subagents/agent-aa68a36a4da30061a.jsonl`:
+
+- 3 个 assistant `thinking` 块，`signature` 字段**全部是完整 `ghc-rsn:v1:...` 载体、逐字节原样**（empty=0, ghc=3, other=0）。
+- 用硬化 `decode_carrier` 解码**全部 `DecodedCarrier`**，还原出真实 encrypted_content（2340 / 2512 / 2116 字符）。
+- **oracle 2 ✅**: Claude Code 逐字节存储载体。**R1（全设计押的最大风险）证实成立。**
+- **oracle 3 回放半 ✅（隐含）**: 载体分布在多回合的 assistant 历史里，Claude Code 回放完整历史 → 后续回合请求带着前面回合的载体。请求侧**重建 reasoning item**那半 = Phase 4。
+
+> grep `'"signature": ?"ghc-rsn:v1:'` 一度返回 0 是**路径遗漏**（子代理 transcript 在 `projects/<p>/<uuid>/subagents/` 比 `projects/*/*.jsonl` 深一层），非载体问题；递归 find 才扫到。
+
+## 仍待 Phase 3-6 落实的 oracle（非阻塞门禁）
+
+- oracle 3 重建、oracle 5 重启恢复、oracle 6 跨模型剥离、oracle 7 篡改（codec 已保证 InvalidCarrier）、oracle 8 双 message_start 客户端影响——这些在 Phase 3-6 实现并测。门禁核心（R1 存储/回放）已过。
 
 ## 本轮已验证（server/wire 侧，curl 直打运行中的代理）
 
