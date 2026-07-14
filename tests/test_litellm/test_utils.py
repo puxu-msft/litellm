@@ -4707,3 +4707,15 @@ class TestValidateEnvironmentTencent:
         assert "TENCENT_API_KEY" in result["missing_keys"]
 
 
+
+
+def test_supports_httpx_timeout_includes_github_copilot():
+    from litellm.utils import supports_httpx_timeout
+
+    assert supports_httpx_timeout("github_copilot") is True
+
+
+def test_supports_httpx_timeout_excludes_unlisted_provider():
+    from litellm.utils import supports_httpx_timeout
+
+    assert supports_httpx_timeout("cohere") is False
