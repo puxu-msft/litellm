@@ -4658,8 +4658,15 @@ Since all four choke points need the exact same warning semantics (a caller-owne
 
 Copy the block below verbatim to start a fresh session (or hand off to a subagent) to execute this plan.
 
+> **RESUMPTION STATUS (2026-07-14): Phase 1 is COMPLETE and committed on branch `ghc`.** Done: Tasks 1, 2, 3, 4, 5, 6, 7, 7a, and 4a steps 1-2 (the `github_copilot` allowlist entry). The entire config surface exists end-to-end (schema/parse/merge/resolve, `GenericLiteLLMParams.http_client` + `LiteLLMParamsTypedDict` fields, `all_litellm_params` leak-prevention, global proxy-load validation, legacy-timeout coexistence warning at both boundaries) with zero runtime timeout-behavior change yet. **Start at Phase 2, Task 8.** One carried-over item: **Task 4a step 3** (the safety-net regression `test_completion_http_client_bypasses_supports_httpx_timeout_degrade_for_unlisted_provider`) was deferred because it depends on Task 13's production code — implement it as part of / right after Task 13. Re-grep every line number before editing (they have drifted since plan authoring, and further from the Phase 1 edits already landed).
+
 ```
 Read docs/superpowers/plans/2026-07-14-upstream-http-client-config.md in full before doing anything else.
+
+RESUMPTION: Phase 1 (Tasks 1-7, 7a, and 4a steps 1-2) is already complete and committed on branch `ghc`.
+Start at Phase 2, Task 8. Do NOT re-do Phase 1. Carry over Task 4a step 3 (a safety-net regression test that
+depends on Task 13) and implement it with Task 13. Re-grep every cited line number before editing — they
+have drifted since plan authoring and again since the Phase 1 edits landed.
 
 Context: this is a private litellm fork (branch `ghc`, no upstream PRs). The plan you just read implements
 fine-grained upstream HTTP client config (connect/read/pool/total timeouts, http2 reserved-only) for the
