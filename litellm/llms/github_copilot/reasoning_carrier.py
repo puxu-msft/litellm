@@ -19,7 +19,7 @@ import base64
 import binascii
 import json
 from dataclasses import dataclass
-from typing import Annotated, Literal, Mapping, Union
+from typing import Annotated, Literal, Mapping, Union, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 from typing_extensions import assert_never
@@ -173,3 +173,40 @@ def decode_carrier(block: Mapping[str, object]) -> DecodeResult:
             version=version,
         )
     )
+
+
+def _is_our_carrier_block(block: object) -> bool:
+    if not isinstance(block, dict):
+        return False
+    b = cast("dict[str, object]", block)
+    return b.get("type") in ("thinking", "redacted_thinking") and not isinstance(decode_carrier(b), NotOurCarrier)
+
+
+def strip_carrier_thinking_blocks(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Remove our ``ghc-rsn`` carrier thinking/redacted_thinking blocks from an
+    Anthropic messages list.
+
+    Used on the non-Responses (e.g. Claude) request path so a private carrier never
+    reaches a backend that would reject it as an invalid signature (spec block 1
+    §4.6/§4.7). Genuine Claude thinking (no ``ghc-rsn`` namespace) is untouched.
+    Zero-copy fast path: returns the same list object when no carrier is present, so
+    normal Claude requests are completely unaffected.
+    """
+
+    def has_carrier(m: dict[str, object]) -> bool:
+        content = m.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(_is_our_carrier_block(b) for b in cast("list[object]", content))
+
+    if not any(has_carrier(m) for m in messages):
+        return messages
+
+    def clean(m: dict[str, object]) -> dict[str, object]:
+        content = m.get("content")
+        if not isinstance(content, list):
+            return m
+        blocks = cast("list[object]", content)
+        return {**m, "content": [b for b in blocks if not _is_our_carrier_block(b)]}
+
+    return [clean(m) for m in messages]

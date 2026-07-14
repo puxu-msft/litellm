@@ -536,8 +536,16 @@ def anthropic_messages_handler(
         # ``async_anthropic_messages_handler`` so it can ``await`` the
         # summarization model for ``compact_20260112``. ``context_management``
         # is passed through as a regular kwarg.
+        #
+        # Cross-model safety: strip our private ``ghc-rsn`` reasoning carrier from
+        # the assistant history before a non-Responses (e.g. Claude) backend, which
+        # would reject it as an invalid thinking signature (spec block 1 §4.6/§4.7).
+        # Zero-copy when no carrier is present, so normal requests are unaffected.
+        from litellm.llms.github_copilot.reasoning_carrier import strip_carrier_thinking_blocks
+
+        completion_kwargs = {**_shared_kwargs, "messages": strip_carrier_thinking_blocks(messages)}
         return LiteLLMMessagesToCompletionTransformationHandler.anthropic_messages_handler(
-            **_shared_kwargs,
+            **completion_kwargs,
         )
 
     if custom_llm_provider is None:

@@ -222,3 +222,40 @@ def test_prefixed_but_corrupt_is_invalid_not_notourcarrier():
         res = decode_carrier({"type": "thinking", "thinking": "", "signature": sig})
         assert not isinstance(res, DecodedCarrier)
         assert not isinstance(res, NotOurCarrier)
+
+
+# ---- cross-model: strip our carrier before a non-Responses (Claude) backend ----
+
+from litellm.llms.github_copilot.reasoning_carrier import strip_carrier_thinking_blocks  # noqa: E402
+
+
+def test_strip_removes_our_carrier_keeps_other_blocks():
+    env = ReasoningReplayEnvelope("rs", "ENC==", ("s",), None)
+    (carrier,) = encode_carrier(env, "signature")
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [carrier, {"type": "text", "text": "answer"}]},
+    ]
+    out = strip_carrier_thinking_blocks(msgs)
+    asst = out[1]["content"]
+    assert all(b.get("type") != "thinking" for b in asst)
+    assert {"type": "text", "text": "answer"} in asst
+
+
+def test_strip_leaves_real_claude_thinking_untouched_zero_copy():
+    msgs = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "real", "signature": "EqoBrealclaudesig=="},
+                {"type": "text", "text": "a"},
+            ],
+        },
+    ]
+    out = strip_carrier_thinking_blocks(msgs)
+    assert out is msgs  # zero-copy fast path: no ghc-rsn carrier -> same object
+
+
+def test_strip_no_thinking_is_zero_copy():
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "plain"}]
+    assert strip_carrier_thinking_blocks(msgs) is msgs
