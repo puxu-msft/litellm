@@ -541,3 +541,9 @@ git commit -m "test(github_copilot): property-based carrier decode safety (never
 - **§4.4 可见 summary: 已交付**（`7ea19e28e2`）。`resolve_reasoning_config` 现已 live: `_build_responses_kwargs` 从 `model_info.github_copilot_reasoning.summary` 解析（默认 `auto` → 可见推理），threads 进 `translate_thinking_to_reasoning(reasoning_summary=...)`。8 个 litellm 契约单测不受影响（它们 `reasoning_summary=None` → 纯 litellm）。kill switch `GHC_REASONING_DISABLE`。此前「summary 降级为不强制」的偏离**已解除**。
 - **仍未接线: carrier A/B 的 per-deployment 选择**。`resolve_reasoning_config` 会校验 `carrier` 字段，但**没有任何代码读 `cfg.carrier`**——streaming 恒发 A（signature）。配置 `carrier="redacted_thinking"` 目前**被静默忽略**。要真正支持 B，需: ①实现 B 流式序列（spec §4.2 两独立块），②把 `cfg.carrier` plumb 进 stream wrapper。属独立后续。
 - §4.3（非载体 thinking → output_text 而非丢弃）偏离仍成立（不回退 litellm 契约 + 跨模型安全由 handler strip 单独保证）。
+
+### 更新（2026-07-14，A/B carrier 接线完成 → 功能完整）
+
+- **carrier A/B config 已全接线**（`56d650144b`）: `model_info.github_copilot_reasoning.carrier` → stream wrapper。A（signature，默认）发 signature_delta；B（redacted_thinking）发两个独立块（summary thinking + 独立 redacted 载体块，spec §4.2）。请求侧 decode 已同时支持两者。
+- **至此用户全部显式诉求达成**: 全保真跨轮连续性、A+B 可配置切换、可见 reasoning（summary 默认 auto）、跨模型安全、kill switch。
+- **仅剩**: 非流式响应侧发载体（Claude Code 恒流式，罕见）；线上重启复验；spec §4.3 偏离记录（非载体 thinking→output_text）。核心与配置全通、271 测试绿。
