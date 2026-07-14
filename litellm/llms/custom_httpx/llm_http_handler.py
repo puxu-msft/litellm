@@ -1959,7 +1959,7 @@ class BaseLLMHTTPHandler:
         )
 
         if client is None or not isinstance(client, AsyncHTTPHandler):
-            async_httpx_client = get_async_httpx_client(llm_provider=litellm.LlmProviders.ANTHROPIC)
+            async_httpx_client = get_async_httpx_client(llm_provider=litellm.LlmProviders(custom_llm_provider))
         else:
             async_httpx_client = client
 

@@ -5,6 +5,7 @@ import httpx
 
 import litellm
 from litellm._logging import verbose_proxy_logger
+from litellm.litellm_core_utils.asyncio_deadline import DeadlineBoundAsyncIterator
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
@@ -34,6 +35,7 @@ class PassThroughStreamingHandler:
         start_time: datetime,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
         url_route: str,
+        _http_client_deadline: Optional[float] = None,
     ):
         raw_bytes: List[bytes] = []
         logging_scheduled = False
@@ -42,6 +44,15 @@ class PassThroughStreamingHandler:
             url_route=url_route,
             endpoint_type=endpoint_type,
             litellm_logging_obj=litellm_logging_obj,
+        )
+
+        # One deadline-bound iterator, reused at both aiter_bytes() call sites below, so a
+        # mid-stream http_client total_timeout expiry raises DeadlineExceeded and closes the
+        # response (phase 2 for the anthropic-messages passthrough streaming path).
+        byte_iterator = (
+            DeadlineBoundAsyncIterator(response.aiter_bytes(), _http_client_deadline, on_timeout_close=response.aclose)
+            if _http_client_deadline is not None
+            else response.aiter_bytes()
         )
 
         # Resolve once per stream rather than re-reading the global +
@@ -56,7 +67,7 @@ class PassThroughStreamingHandler:
         try:
             if not cost_injection_active:
                 # Hot path: just buffer for end-of-stream logging and forward.
-                async for chunk in response.aiter_bytes():
+                async for chunk in byte_iterator:
                     raw_bytes.append(chunk)
                     yield chunk
             else:
@@ -65,7 +76,7 @@ class PassThroughStreamingHandler:
                 # -> ``str`` for the per-chunk call site.
                 assert model_name is not None
                 resolved_model_name: str = model_name
-                async for chunk in response.aiter_bytes():
+                async for chunk in byte_iterator:
                     raw_bytes.append(chunk)
                     if endpoint_type == EndpointType.VERTEX_AI:
                         if "streamRawPredict" in url_route or "rawPredict" in url_route:

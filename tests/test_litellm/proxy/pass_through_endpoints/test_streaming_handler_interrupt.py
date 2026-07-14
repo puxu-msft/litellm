@@ -256,3 +256,39 @@ def test_convert_raw_bytes_survives_truncated_multibyte_sequence():
     lines = PassThroughStreamingHandler._convert_raw_bytes_to_str_lines(raw_bytes)
 
     assert any('"type": "message_delta"' in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_raises_deadline_exceeded_when_deadline_passed():
+    from litellm.litellm_core_utils.asyncio_deadline import DeadlineExceeded
+
+    async def _slow_chunks():
+        yield b"chunk-1"
+        await asyncio.sleep(10)
+        yield b"never"  # pragma: no cover
+
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = 200
+    response.aiter_bytes = _slow_chunks
+    response.aclose = AsyncMock()
+
+    mock_logging_obj = MagicMock()
+    mock_passthrough_handler = MagicMock()
+
+    with patch.object(PassThroughStreamingHandler, "_route_streaming_logging_to_handler", new=AsyncMock()):
+        received = []
+        with pytest.raises(DeadlineExceeded):
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={"model": "claude-3-haiku"},
+                litellm_logging_obj=mock_logging_obj,
+                endpoint_type=EndpointType.GENERIC,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=mock_passthrough_handler,
+                url_route="/anthropic/v1/messages",
+                _http_client_deadline=asyncio.get_event_loop().time() + 0.05,
+            ):
+                received.append(chunk)
+                await asyncio.sleep(0)
+        assert received == [b"chunk-1"]
+        response.aclose.assert_awaited_once()

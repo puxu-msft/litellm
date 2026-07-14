@@ -74,6 +74,7 @@ class BaseAnthropicMessagesStreamingIterator:
             start_time=self.start_time,
             passthrough_success_handler_obj=GLOBAL_PASS_THROUGH_SUCCESS_HANDLER_OBJ,
             url_route="/v1/messages",
+            _http_client_deadline=getattr(litellm_logging_obj, "http_client_deadline", None),
         )
 
     def _convert_chunk_to_sse_format(self, chunk: Union[dict, Any]) -> bytes:

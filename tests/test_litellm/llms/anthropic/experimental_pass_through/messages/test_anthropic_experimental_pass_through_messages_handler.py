@@ -1058,3 +1058,26 @@ async def test_async_anthropic_messages_handler_merges_global_http_client_with_d
     resolved = captured_kwargs[0]["timeout"]
     assert resolved.connect == 2.0  # deployment overrides global
     assert resolved.pool == 12.0  # falls back to global
+
+
+def test_get_async_streaming_response_iterator_passes_http_client_deadline():
+    from unittest.mock import MagicMock, patch
+
+    from litellm.llms.anthropic.experimental_pass_through.messages.streaming_iterator import (
+        BaseAnthropicMessagesStreamingIterator,
+    )
+
+    logging_obj = MagicMock()
+    logging_obj.http_client_deadline = 12345.0
+    instance = BaseAnthropicMessagesStreamingIterator(litellm_logging_obj=logging_obj, request_body={})
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.PassThroughStreamingHandler.chunk_processor"
+    ) as mock_chunk_processor:
+        instance.get_async_streaming_response_iterator(
+            httpx_response=MagicMock(),
+            request_body={},
+            litellm_logging_obj=logging_obj,
+        )
+
+    assert mock_chunk_processor.call_args.kwargs.get("_http_client_deadline") == 12345.0

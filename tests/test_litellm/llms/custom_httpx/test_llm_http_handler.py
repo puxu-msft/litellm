@@ -1381,3 +1381,40 @@ def test_handle_error_reraises_deadline_exceeded_without_wrapping():
         handler._handle_error(e=original, provider_config=MagicMock())
 
     assert exc_info.value is original
+
+
+@pytest.mark.asyncio
+async def test_async_anthropic_messages_handler_uses_actual_provider_for_client_cache_key():
+    from unittest.mock import MagicMock, patch
+
+    import litellm
+    from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+
+    handler = BaseLLMHTTPHandler()
+    captured_providers = []
+
+    def _fake_get_async_httpx_client(llm_provider, **kwargs):
+        captured_providers.append(llm_provider)
+        mock_client = MagicMock()
+        mock_client.post = MagicMock()
+        return mock_client
+
+    with patch(
+        "litellm.llms.custom_httpx.llm_http_handler.get_async_httpx_client",
+        side_effect=_fake_get_async_httpx_client,
+    ):
+        try:
+            await handler.async_anthropic_messages_handler(
+                model="claude-3-haiku",
+                messages=[{"role": "user", "content": "hi"}],
+                anthropic_messages_provider_config=MagicMock(),
+                anthropic_messages_optional_request_params={},
+                custom_llm_provider="github_copilot",
+                litellm_params=MagicMock(http_client=None, timeout=None),
+                logging_obj=MagicMock(http_client_deadline=None),
+            )
+        except Exception:
+            pass  # request construction downstream of client selection is out of scope here
+
+    assert len(captured_providers) >= 1
+    assert captured_providers[0] == litellm.LlmProviders.GITHUB_COPILOT
