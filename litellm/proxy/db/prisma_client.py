@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Union
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.secret_managers.main import str_to_bool
 
 
@@ -97,9 +98,16 @@ class PrismaWrapper:
         iam_endpoint: IAMEndpoint | None = None,
         recreate_uses_datasource: bool = False,
         log_prefix: str = "",
+        is_shutting_down: Callable[[], bool] | None = None,
     ):
         self._original_prisma = original_prisma
         self.iam_token_db_auth = iam_token_db_auth
+        # Injected so the IAM token-refresh recreate path (a second engine
+        # recreate route independent of PrismaClient.attempt_db_reconnect) can
+        # be suppressed during shutdown. Defaults to the process-wide manager.
+        self._is_shutting_down: Callable[[], bool] = (
+            is_shutting_down if is_shutting_down is not None else GracefulShutdownManager.is_shutting_down
+        )
 
         # Per-connection knobs so the same wrapper can be used for the writer
         # (defaults: DATABASE_URL env, IAM endpoint from DATABASE_HOST/etc.,
@@ -382,6 +390,13 @@ class PrismaWrapper:
             )
             return False
 
+        if self._is_shutting_down():
+            verbose_proxy_logger.info(
+                "%sSkipping Prisma engine recreate; shutdown in progress.",
+                self._log_prefix,
+            )
+            return False
+
         old_engine_pid = self._get_engine_pid()
         if old_engine_pid > 0:
             # Record BEFORE the kill so the engine-death watcher, which may
@@ -480,6 +495,18 @@ class PrismaWrapper:
                     )
                     await asyncio.sleep(sleep_seconds)
 
+                if self._is_shutting_down():
+                    # break, NOT continue: when sleep_seconds <= 0 there is no
+                    # await above, so continue would spin a tight busy loop that
+                    # also starves the cancellation stop_token_refresh_task
+                    # relies on. A finished loop task is still safely
+                    # cancelled/awaited by stop_token_refresh_task.
+                    verbose_proxy_logger.info(
+                        "%sExiting RDS IAM token refresh loop; shutdown in progress.",
+                        self._log_prefix,
+                    )
+                    break
+
                 # Refresh the token
                 verbose_proxy_logger.info("%sProactively refreshing RDS IAM token...", self._log_prefix)
                 await self._safe_refresh_token()
@@ -506,6 +533,12 @@ class PrismaWrapper:
         preventing multiple concurrent reconnection attempts.
         """
         async with self._reconnection_lock:
+            if self._is_shutting_down():
+                verbose_proxy_logger.info(
+                    "%sSkipping RDS IAM token refresh after acquiring lock; shutdown in progress.",
+                    self._log_prefix,
+                )
+                return
             # Double-checked under the lock: another trigger (e.g. the
             # proactive loop racing a __getattr__ fallback) may have already
             # refreshed while we waited. Recreating again would needlessly kill

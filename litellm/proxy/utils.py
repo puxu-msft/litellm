@@ -2821,12 +2821,14 @@ class PrismaClient:
                 original_prisma=Prisma(http=http_client),
                 iam_token_db_auth=iam_flag,
                 log_prefix=writer_log_prefix,
+                is_shutting_down=self._is_shutting_down,
             )
         else:
             writer_wrapper = PrismaWrapper(
                 original_prisma=Prisma(),
                 iam_token_db_auth=iam_flag,
                 log_prefix=writer_log_prefix,
+                is_shutting_down=self._is_shutting_down,
             )
 
         # Optional read-replica routing. When DATABASE_URL_READ_REPLICA is set,
@@ -2874,6 +2876,7 @@ class PrismaClient:
                     iam_endpoint=reader_iam_endpoint,
                     recreate_uses_datasource=True,
                     log_prefix="[reader]",
+                    is_shutting_down=self._is_shutting_down,
                 )
                 self.db = RoutingPrismaWrapper(writer=writer_wrapper, reader=reader_wrapper)
                 verbose_proxy_logger.info(

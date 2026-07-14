@@ -1,15 +1,11 @@
-import json
 import os
 import signal
 import sys
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
-sys.path.insert(
-    0, os.path.abspath("../../../..")
-)  # Adds the parent directory to the system path
+sys.path.insert(0, os.path.abspath("../../../.."))  # Adds the parent directory to the system path
 
 
 from litellm.proxy.db.prisma_client import PrismaWrapper, should_update_prisma_schema
@@ -158,3 +154,58 @@ async def test_recreate_prisma_client_handles_missing_engine_pid(
 
     mock_kill.assert_not_called()  # PID was 0, kill skipped
     mock_new_prisma.connect.assert_awaited_once()
+
+
+# ── IAM token refresh shutdown guards (Task 5) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_loop_breaks_when_shutting_down_after_sleep():
+    """Guard #1: loop wakes, sees shutdown, and BREAKS (not continue) — a
+    continue with sleep_seconds<=0 would busy-spin. Wrapped in wait_for so a
+    regression to `continue` fails as a timeout instead of hanging the suite."""
+    import asyncio
+
+    wrapper = PrismaWrapper(original_prisma=MagicMock(), iam_token_db_auth=True, is_shutting_down=lambda: True)
+    wrapper._calculate_seconds_until_refresh = MagicMock(return_value=0)
+    wrapper._safe_refresh_token = AsyncMock()
+    await asyncio.wait_for(wrapper._token_refresh_loop(), timeout=2.0)
+    wrapper._safe_refresh_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_safe_refresh_token_skips_recreate_when_shutting_down_after_lock():
+    """Guard #2: shutdown that started while waiting for _reconnection_lock
+    aborts the refresh before it touches the token/engine."""
+    wrapper = PrismaWrapper(original_prisma=MagicMock(), iam_token_db_auth=True, is_shutting_down=lambda: True)
+    wrapper._token_refresh_not_needed = MagicMock()
+    wrapper.get_rds_iam_token = MagicMock()
+    await wrapper._safe_refresh_token()
+    wrapper._token_refresh_not_needed.assert_not_called()
+    wrapper.get_rds_iam_token.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recreate_prisma_client_locked_skips_kill_when_shutting_down():
+    """Guard #3: after the optimistic-generation check, before killing/spawning
+    the engine — also defends the watchdog's own reconnect path, which reaches
+    this same method."""
+    wrapper = PrismaWrapper(original_prisma=MagicMock(), iam_token_db_auth=True, is_shutting_down=lambda: True)
+    wrapper._get_engine_pid = MagicMock()
+    result = await wrapper._recreate_prisma_client_locked("postgresql://new")
+    assert result is False
+    wrapper._get_engine_pid.assert_not_called()
+
+
+def test_prisma_wrapper_defaults_is_shutting_down_to_manager():
+    """No injection -> the process-wide GracefulShutdownManager backs the guard."""
+    from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
+
+    GracefulShutdownManager.reset()
+    wrapper = PrismaWrapper(original_prisma=MagicMock(), iam_token_db_auth=False)
+    try:
+        assert wrapper._is_shutting_down() is False
+        GracefulShutdownManager.start_shutdown()
+        assert wrapper._is_shutting_down() is True
+    finally:
+        GracefulShutdownManager.reset()
