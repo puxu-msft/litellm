@@ -2902,6 +2902,11 @@ class PrismaClient:
             self.db = writer_wrapper  # Client to connect to Prisma db
         self._db_reconnect_lock = asyncio.Lock()
         self._db_health_watchdog_task: Optional[asyncio.Task] = None
+        # Strong reference to the in-flight engine-death reconnect task. asyncio
+        # only holds a weak reference to a bare create_task(), so without this a
+        # fire-and-forget reconnect can be garbage-collected mid-flight and
+        # silently dropped; keeping it here also lets shutdown cancel it.
+        self._engine_reconnect_task: Optional[asyncio.Task] = None
         self._db_last_reconnect_attempt_ts: float = 0.0
         self._db_reconnect_cooldown_seconds: int = max(1, int(os.getenv("PRISMA_RECONNECT_COOLDOWN_SECONDS", "15")))
         self._db_health_watchdog_interval_seconds: int = max(
@@ -4300,7 +4305,19 @@ class PrismaClient:
         self._engine_confirmed_dead = True
         self._reap_all_zombies()
         self._cleanup_engine_watcher()
-        asyncio.create_task(self._reconnect_after_engine_death(dead_pid, source, term_signal))
+        task = asyncio.create_task(self._reconnect_after_engine_death(dead_pid, source, term_signal))
+        self._engine_reconnect_task = task
+        task.add_done_callback(self._discard_engine_reconnect_task)
+
+    def _discard_engine_reconnect_task(self, task: "asyncio.Task[None]") -> None:
+        """Drop the finished reconnect task's reference.
+
+        Held strongly (in ``_engine_reconnect_task``) only while it runs so the
+        loop can't GC a fire-and-forget task mid-flight; clear it once done so a
+        completed task isn't kept alive or mistakenly cancelled later.
+        """
+        if self._engine_reconnect_task is task:
+            self._engine_reconnect_task = None
 
     async def _reconnect_after_engine_death(
         self, dead_pid: int, source: str, term_signal: Optional[int] = None
@@ -4761,6 +4778,14 @@ class PrismaClient:
     async def stop_db_health_watchdog_task(self) -> None:
         """Stop DB health watchdog task and engine watcher gracefully."""
         self._stop_engine_watcher()
+        reconnect_task = self._engine_reconnect_task
+        if reconnect_task is not None:
+            reconnect_task.cancel()
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._engine_reconnect_task = None
         if self._db_health_watchdog_task is None:
             return
         self._db_health_watchdog_task.cancel()

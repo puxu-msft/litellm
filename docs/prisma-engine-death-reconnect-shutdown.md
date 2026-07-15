@@ -20,17 +20,22 @@ Suppression rule in `_reconnect_after_engine_death`:
 
 This kills the exact symptom in the reported log (the `waitpid thread` detector under Ctrl+C).
 
-## Still open (deferred; coordinate with Phase 1a/1b)
+## Out of scope
 
-- Health-watchdog resurrection path. `_db_health_watchdog_loop` calls `attempt_db_reconnect` on probe failure. On uvicorn this is now blocked from doing damage: `DrainingServer` sets the shutdown flag at signal time and `_attempt_reconnect_inside_lock` re-checks it after taking the lock, so a shutdown probe failure no longer recreates the engine. Still open: unify the watchdog's own lifecycle (stop it promptly on shutdown rather than after drain) and confirm the same holds for runners without an early-GSM signal.
-- Reconnect task lifecycle. The engine-death reconnect is a bare `asyncio.create_task` with no stored reference (can be GC'd mid-flight) and is not cancelled by `stop_db_health_watchdog_task`. Track it and cancel on stop.
-- Non-uvicorn runners. Granian (`Granian(**kwargs).serve()`) has no early-GSM wiring, so its pidfd / os.kill-poll detectors (which cannot read an exit status) still race a process-group signal there. The waitpid detector's SIGINT gate already covers the common path on any runner.
-- Integration coverage at the real-uvicorn level (spawn uvicorn + child + process-group SIGINT, assert no reconnect / no `triggering reconnect` log / no new engine PID). The current regression test spawns a real child and sends SIGINT to exercise the real `os.waitpid` -> `WTERMSIG` path, but does not stand up uvicorn.
+- Non-uvicorn runners (out of scope for this fork). Granian (`Granian(**kwargs).serve()`) has no early-GSM wiring, so its pidfd / os.kill-poll fallback detectors (which cannot read an exit status) still race a process-group signal there. This fork runs uvicorn standalone (`litellm --config ...`), so Granian is not used; the waitpid detector's SIGINT gate already covers the common path on any runner. If Granian is ever adopted, mirror `DrainingServer`'s `handle_exit` hook for it. Left unfixed deliberately (YAGNI here).
 
-## Already landed by the shutdown fleet
+## Already landed
 
-- TOCTOU. `_attempt_reconnect_inside_lock` now re-checks `_is_shutting_down()` after acquiring `_db_reconnect_lock`, covering every reconnect caller (death path, health watchdog, request-driven) at the destructive point.
+By this fix:
+
+- Reconnect task lifecycle. The engine-death reconnect is now stored on `_engine_reconnect_task` while it runs (asyncio only weakly references a bare `create_task`, so it could otherwise be GC'd mid-flight) and is cancelled/awaited by `stop_db_health_watchdog_task`.
+
+By the shutdown fleet:
+
+- TOCTOU. `_attempt_reconnect_inside_lock` re-checks `_is_shutting_down()` after acquiring `_db_reconnect_lock`, covering every reconnect caller (death path, health watchdog, request-driven) at the destructive point.
+- Health-watchdog lifecycle. The lifespan now stops the watchdog right after drain (before tearing down shared deps), and the lock gate above blocks a shutdown probe failure from recreating the engine.
 - Early-shutdown signal on uvicorn. `DrainingServer` overrides `handle_exit` to call `GracefulShutdownManager.start_shutdown()` synchronously at signal-delivery time; `litellm/proxy/shutdown/uvicorn_runner.py` + `proxy_cli` wire it into the serve path. So on uvicorn the shutdown flag is set before the death callback runs, making the flag-based gate effective for the pidfd/poll detectors and SIGTERM too.
+- Real-uvicorn E2E. `tests/e2e/shutdown/test_graceful_shutdown_e2e.py` stands up the proxy, sends SIGINT/SIGTERM to a real process with an in-flight request, and asserts it quiesces and exits promptly without emitting reconnect/DB/redis-spam lines.
 
 ## Dependency
 

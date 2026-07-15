@@ -1080,3 +1080,67 @@ async def test_real_child_killed_by_sigint_is_not_reconnected(
         "classified_as_sigint": True,
         "no_reconnect_log": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Engine-death reconnect task lifecycle.
+#
+# asyncio only holds a weak reference to a bare create_task(), so a
+# fire-and-forget reconnect could be garbage-collected mid-flight and silently
+# dropped, leaving the DB down. The task is kept on the client while it runs and
+# cancelled on shutdown.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_engine_death_reconnect_task_is_tracked_then_cleared(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client.attempt_db_reconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777, None)  # crash -> real reconnect
+    task = prisma_client._engine_reconnect_task
+    tracked_while_pending = task is not None
+
+    await task  # let the reconnect run to completion
+    await asyncio.sleep(0)  # let the done-callback fire
+
+    assert tracked_while_pending is True
+    assert prisma_client.attempt_db_reconnect.await_count == 1
+    assert prisma_client._engine_reconnect_task is None
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_pending_engine_reconnect_task(
+    prisma_client: PrismaClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prisma_client._engine_pid = 7777
+    prisma_client._engine_confirmed_dead = False
+    prisma_client._is_shutting_down = lambda: False
+    prisma_client._db_health_watchdog_task = None
+
+    never = asyncio.Event()
+
+    async def _hang(*_args: Any, **_kwargs: Any) -> bool:
+        await never.wait()
+        return True
+
+    prisma_client.attempt_db_reconnect = _hang
+    monkeypatch.setattr(PrismaClient, "_reap_all_zombies", staticmethod(lambda: set()))
+    monkeypatch.setattr(prisma_client, "_cleanup_engine_watcher", MagicMock())
+
+    prisma_client._on_engine_death_from_thread(7777, None)
+    await asyncio.sleep(0)  # let the task start and block on the reconnect
+    task = prisma_client._engine_reconnect_task
+    pending_before_stop = task is not None and not task.done()
+
+    await prisma_client.stop_db_health_watchdog_task()
+
+    assert pending_before_stop is True
+    assert task.cancelled()
+    assert prisma_client._engine_reconnect_task is None
