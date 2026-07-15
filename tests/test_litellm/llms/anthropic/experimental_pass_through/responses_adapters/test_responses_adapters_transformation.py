@@ -170,6 +170,53 @@ class TestOutputConfigStructuredOutput:
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["text"]["format"]["schema"] == self._SCHEMA
 
+    def test_non_strict_schema_is_made_strict_compliant(self):
+        """A client schema that omits ``additionalProperties: false`` (or leaves
+        properties optional) is rewritten to satisfy Responses API strict mode.
+
+        Regression: previously the raw schema was forwarded verbatim with
+        ``strict: True``, so copilot's /responses rejected it with
+        ``invalid_request_body`` -- "'additionalProperties' is required to be
+        supplied and to be false". strict mode also requires every property to be
+        listed in ``required``.
+        """
+        loose = {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name"],
+        }
+        req = _make_request(output_format={"type": "json_schema", "schema": loose})
+        kwargs = _ADAPTER.translate_request(req)
+        schema = kwargs["text"]["format"]["schema"]
+        assert schema["additionalProperties"] is False
+        assert set(schema["required"]) == {"name", "age"}
+        # the caller's schema object must not be mutated in place
+        assert "additionalProperties" not in loose
+
+    def test_nested_object_schema_made_strict_recursively(self):
+        """Nested object schemas also need ``additionalProperties: false``."""
+        nested = {
+            "type": "object",
+            "properties": {
+                "user": {"type": "object", "properties": {"id": {"type": "string"}}}
+            },
+        }
+        req = _make_request(output_format={"type": "json_schema", "schema": nested})
+        kwargs = _ADAPTER.translate_request(req)
+        schema = kwargs["text"]["format"]["schema"]
+        assert schema["additionalProperties"] is False
+        assert schema["properties"]["user"]["additionalProperties"] is False
+        assert set(schema["properties"]["user"]["required"]) == {"id"}
+
+    def test_already_strict_schema_unchanged(self):
+        """An already strict-compliant schema is preserved as-is (idempotent)."""
+        req = _make_request(
+            output_format={"type": "json_schema", "schema": self._SCHEMA}
+        )
+        kwargs = _ADAPTER.translate_request(req)
+        assert kwargs["text"]["format"]["schema"] == self._SCHEMA
+
+
 
 # ---------------------------------------------------------------------------
 # translate_messages_to_responses_input

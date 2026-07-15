@@ -5,8 +5,11 @@ This module owns all format conversions for the direct v1/messages -> Responses 
 path used for OpenAI and Azure models.
 """
 
+import copy
 import json
 from typing import Any, Dict, List, Literal, Optional, Union, cast
+
+from pydantic import TypeAdapter
 
 from litellm.litellm_core_utils.reasoning_effort_utils import (
     reasoning_effort_from_thinking_budget,
@@ -36,6 +39,31 @@ def _poc_reasoning_enabled() -> bool:
     from litellm.llms.github_copilot.reasoning_config import reasoning_bridge_enabled
 
     return reasoning_bridge_enabled()
+
+
+# Validates a client-supplied structured-output schema into a concretely typed
+# mapping (or raises) so the strict-schema rewrite below runs on typed data rather
+# than the request's untyped ``Any`` blob.
+_STRUCTURED_OUTPUT_SCHEMA_ADAPTER: TypeAdapter[Dict[str, object]] = TypeAdapter(Dict[str, object])
+
+
+def _to_strict_response_schema(schema: Dict[str, object]) -> Dict[str, object]:
+    """Rewrite a client JSON schema to satisfy Responses API strict mode.
+
+    copilot's /responses (and OpenAI) reject a strict ``json_schema`` unless every
+    object sets ``additionalProperties: false`` and lists all of its properties in
+    ``required``; otherwise the request fails with ``invalid_request_body``
+    ("'additionalProperties' is required to be supplied and to be false"). We
+    delegate to the openai SDK's own strict-schema enforcer -- the same
+    ``openai.lib._pydantic`` module litellm already uses for pydantic response
+    formats (see ``base_llm/base_utils.py``) -- instead of re-deriving the rules.
+    Operates on a deep copy so the caller's schema object is never mutated.
+    """
+    from openai.lib._pydantic import _ensure_strict_json_schema  # pyright: ignore[reportPrivateUsage]
+
+    schema_copy = copy.deepcopy(schema)
+    strict: Dict[str, object] = _ensure_strict_json_schema(schema_copy, path=(), root=schema_copy)
+    return strict
 
 
 def _poc_reasoning_input_item(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -446,13 +474,14 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
         if not isinstance(output_format, dict) and isinstance(output_config, dict):
             output_format = output_config.get("format")  # type: ignore[assignment]
         if isinstance(output_format, dict) and output_format.get("type") == "json_schema":
-            schema = output_format.get("schema")
-            if schema:
+            raw_schema = output_format.get("schema")
+            if isinstance(raw_schema, dict) and raw_schema:
+                schema = _STRUCTURED_OUTPUT_SCHEMA_ADAPTER.validate_python(raw_schema)
                 responses_kwargs["text"] = {
                     "format": {
                         "type": "json_schema",
                         "name": "structured_output",
-                        "schema": schema,
+                        "schema": _to_strict_response_schema(schema),
                         "strict": True,
                     }
                 }
