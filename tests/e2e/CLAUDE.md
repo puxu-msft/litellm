@@ -17,6 +17,7 @@ Each subdirectory under `tests/e2e/` is one suite, scoped to an endpoint family 
 - `security/` - secret handling and log-leak protection
 - `shutdown/` - process-level graceful shutdown: spawns its own proxy subprocess and sends real SIGINT/SIGTERM (own `spawned_proxy_e2e` marker, not the live-proxy `e2e` marker)
 - `router/` - routing and reliability behavior (rate limits, fallbacks, cooldowns)
+- `github_copilot_reasoning/` - GHC API gpt reasoning<->thinking carrier bridge; on-demand only (own `billed`/`anthropic_sdk`/`claude_cli` markers, not the shared `e2e` marker): real anthropic SDK round-trips, billed copilot differential/continuity, and real claude CLI R1 storage
 - `gateway/` - proxy configuration only (`litellm-config.yml`); no tests
 
 ## Lay the pattern down in a class
