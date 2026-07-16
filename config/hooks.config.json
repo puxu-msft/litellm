@@ -11,12 +11,12 @@
     "toolref_file": "/tmp/litellm-toolref.jsonl"
   },
   "deployment_probe": {
-    "enabled": false,
+    "enabled": true,
     "orphan_only": true,
-    "file": "/tmp/x",
+    "file": "/home/xp/.config/litellm/probe-logs/deployment-orphans.jsonl",
     "dump_all": false,
-    "dump_file": "/tmp/x",
-    "model_contains": "",
+    "dump_file": "/home/xp/.config/litellm/probe-logs/deployment.jsonl",
+    "model_contains": "claude",
     "fix_orphans": false
   },
   "failure_probe": {
@@ -136,7 +136,7 @@
     "timing_file": "/home/xp/.config/litellm/probe-logs/request-timing.jsonl"
   },
   "orphan_tool_result": {
-    "strategy": "drop",
+    "strategy": "text",
     "model_contains": ""
   }
 }

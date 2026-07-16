@@ -72,7 +72,7 @@ OpenAI chat/completions,copilot 再转回 Anthropic——**一次请求两次格
 
 | hook | 时机 | 修复 |
 |---|---|---|
-| `process` | 转换前 | strip cache_control.scope、fix tool_choice、注入工具、请求侧孤儿 tool_result 补全、thinking block 修复(见下) |
+| `process` | 转换前 | strip cache_control.scope、fix tool_choice、注入工具、孤儿 tool_use 补 tool_result(`fix_orphan_tool_use`)、孤儿 tool_result 处理(`orphan_tool_result`,见下)、thinking block 修复(见下) |
 | `process_deployment` | 转换后/发出前 | 转换后 OpenAI 载荷的孤儿 tool_call 观测/修复(盲区) |
 | `observe_failure`/`observe_success` | 失败/成功 | 只观测(孤儿检测、抓失败载荷) |
 | `stream_transform` | 流式响应 | 见下"流式修复" |
@@ -105,9 +105,29 @@ OpenAI chat/completions,copilot 再转回 Anthropic——**一次请求两次格
 
 优先级:`strip_all` > `empty_signature` > `insert_text`。
 
+### 孤儿 tool_result 处理(`orphan_tool_result`,请求侧)
+
+与 `fix_orphan_tool_use`(孤儿 tool_use → 补合成 tool_result)**方向相反**:一个 tool_result 若其
+`tool_use_id` 在整个请求里无匹配的 tool_use,翻译成 Responses API 后即 function_call_output 无配对
+function_call,copilot `/responses` 报 `invalid_request_body`:"No tool call found for function call
+output with call_id ..."。
+
+修复放在 `process`(转换前,Anthropic messages)。关键:`anthropic_messages→responses` 走异步
+`aresponses`,**不应用 `process_deployment`(async_pre_call_deployment_hook)**(只有 sync responses
+路径应用),而 `process` 对 `data["messages"]` 的改写**会**传播到 responses 翻译(已 live 实证)。所以
+这类孤儿只能在 `process` 修,`process_deployment` 够不到。
+
+三态策略(`orphan_tool_result.strategy`,热读可即时切换):
+
+1. **passthrough**(默认)— 不动,留给上游拒(维持原行为)。
+2. **drop** — 删掉孤儿 tool_result 块;若该消息删空则整条丢弃。
+3. **text** — 把孤儿 tool_result 转成带 tag 的代码块 text 块(```` ```tool_result call_id=<id>\n<内容>\n``` ````),保留输出内容而不破坏请求。
+
+可选 `model_contains` 过滤(留空=所有模型)。只影响孤儿,配对的 tool_result 永不受影响。
+
 ## 配置(hooks.config.json)
 
-顶层键:`fix_tool_choice`、`inject_tools`、`fix_thinking`、`probe`、`deployment_probe`、
+顶层键:`fix_tool_choice`、`inject_tools`、`fix_thinking`、`orphan_tool_result`、`probe`、`deployment_probe`、
 `failure_probe`、`success_probe`、`stream_fix`。各修复/探针独立开关,默认多为关。改动即时热读生效。
 
 `stream_fix` 关键项:

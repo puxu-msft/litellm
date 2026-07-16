@@ -37,3 +37,12 @@ per-provider 上游 connect/read/pool 分轴超时 + total(asyncio 绝对 deadli
 ## 关联加固(已随会话完成)
 
 - proxy 加载期:`stream_keepalive` fail-fast 校验 + 缺上游超时 advisory(`should_advise_missing_upstream_timeout`);`http_client` 全局校验(见上)
+
+## gpt→responses invalid_request_body 排查与修复(2026-07-15..17,已随会话完成)
+
+起因:`gpt`(→`github_copilot/gpt-5.6-sol`,mode=responses)经 `/v1/messages` 返回 `{"error":{"message":"","code":"invalid_request_body"}}`(空 message)。
+
+- **空 message 本体**:主动派真实 agent 流量 + 累计约 200 分钟捕获,始终未复现;失败发生在实例启动后 29 秒 → 判定 copilot 网关**启动期瞬态**,非转换层缺陷。持久失败捕获仍武装(`~/.config/litellm` 的 failure_probe + hookpkg `observe_failure` 全量 dump `request_full`),真复现自动落 `probe-logs/failures.jsonl` 供离线重放。详见 memory `ghc-responses-invalid-request-body`。
+- **Bug 1 结构化输出(litellm core,已修 `2d94670276`)**:`responses_adapters/transformation.py` 的 `text.format` json_schema 设 `strict:True` 却原样透传客户端 schema,漏 `additionalProperties:false`+全 required → copilot 拒。改用 openai SDK 的 `_ensure_strict_json_schema`(litellm 已依赖同模块)。TDD 回归 + live 验证(loose→400、strict→200)。用户重启后已生效。
+- **Bug 3 孤儿 tool_result(hookpkg,已修 `538b5678d1`)**:tool_result 无匹配 tool_use → function_call_output 无 function_call → copilot 拒 "No tool call found ..."。三态可配置(`orphan_tool_result.strategy`:passthrough/drop/text,默认 passthrough 空转),见 `config/README.md`。**关键**:anthropic_messages→responses 走异步 aresponses **不应用 deployment hook**,只能在 `process`(async_pre_call_hook)改 Anthropic messages(实测传播);另修 hookpkg RELOAD_ORDER 漏 `orphans` 的静默陷阱。详见 memory `ghc-hook-mutation-propagation-map`。三态 live 验证 + 169 hookpkg 测试全绿。
+- **待用户决定**:孤儿机制线上默认留 `passthrough`(空转),启用 drop/text 由用户改 config(热读,无需重启)。
