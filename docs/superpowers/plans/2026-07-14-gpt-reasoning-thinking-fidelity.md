@@ -23,14 +23,14 @@
 
 ## 阶段总览与门禁
 
-- **Phase 1 — 载体 codec（纯模块，TDD，无 live 依赖）**: 基础，先做、风险最低、PoC 也要用。
-- **Phase 2 — 可行性 PoC（门禁，人机协同）**: 最小响应侧发射 + 真实 Claude Code gpt 会话验证 oracle 表。**GATE**: 不过则回到载体/编码选择，不进 Phase 3+。
-- **Phase 3 — 响应侧完整（非流式 + 流式）+ 配置 plumbing**
-- **Phase 4 — 请求侧（decode → reasoning item 还原 / NotOurCarrier 丢弃 / 跨模型剥离）**
-- **Phase 5 — reasoning_summary 请求 + 配置 resolver 收尾**
-- **Phase 6 — 跨模型矩阵 + 集成/e2e 测试收口**
+> **状态: 全部完成并线上验证（2026-07-15）。** 当前实现活文档: `docs/github_copilot_reasoning_bridge.md`。Phase 2 门禁 PASSED（R1 证实: gpt-souls 子代理 transcript 146 个载体逐字节存活）。生产化: 临时 `GHC_REASONING_POC` flag 已换成默认开 + kill switch `GHC_REASONING_DISABLE`，并按 provider 收窄到 github_copilot。非流式发载体 + 全链路往返回归 + 三组按需 e2e（anthropic SDK / billed / claude CLI）均已落地。与 spec 的两处偏离见活文档 §7。
 
-> **Phase 3-6 的 step 级 TDD 代码在 Phase 2 门禁通过后、进入该 phase 时再补齐**（spike-first）。原因: 它们押在「Claude Code 原样回放载体」这一未证事实（spec R1）与流式 SSE 的确切 litellm 内部类型上；PoC 未过就写死数百行 step 代码，正是 PoC 要防的「plan the wrong thing」。本计划为这些 phase 冻结**文件、接口签名、交付物、测试意图**（planner 合同），足以在门禁后无歧义展开。Phase 1/2 为完整 step 级。
+- **Phase 1 — 载体 codec**: ✅ 完成（严格 Pydantic 边界 + 严格 base64；26 测试、basedpyright 0 错、变异验证）
+- **Phase 2 — 可行性 PoC（门禁）**: ✅ **PASSED**（子代理 146 载体存活；live 差分 valid→200 / 篡改→400）
+- **Phase 3 — 响应侧完整（流式 + 非流式）+ 配置**: ✅ 完成
+- **Phase 4 — 请求侧 decode → 重建 reasoning item**: ✅ 完成（schema 校验；非载体保 output_text）
+- **Phase 5 — reasoning_summary + 配置 resolver**: ✅ 完成（provider 门控）
+- **Phase 6 — 跨模型剥离 + 集成/e2e**: ✅ 完成（60 单元/集成 + 3 组按需 e2e）
 
 ## 文件结构
 
@@ -433,7 +433,7 @@ git commit -m "test(github_copilot): property-based carrier decode safety (never
 
 > 无自动化断言可替代——需人在 Claude Code 里真实驱动 gpt。执行者按下表逐格记录，产出一份 `docs/superpowers/plans/2026-07-14-gpt-reasoning-poc-results.md`。
 
-- [ ] **Step 1: 起代理**（`~/.claude/litellm/start-ghc-api.sh` 或确认在跑）、`GHC_REASONING_POC=1`，开 `stream_fix.probe_only` 抓 wire。
+- [ ] **Step 1: 起代理**（`~/.config/litellm/start-ghc-api.sh` 或确认在跑）、`GHC_REASONING_POC=1`，开 `stream_fix.probe_only` 抓 wire。
 - [ ] **Step 2: A 载体** — 在 Claude Code 用 model=gpt 跑一轮触发推理的对话，逐格填 oracle:
 
   | # | oracle | 期望 | 实测 |

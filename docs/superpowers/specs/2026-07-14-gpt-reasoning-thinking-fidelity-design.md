@@ -1,6 +1,6 @@
 # GPT reasoning ↔ Anthropic thinking 全保真转换 · 设计/规格
 
-状态: **草案 v3（已吸收 GPT 对抗评审两轮: 轮1 的 2 blocker + 8 major + 3 minor、轮2 的 4 major + 2 minor 全部冻结），待你终审**
+状态: **已实现并线上验证**（2026-07-15）。当前实现的活文档见 `docs/github_copilot_reasoning_bridge.md`（含与本 spec 的偏离记录 §7）。两轮 GPT 对抗评审（轮1 的 2 blocker + 8 major + 3 minor、轮2 的 4 major + 2 minor）已全部吸收冻结。
 日期: 2026-07-14
 范围: Anthropic ↔ GPT 全保真格式转换的 **block 1**（reasoning↔thinking）。block 2/3/4 见 `docs/BACKLOG.md`。
 适用: 私有 fork 的 `github_copilot` provider，gpt-* 模型经 `/v1/messages` 路由到 Responses API。
@@ -11,7 +11,7 @@
 
 Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、经 copilot 走 Responses API，其推理状态是 `encrypted_content`（不透明、加密）。gpt-* 的 `/v1/messages` 请求经 `_should_route_to_responses_api` 判定后，走 **direct Responses adapter**（`LiteLLMMessagesToResponsesAPIHandler`，落在 `litellm/llms/anthropic/experimental_pass_through/responses_adapters/`），而非 chat completion bridge。
 
-2026-07-14 live 探针（原始数据 `~/.claude/litellm/probe-logs/live-probe-t1.sse`/`t2.json`；方法与结论见 `~/.claude/litellm/docs/illformed-fix.md`「thinking block 处置的 provider 差异」）+ GPT 评审代码核实确证:
+2026-07-14 live 探针（原始数据 `~/.config/litellm/probe-logs/live-probe-t1.sse`/`t2.json`；方法与结论见 `~/.config/litellm/docs/illformed-fix.md`「thinking block 处置的 provider 差异」）+ GPT 评审代码核实确证:
 
 - gpt 回来的 thinking 块是**空壳**: `{"type":"thinking","thinking":""}`，无 `signature`/无 `encrypted_content`。
 - 丢失点在 direct Responses adapter 非流式 [responses_adapters/transformation.py:410-420](litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py#L410-L420): 对每个 `ResponseReasoningItem` 只遍历 `item.summary` 输出 `thinking(signature=None)`，**完全不读 `item.id`/`item.encrypted_content`**。流式路径 [streaming_iterator.py](litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py) 在 `output_item.added` 开 thinking 块、发 summary delta、`output_item.done` 直接 stop，同样不读 `encrypted_content`。
@@ -163,7 +163,7 @@ Claude Code 只说 Anthropic Messages 协议。gpt-5.x 是 reasoning 模型、�
 ## 9. 相关
 
 - `docs/BACKLOG.md` —— block 2/3/4 延后项。
-- `~/.claude/litellm/docs/illformed-fix.md` —— live 探针方法与 provider 差异结论。
+- `~/.config/litellm/docs/illformed-fix.md` —— live 探针方法与 provider 差异结论。
 - `~/.claude/skills/debugging-llm-proxy-transforms/` —— 代理转换排错方法论。
 
 ## 10. 评审吸收记录（2026-07-14 GPT 对抗评审）
