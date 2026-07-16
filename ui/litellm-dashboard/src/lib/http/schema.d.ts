@@ -24110,6 +24110,28 @@ export interface components {
              */
             vault_token?: string | null;
         };
+        /**
+         * HttpClientConfig
+         * @description Parsed, validated upstream HTTP client configuration.
+         *
+         *     All fields are optional: an absent field means "fall back to the next layer"
+         *     (deployment -> global -> legacy per-face default), resolved by
+         *     `merge_http_client_config` / `resolve_http_client_timeout`. Every present timeout
+         *     field must be strictly positive (`gt=0`); 0 or negative is rejected at parse time
+         *     rather than silently producing an instantly-expiring or infinite timeout.
+         */
+        HttpClientConfig: {
+            /** Connect Timeout */
+            connect_timeout?: number | null;
+            /** Http2 */
+            http2?: boolean | null;
+            /** Pool Timeout */
+            pool_timeout?: number | null;
+            /** Read Timeout */
+            read_timeout?: number | null;
+            /** Total Timeout */
+            total_timeout?: number | null;
+        };
         /** Hyperparameters */
         Hyperparameters: {
             /** Batch Size */
@@ -25378,6 +25400,7 @@ export interface components {
             default_api_key_tpm_limit?: number | null;
             /** Gcs Bucket Name */
             gcs_bucket_name?: string | null;
+            http_client?: components["schemas"]["HttpClientConfig"] | null;
             /** Input Cost Per Audio Per Second */
             input_cost_per_audio_per_second?: number | null;
             /** Input Cost Per Audio Per Second Above 128K Tokens */
@@ -33164,6 +33187,7 @@ export interface components {
             default_api_key_tpm_limit?: number | null;
             /** Gcs Bucket Name */
             gcs_bucket_name?: string | null;
+            http_client?: components["schemas"]["HttpClientConfig"] | null;
             /** Input Cost Per Audio Per Second */
             input_cost_per_audio_per_second?: number | null;
             /** Input Cost Per Audio Per Second Above 128K Tokens */
