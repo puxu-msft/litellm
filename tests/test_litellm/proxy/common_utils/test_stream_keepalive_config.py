@@ -74,3 +74,5 @@ def test_should_advise_missing_upstream_timeout():
     assert should_advise_missing_upstream_timeout({"enabled": False}, False) is False
     # unset -> no advice
     assert should_advise_missing_upstream_timeout(None, False) is False
+    # non-parseable value (not a valid override) -> no advice
+    assert should_advise_missing_upstream_timeout("not-a-config", False) is False

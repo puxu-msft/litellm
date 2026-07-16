@@ -12,7 +12,6 @@ from __future__ import annotations
 import math
 
 from pydantic import BaseModel, ConfigDict, field_validator
-from typing_extensions import cast
 
 KEEPALIVE_MIN_INTERVAL_SECONDS = 1.0
 KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 15.0
@@ -87,6 +86,8 @@ def should_advise_missing_upstream_timeout(value: object, request_timeout_explic
     set — the operator should be advised the backstop is the default read timeout."""
     if request_timeout_explicitly_set:
         return False
-    if not isinstance(value, dict):
+    try:
+        override = parse_override(value)
+    except Exception:  # noqa: BLE001 -- any parse failure means "not a valid enabled keepalive config"
         return False
-    return bool(cast("dict[str, object]", value).get("enabled", True))
+    return override.enabled if override.enabled is not None else True

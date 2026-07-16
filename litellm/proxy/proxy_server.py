@@ -4328,8 +4328,14 @@ class ProxyConfig:
                         warn_if_legacy_timeout_coexists_with_http_client,
                     )
 
+                    http_client_value: object = value
+                    if http_client_value is not None and not isinstance(http_client_value, dict):
+                        raise ValueError(
+                            "Invalid `http_client` setting in litellm_settings: expected a mapping, "
+                            f"got {type(http_client_value).__name__}"
+                        )
                     try:
-                        parsed_http_client = parse_http_client_config(cast("Optional[dict]", value))
+                        parsed_http_client = parse_http_client_config(http_client_value)
                     except Exception as e:
                         raise ValueError(f"Invalid `http_client` setting in litellm_settings: {e}") from e
                     warn_if_legacy_timeout_coexists_with_http_client(
@@ -4350,11 +4356,12 @@ class ProxyConfig:
                         validate_global_config,
                     )
 
-                    _ka_err = validate_global_config(cast(object, value))
+                    keepalive_value: object = value
+                    _ka_err = validate_global_config(keepalive_value)
                     if _ka_err is not None:
                         verbose_proxy_logger.error(
                             "Invalid litellm_settings.stream_keepalive=%s (%s); keepalive disabled",
-                            cast(object, value),
+                            keepalive_value,
                             _ka_err,
                         )
                         litellm.stream_keepalive = None
