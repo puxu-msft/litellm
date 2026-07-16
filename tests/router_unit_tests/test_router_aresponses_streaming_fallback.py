@@ -266,3 +266,102 @@ async def test_aresponses_with_streaming_fallbacks_wraps_streaming_iterator():
         )
     assert out is wrapped
     mock_wrap.assert_awaited_once()
+
+
+# -------- Task 20a: mid-stream DeadlineExceeded -> Router fallback (integration) --------
+
+
+@pytest.mark.asyncio
+async def test_aresponses_deadline_midstream_triggers_router_fallback():
+    """Router-wrapped half of Task 20a (deferred in commit ad6716f3d3).
+
+    A mid-stream ``total_timeout`` ``DeadlineExceeded`` is mapped by
+    ``ResponsesAPIStreamingIterator.__anext__`` to a ``MidStreamFallbackError`` whose
+    ``original_exception`` is a public ``litellm.Timeout``. This test proves that when
+    such an error surfaces from the source iterator, ``_aresponses_streaming_iterator``
+    drives the Router's cross-deployment fallback via
+    ``async_function_with_fallbacks_common_utils`` (yielding the fallback deployment's
+    events) instead of letting the error propagate to the client. The direct-iterator
+    half lives in ``tests/test_litellm/responses/test_streaming_iterator.py``.
+    """
+    import litellm
+    from litellm.exceptions import MidStreamFallbackError
+
+    first_chunk = MagicMock()
+    first_chunk.type = "response.output_text.delta"  # a non-terminal mid-stream delta
+
+    class _DeadlineFallbackSource:
+        """Yields one delta, then raises exactly what ResponsesAPIStreamingIterator
+        raises on a mid-stream DeadlineExceeded (Task 20a)."""
+
+        def __init__(self) -> None:
+            self._yielded = False
+            self.completed_response = None  # -> _extract_partial_responses_usage returns None
+            self.model = "openai/gpt-4o-mini"
+            self.custom_llm_provider = "openai"
+            self._hidden_params: dict = {}
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._yielded:
+                self._yielded = True
+                return first_chunk
+            raise MidStreamFallbackError(
+                message="AsyncioDeadlineExceeded",
+                model=self.model,
+                llm_provider=self.custom_llm_provider,
+                original_exception=litellm.Timeout(
+                    message="deadline",
+                    model=self.model,
+                    llm_provider=self.custom_llm_provider,
+                ),
+                generated_content="partial",
+                is_pre_first_chunk=False,
+            )
+
+        async def aclose(self):
+            return None
+
+    fallback_event = _make_completed_event(4, 2, 6)
+
+    class _FallbackIter:
+        _hidden_params: dict = {}
+
+        def __init__(self) -> None:
+            self._done = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return fallback_event
+
+        async def aclose(self):
+            return None
+
+    router = _make_router()
+    fallback_common = AsyncMock(return_value=_FallbackIter())
+
+    with patch.object(
+        router, "async_function_with_fallbacks_common_utils", new=fallback_common
+    ), patch.object(router, "_update_kwargs_before_fallbacks", new=MagicMock()):
+        wrapper = await router._aresponses_streaming_iterator(
+            _DeadlineFallbackSource(), initial_kwargs={"model": "primary"}
+        )
+        collected = [ev async for ev in wrapper]
+
+    # Pre-error delta forwarded, then the fallback deployment's completed event.
+    assert collected[0] is first_chunk
+    assert fallback_event in collected
+    # The deadline-mapped MidStreamFallbackError drove the Router fallback exactly once,
+    # carrying the public litellm.Timeout as its original exception.
+    fallback_common.assert_awaited_once()
+    triggering_exc = fallback_common.await_args.kwargs["e"]
+    assert isinstance(triggering_exc, MidStreamFallbackError)
+    assert isinstance(triggering_exc.original_exception, litellm.Timeout)
+
