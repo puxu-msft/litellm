@@ -7,7 +7,7 @@
 | 功能 | 状态 | spec | plan | 下一步 |
 |---|---|---|---|---|
 | 下游 SSE 保活 | ✅ 已实现 + E2E 验证 | [keepalive](superpowers/specs/2026-07-14-downstream-sse-keepalive-design.md) | [keepalive](superpowers/plans/2026-07-14-downstream-sse-keepalive.md) | 完成;BACKLOG 有延后项 |
-| 上游 http_client 超时 | 🟡 Phase 1 完成,Phase 2-5 待做 | [upstream-timeout](superpowers/specs/2026-07-13-upstream-http-client-config-design.md) | [upstream-timeout](superpowers/plans/2026-07-14-upstream-http-client-config.md) | 新会话用 plan 末 kick-off,从 Phase 2 Task 8 起 |
+| 上游 http_client 超时 | ✅ 完成(全 5 phase + 变异测试 98.4%) | [upstream-timeout](superpowers/specs/2026-07-13-upstream-http-client-config-design.md) | [upstream-timeout](superpowers/plans/2026-07-14-upstream-http-client-config.md) | 已完成;plan 已标 ALL PHASES COMPLETE,详见下方小节 |
 | github_copilot messages 原生路由 | 见 plan | [routing](superpowers/specs/2026-07-13-github-copilot-messages-native-routing-design.md) | [routing](superpowers/plans/2026-07-13-github-copilot-messages-native-routing.md) | 见该 plan |
 | gpt reasoning↔thinking 保真 | 见 plan(PoC 已出结果) | — | [fidelity](superpowers/plans/2026-07-14-gpt-reasoning-thinking-fidelity.md) / [poc](superpowers/plans/2026-07-14-gpt-reasoning-poc-results.md) | 见该 plan |
 
@@ -25,14 +25,14 @@
 - **部署链路**:Caddy(`~/.claude/litellm/Caddyfile`,Claude→Caddy:4143→litellm:4142/4141)对保活透明(`response_header_timeout 0` / `read_timeout 0` / `stream_timeout 0` / `flush_interval -1`),无需改
 - **延后**(BACKLOG):可观测性指标已做;外部固定 deadline(ingress/LB,非代码可解)、面 1 message_start 前原生 ping(留 PoC,默认只发注释)
 
-## 上游 http_client 超时 — 🟡 Phase 1 完成
+## 上游 http_client 超时 — ✅ 完成
 
 per-provider 上游 connect/read/pool 分轴超时 + total(asyncio 绝对 deadline,覆盖 SDK 重试与流式),三面(chat/responses/messages),github_copilot。
 
 - **Phase 1 已完成(Tasks 1-7、7a、4a 步骤 1-2,均已提交)**:`litellm/litellm_core_utils/http_client_config.py`(schema/parse/merge/resolve/coexistence-warn)、`GenericLiteLLMParams.http_client` + TypedDict 字段、`all_litellm_params` 防泄漏、`litellm.http_client` 全局 + proxy 加载校验、legacy-timeout 共存警告(全局 & per-deployment)、`github_copilot` 加入 `supports_httpx_timeout`。约 50 单测全绿,**零运行时行为变化**
-- **待做 Phase 2-5**(plan 里 ~20 task,共享核心手术,高风险):Phase 2 deadline 基础设施(`asyncio_deadline.py`:`with_deadline`/`DeadlineBoundAsyncIterator`/`DeadlineExceeded`→`litellm.Timeout` 映射)、Phase 3/4 三面 deadline 接线(非流式 + 流式 phase①/②包裹 + Router fallback 分类)、Phase 5 router 回归 / 自定义 client 警告 / http2 schema-only / mutation
-- **carried-over**:**Task 4a 步骤 3**(safety-net 回归)依赖 Task 13,随 Phase 3 补
-- **续跑**:plan 末 **Kick-off Prompt** 已标注「Phase 1 完成,从 Phase 2 Task 8 起」,新会话整段粘贴即可。行号已漂移,编辑前先 grep
+- **Phase 2-5 已完成**:Phase 2 deadline 基础设施(`asyncio_deadline.py`:`with_deadline`/`DeadlineBoundAsyncIterator`/`DeadlineExceeded`→`litellm.Timeout` 映射)、Phase 3/4 三面(chat/responses/messages)deadline 接线(非流式 + 流式 phase①/②包裹 + Router mid-stream fallback 分类)、Phase 5 Router 回归 / 自带 client 绕过告警(4 个 choke point)/ http2 schema-only / mutation。Task 4a 步骤 3 已随 Task 13 补
+- **变异测试**:`http_client_config.py` + `asyncio_deadline.py` 123/125 = 98.4% 击杀(2 存活为已证明的等价变异体)
+- **收尾**:dashboard `schema.d.ts` 已回填 http_client 字段;LIT006 预算 cast 已重构/加 `# cast-ok` 回到天花板下
 
 ## 关联加固(已随会话完成)
 
