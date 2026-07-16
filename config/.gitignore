@@ -1,0 +1,4 @@
+/github_copilot
+/probe-logs
+__pycache__/
+*.pyc

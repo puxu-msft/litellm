@@ -1,0 +1,99 @@
+# 运行:
+#   caddy run --config /home/xp/.config/litellm/Caddyfile --adapter caddyfile
+# 前台校验:
+#   caddy validate --config /home/xp/.config/litellm/Caddyfile --adapter caddyfile
+#
+{
+    # 关闭 admin API，如需平滑热更不断连时开启
+    admin off
+    # admin localhost:2019
+
+    auto_https off
+
+    # 优雅退出，给在途请求的宽限期。
+    # ⚠ 需把 caddy-lb.service TimeoutStopSec ≥ 此值，否则 systemd 会 SIGKILL
+    grace_period 30s
+
+    # 下游（客户端→Caddy）侧
+    servers {
+        timeouts {
+        	idle 20m
+        }
+        # max_header_size 512KB
+
+        # 暴露 Prometheus 指标于 admin 端点的 /metrics
+        # metrics
+    }
+
+    # 关闭访问日志到 stderr 之外的持久化；按需打开。
+    log {
+        output stderr
+        level WARN
+    }
+    # —— 可选：访问日志落文件 + 滚动（替代上面的 stderr 块）——
+    # log {
+    # 	output file /home/xp/.config/litellm/caddy-lb.log {
+    # 		roll_size 10MB
+    # 		roll_keep 5
+    # 	}
+    # 	format json
+    # }
+}
+
+:4141 {
+    # —— 可选：硬性拒绝超大请求体（站点级指令，非 reverse_proxy 子指令；这才是真正的「上限并拒绝」，区别于上面的 request_buffers 缓冲）——
+    # request_body {
+    # 	max_size 10MB
+    # }
+    reverse_proxy {
+        to 127.0.0.1:4142
+        to 127.0.0.1:4143
+
+        # 主备故障转移：永远优先选列表里第一个健康的上游
+        lb_policy first
+        # lb_policy round_robin   # 可选：轮询（least_conn 为最少连接）——会放弃主备语义
+
+        # TCP 被动健康检查（连接失败/RST/read error）
+        # max_fails 次失败即标记不健康，在 fail_duration 内跳过它
+        max_fails 1
+        fail_duration 10s
+
+        # HTTP 被动健康检查
+        # unhealthy_status 5xx          # 上游返回 5xx 即计一次失败（litellm 转换 bug 吐 5xx 时才会触发摘除 4142）；仅影响「后续」请求，当前这条 5xx 请求本身不会自动改投
+        # unhealthy_latency 30s         # ⚠本场景勿用：LLM 请求延迟本就极高（思考+长输出），按延迟判失败会误杀健康上游
+
+        # 单请求的跨上游重试窗口，首选连接失败时立即改投下一个
+        lb_try_duration 5s
+        lb_try_interval 1s
+        lb_retries 2
+
+        # —— 可选：主动健康检查 ——
+        health_uri /health/liveness
+        health_interval 2s
+        health_timeout 10s
+        health_status 2xx
+        health_passes 1 				# 连续 N 次通过才判恢复健康（避免抖动）
+        health_fails 1 					# 连续 N 次失败才判不健康
+
+        # LLM SSE 流式：立即透传每个 chunk 不缓冲
+        flush_interval -1
+        stream_timeout 0       			# ⚠ 流式连接强制关闭上限；LLM 长流务必保持 0/不设（默认无），设了会腰斩长输出
+        stream_close_delay 300s 			# reload 时给在途 SSE 的收尾延迟（仅启用下方 admin 平滑 reload 时相关）
+
+        # 上游侧（Caddy→服务端）
+        transport http {
+            dial_timeout 3s            	# 连接超时
+            response_header_timeout 0  	# 首字节前等待
+            read_timeout 0             	# 读超时
+            write_timeout 0
+            keepalive 1800s
+            keepalive_idle_conns_per_host 0
+            max_conns_per_host 0
+        }
+    }
+
+    # —— 可选：上游全部不可用时返回自定义错误（默认是 502）——
+    handle_errors {
+        respond "network issue" 503
+    }
+}

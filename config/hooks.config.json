@@ -1,0 +1,138 @@
+{
+  "fix_tool_choice": true,
+  "probe": {
+    "enabled": false,
+    "file": "/tmp/litellm-toolprobe.jsonl",
+    "dump_messages": false,
+    "dump_file": "/tmp/litellm-messages.jsonl",
+    "dump_orphans_only": true,
+    "orphan_dump_file": "/tmp/litellm-orphans.jsonl",
+    "dump_toolref": false,
+    "toolref_file": "/tmp/litellm-toolref.jsonl"
+  },
+  "deployment_probe": {
+    "enabled": true,
+    "orphan_only": true,
+    "file": "/home/xp/.config/litellm/probe-logs/deployment-orphans.jsonl",
+    "dump_all": false,
+    "dump_file": "/home/xp/.config/litellm/probe-logs/deployment.jsonl",
+    "model_contains": "claude",
+    "fix_orphans": false
+  },
+  "failure_probe": {
+    "enabled": true,
+    "file": "/home/xp/.config/litellm/probe-logs/failures.jsonl",
+    "match_exception_contains": "invalid_request_body",
+    "dump_full_request": true
+  },
+  "success_probe": {
+    "enabled": false,
+    "file": "/home/xp/.config/litellm/probe-logs/success.jsonl"
+  },
+  "stream_fix": {
+    "enabled": true,
+    "probe_only": false,
+    "probe_file": "/home/xp/.config/litellm/probe-logs/stream-tool-input.jsonl",
+    "tools": {
+      "AskUserQuestion": {
+        "items_key": "questions",
+        "copy_within_items": [
+          {
+            "src": "header",
+            "dst": "question"
+          }
+        ]
+      }
+    },
+    "audit_file": "/home/xp/.config/litellm/probe-logs/stream-patched.jsonl",
+    "convert_text_invoke": true,
+    "convert_text_invoke_tools": [
+      "Agent",
+      "AskUserQuestion",
+      "Bash",
+      "Edit",
+      "ExitPlanMode",
+      "Read",
+      "SendMessage",
+      "Skill",
+      "Task",
+      "TaskStop",
+      "TodoWrite",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "mcp__plugin_*"
+    ],
+    "degen_trim": {
+      "enabled": true
+    }
+  },
+  "inject_tools": {
+    "enabled": false,
+    "model_contains": "gpt",
+    "only_if_tools_present": true,
+    "tools": [
+      {
+        "name": "Grep",
+        "description": "A powerful search tool built on ripgrep. Searches file contents with a regular expression. Supports path, output_mode (content/files_with_matches/count), case-insensitive (-i), line numbers (-n), and glob filtering.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "The regular expression pattern to search for in file contents."
+            },
+            "path": {
+              "type": "string",
+              "description": "Absolute path to a file or directory to search in."
+            },
+            "glob": {
+              "type": "string",
+              "description": "Glob pattern to filter files, e.g. \"*.py\"."
+            },
+            "output_mode": {
+              "type": "string",
+              "enum": [
+                "content",
+                "files_with_matches",
+                "count"
+              ],
+              "description": "What to return."
+            },
+            "-i": {
+              "type": "boolean",
+              "description": "Case-insensitive search."
+            },
+            "-n": {
+              "type": "boolean",
+              "description": "Show line numbers (content mode only)."
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      }
+    ]
+  },
+  "fix_thinking": {
+    "insert_text": true,
+    "empty_signature": "to_text",
+    "strip_all": false
+  },
+  "block_audit": {
+    "enabled": true,
+    "file": "/home/xp/.config/litellm/probe-logs/block-seq.jsonl",
+    "violation_only": true
+  },
+  "dedup_tool_use": {
+    "enabled": true
+  },
+  "request_log": {
+    "enabled": true,
+    "diagnose": true,
+    "suppress_uvicorn_access": true,
+    "color": "auto",
+    "timing_file": "/home/xp/.config/litellm/probe-logs/request-timing.jsonl"
+  }
+}

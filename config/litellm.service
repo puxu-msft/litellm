@@ -1,0 +1,46 @@
+[Unit]
+Description=litellm proxy
+Documentation=https://docs.litellm.ai/
+
+After=network.target homebrew.postgresql@18.service homebrew.redis.service
+Wants=homebrew.postgresql@18.service homebrew.redis.service
+
+# 崩溃重启风暴熔断（60s 内重启超 5 次则放弃并置为 failed）。
+# 注意：StartLimit* 属 [Unit] 段，放 [Service] 会被 systemd 忽略并告警
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+Environment=PATH=/home/xp/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin
+Environment=GITHUB_COPILOT_TOKEN_DIR=/home/xp/.config/litellm/github_copilot
+Environment=GITHUB_COPILOT_ACCESS_TOKEN_FILE=access-token
+Environment=GITHUB_COPILOT_API_BASE=https://api.enterprise.github.com
+Environment=REDIS_HOST=127.0.0.1
+Environment=REDIS_PORT=6379
+Environment=REDIS_PASSWORD=
+Environment=LITELLM_LOG=INFO
+WorkingDirectory=/home/xp/refs/ai-agents/litellm
+ExecStart=/home/xp/refs/ai-agents/litellm/start.sh
+
+Restart=on-failure
+RestartSec=3s
+# litellm 无 sd_notify；给足关停宽限，让在途流式请求收尾（默认 SIGTERM）。
+TimeoutStopSec=300s
+
+SyslogIdentifier=litellm
+LogRateLimitIntervalSec=0
+
+# —— 可选：资源上限（大量并发 SSE + 模型上下文，litellm 内存可观）——
+# LimitNOFILE=1048576
+# MemoryMax=4G
+
+# —— 可选：安全加固 ——
+NoNewPrivileges=true
+# /usr /boot /etc 只读；不影响读 $HOME
+ProtectSystem=full
+# ProtectHome=none
+
+[Install]
+WantedBy=default.target
