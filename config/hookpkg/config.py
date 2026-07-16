@@ -20,6 +20,14 @@ _DEFAULT_CONFIG = {
     "fix_tool_choice": True,
     "strip_cache_control_scope": True,
     "fix_orphan_tool_use": True,
+    # 反方向孤儿处理:tool_result 的 tool_use_id 无匹配 tool_use(→ function_call_output
+    # 无 function_call,copilot /responses 报 "No tool call found for function call output")。
+    # strategy: "passthrough"(默认,不动,留给上游拒)/ "drop"(删块)/ "text"(转带 tag 的
+    # 代码块文本,保内容)。model_contains 留空=所有模型,否则仅对模型名含该子串的请求生效。
+    "orphan_tool_result": {
+        "strategy": "passthrough",
+        "model_contains": "",
+    },
     # 剥离 copilot 原生 /v1/messages 端点不接受的顶层字段。默认空——注意 context_management
     # 【不该】在此:它是 beta 特性,copilot 完全支持,只需正确透传 anthropic-beta header
     # (context-management-2025-06-27)。误剥会关掉 context editing 能力。
@@ -162,7 +170,7 @@ def load_config():
         with open(CONFIG_PATH) as f:
             loaded = json.load(f)
         merged = {**_DEFAULT_CONFIG, **loaded}
-        for k in ("probe", "inject_tools", "deployment_probe", "failure_probe", "success_probe", "stream_fix", "fix_thinking", "strip_beta_by_model", "block_audit", "dedup_tool_use", "request_log"):
+        for k in ("probe", "inject_tools", "deployment_probe", "failure_probe", "success_probe", "stream_fix", "fix_thinking", "strip_beta_by_model", "block_audit", "dedup_tool_use", "request_log", "orphan_tool_result"):
             if isinstance(loaded.get(k), dict):
                 merged[k] = {**_DEFAULT_CONFIG[k], **loaded[k]}
         _cfg_cache["config"] = merged

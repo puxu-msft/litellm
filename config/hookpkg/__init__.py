@@ -463,6 +463,101 @@ def _orphan_pre_fix_snapshot(msgs, cfg):
     return json.loads(json.dumps(msgs, default=str))
 
 
+def _tool_result_output_text(content) -> str:
+    """把 Anthropic tool_result 的 content(str / text-block 列表 / None)抽成纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"
+        )
+    return str(content)
+
+
+def _find_orphan_tool_results(messages):
+    """孤儿 tool_result:其 tool_use_id 在整个请求里无匹配的 tool_use。返回 [(mi, bi, tid), ...]。
+
+    翻译成 Responses API 后即 function_call_output 无配对 function_call,copilot /responses 报
+    "No tool call found for function call output with call_id ..."。内联于 __init__(而非
+    orphans.py)——orphans 不在 SIGUSR2 RELOAD_ORDER,内联保证改动热重载即时生效。"""
+    if not isinstance(messages, list):
+        return []
+
+    def blocks(m):
+        c = m.get("content") if isinstance(m, dict) else None
+        return c if isinstance(c, list) else []
+
+    known = {
+        b.get("id")
+        for m in messages
+        for b in blocks(m)
+        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+    }
+    return [
+        (mi, bi, b.get("tool_use_id"))
+        for mi, m in enumerate(messages)
+        for bi, b in enumerate(blocks(m))
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") and b.get("tool_use_id") not in known
+    ]
+
+
+def _fix_orphan_tool_result(data, cfg) -> int:
+    """按配置策略处理孤儿 tool_result(tool_use_id 无匹配 tool_use)。返回处理的块数。
+
+    作用于 async_pre_call_hook 阶段的 Anthropic `messages`:anthropic_messages→responses 走
+    异步 aresponses,不应用 deployment hook,只有此处对 data["messages"] 的改写会传播到
+    responses 翻译(已实测)。
+
+    strategy(hooks.config.json 的 orphan_tool_result.strategy,热读可即时切换):
+      passthrough(默认,不动,留给上游拒)/ drop(删块,块删空的消息整条丢弃)/
+      text(把 tool_result 转成带 tag 的代码块 text 块,保留内容而不破坏请求)。
+    可选 model_contains 过滤(留空=所有模型)。只影响孤儿,配对的 tool_result 永不受影响。
+    原地 mutate(slice 赋值)以传播到 litellm 持有的同一 messages 引用。
+    """
+    otr = cfg.get("orphan_tool_result") or {}
+    strategy = (otr.get("strategy") or "passthrough").strip().lower()
+    if strategy not in ("drop", "text"):
+        return 0  # passthrough / 未知 -> 不动
+    needle = otr.get("model_contains") or ""
+    if needle and needle not in (data.get("model") or ""):
+        return 0
+    messages = data.get("messages")
+    orphans = _find_orphan_tool_results(messages)
+    if not orphans:
+        return 0
+
+    by_msg: dict = {}
+    for mi, bi, tid in orphans:
+        by_msg.setdefault(mi, {})[bi] = tid
+
+    new_messages = []
+    for mi, m in enumerate(messages):
+        if mi not in by_msg or not isinstance(m.get("content"), list):
+            new_messages.append(m)
+            continue
+        repl = by_msg[mi]
+        new_content = []
+        for bi, b in enumerate(m["content"]):
+            if bi not in repl:
+                new_content.append(b)
+            elif strategy == "text":
+                new_content.append(
+                    {"type": "text", "text": f"```tool_result call_id={repl[bi]}\n{_tool_result_output_text(b.get('content'))}\n```"}
+                )
+            # drop: 跳过该块
+        if new_content:  # 删空的消息整条丢弃(空 content 无意义且可能被拒)
+            new_messages.append({**m, "content": new_content})
+    messages[:] = new_messages
+    logger.warning(
+        "hookpkg: rewrote %d orphan tool_result block(s) via strategy=%r on model=%r",
+        len(orphans), strategy, data.get("model"),
+    )
+    return len(orphans)
+
+
+
 def process(data: dict, call_type: str) -> dict:
     """薄壳调用的入口。"""
     cfg = load_config()
@@ -509,6 +604,10 @@ def process(data: dict, call_type: str) -> dict:
     n = _fix_orphan_tool_use(data, cfg)
     if pre is not None:
         _dump_orphan_evidence(pre, n, data, cfg)
+    # 反方向孤儿(tool_result 无匹配 tool_use → function_call_output 无 function_call)。
+    # anthropic_messages→responses 异步路径不应用 deployment hook,只能在此(Anthropic 格式,
+    # async_pre_call_hook)改——已实测此处对 data["messages"] 的改写会传播到 responses 翻译。
+    _fix_orphan_tool_result(data, cfg)
     return data
 def process_deployment(kwargs: dict, call_type):
     """转换后、发出前(deployment 已选定)。返回修改后的 kwargs 或 None。

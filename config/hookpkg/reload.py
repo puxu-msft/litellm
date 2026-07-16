@@ -115,6 +115,7 @@ RELOAD_ORDER = [
     "hookpkg.config",
     "hookpkg.probes",
     "hookpkg.sse",
+    "hookpkg.orphans",         # 孤儿检测/修复(纯函数,无内部依赖)
     "hookpkg.fixes.json_repair",
     "hookpkg.fixes.unicode_repair",
     "hookpkg.fixes.coerce",

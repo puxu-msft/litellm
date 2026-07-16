@@ -20,6 +20,8 @@ python smoke_test.py        # 冒烟测试(用 litellm 的 python 跑)
 
 Prisma schema 的 `generator client` 必须保留 `recursive_type_depth = -1`。本项目使用 basedpyright，该模式使用生成器推荐的真实递归类型，避免默认深度 5 把关系输入类型展开成约 48.8 万行。2026-07-17 实测生成的 `types.py` 从 22 MiB 降至 5 MiB，同机暖启动到 `Application startup complete` 从约 12.34 秒降至 8.44 秒。
 
+普通启动不负责迁移数据库。`general_settings.disable_prisma_schema_update` 和 `disable_prisma_schema_check` 均为 `true`，因此启动只连接数据库并执行 health check，不运行 `prisma migrate deploy`、`db push` 或 `migrate diff`。schema 变化后，先按项目 migration runbook 显式生成并应用迁移，再重启服务；根目录 `start.sh` 只按 schema 内容哈希决定是否重新生成 Python client。
+
 Caddy 对上游 4142/4143 每 2 秒做一次主动健康检查，一次通过后恢复。这样 LiteLLM 就绪后，入口 4141 再等待 0～2 秒即可恢复流量。
 
 ### 创建客户端 API key

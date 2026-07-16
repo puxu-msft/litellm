@@ -24,16 +24,6 @@ export GHC_REASONING_POC=1
 
 pushd "$(dirname "$0")" || exit 1
 
-# uv sync --extra proxy --extra extra_proxy
-
-prisma_dir=(.venv/lib/python*/site-packages/prisma)
-schema_hash="$(sha256sum schema.prisma | cut -d' ' -f1)"
-stamp="${prisma_dir[0]}/.litellm-schema.sha256"
-if [[ "$(cat "$stamp" 2>/dev/null)" != "$schema_hash" ]]; then
-  uv run --no-sync -- prisma generate
-  printf '%s\n' "$schema_hash" > "$stamp"
-fi
-
 uv run --no-sync -- litellm --config "$HOME/.config/litellm/config.yaml" --host 127.0.0.1 --port 4142
 
 popd

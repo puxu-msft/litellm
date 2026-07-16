@@ -11,12 +11,12 @@
     "toolref_file": "/tmp/litellm-toolref.jsonl"
   },
   "deployment_probe": {
-    "enabled": true,
+    "enabled": false,
     "orphan_only": true,
-    "file": "/home/xp/.config/litellm/probe-logs/deployment-orphans.jsonl",
+    "file": "/tmp/x",
     "dump_all": false,
-    "dump_file": "/home/xp/.config/litellm/probe-logs/deployment.jsonl",
-    "model_contains": "claude",
+    "dump_file": "/tmp/x",
+    "model_contains": "",
     "fix_orphans": false
   },
   "failure_probe": {
@@ -134,5 +134,9 @@
     "suppress_uvicorn_access": true,
     "color": "auto",
     "timing_file": "/home/xp/.config/litellm/probe-logs/request-timing.jsonl"
+  },
+  "orphan_tool_result": {
+    "strategy": "drop",
+    "model_contains": ""
   }
 }
