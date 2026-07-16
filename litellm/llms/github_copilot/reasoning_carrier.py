@@ -178,7 +178,7 @@ def decode_carrier(block: Mapping[str, object]) -> DecodeResult:
 def _is_our_carrier_block(block: object) -> bool:
     if not isinstance(block, dict):
         return False
-    b = cast("dict[str, object]", block)
+    b = cast("dict[str, object]", block)  # cast-ok: content block narrowing
     return b.get("type") in ("thinking", "redacted_thinking") and not isinstance(decode_carrier(b), NotOurCarrier)
 
 

@@ -507,11 +507,11 @@ async def _create_response_with_keepalive(
     # AsyncIterator[SSEFrame] (str or bytes); the lease owns the original
     # generator for closing.
     framed: AsyncIterator[SSEFrame] = (
-        normalize_anthropic_sse_frames(cast("AsyncIterator[bytes]", generator))
+        normalize_anthropic_sse_frames(cast("AsyncIterator[bytes]", generator))  # cast-ok: stream-type variance
         if needs_frame_normalizer(surface)
         else generator
     )
-    lease = StreamLease(inner=cast("AsyncGenerator[SSEFrame, None]", generator))
+    lease = StreamLease(inner=cast("AsyncGenerator[SSEFrame, None]", generator))  # cast-ok: stream-type variance
 
     chunk_task: "asyncio.Task[SSEFrame]" = asyncio.ensure_future(framed.__anext__())
     lease.set_pending_task(chunk_task)
@@ -596,12 +596,13 @@ async def _create_response_with_keepalive(
             ):
                 yield frame
 
+        _fast_body_metered = _metered_keepalive_body(_fast_body(), surface.value)
         return _UpstreamClosingStreamingResponse(
-            cast("AsyncGenerator[str, None]", _metered_keepalive_body(_fast_body(), surface.value)),
+            cast("AsyncGenerator[str, None]", _fast_body_metered),  # cast-ok: stream-type variance
             media_type=media_type,
             headers=streaming_headers,
             status_code=default_status_code,
-            upstream_generator=cast("AsyncGenerator[str, None]", lease),
+            upstream_generator=cast("AsyncGenerator[str, None]", lease),  # cast-ok: stream-type variance
         )
 
     # Timer fired first: slow upstream. Commit 200 and keepalive during the wait.
@@ -614,12 +615,13 @@ async def _create_response_with_keepalive(
         ),
         surface,
     )
+    slow_body_metered = _metered_keepalive_body(slow_body, surface.value)
     return _UpstreamClosingStreamingResponse(
-        cast("AsyncGenerator[str, None]", _metered_keepalive_body(slow_body, surface.value)),
+        cast("AsyncGenerator[str, None]", slow_body_metered),  # cast-ok: stream-type variance
         media_type=media_type,
         headers=streaming_headers,
         status_code=default_status_code,
-        upstream_generator=cast("AsyncGenerator[str, None]", lease),
+        upstream_generator=cast("AsyncGenerator[str, None]", lease),  # cast-ok: stream-type variance
     )
 
 
@@ -668,7 +670,7 @@ def _resolve_downstream_keepalive(
                 dep_params = getattr(deployment, "litellm_params", None) if deployment is not None else None
                 # Deployment litellm_params is a dict at runtime (LiteLLMParamsTypedDict).
                 raw = (
-                    cast("dict[str, object]", dep_params).get("stream_keepalive")
+                    cast("dict[str, object]", dep_params).get("stream_keepalive")  # cast-ok: hot-path dict narrowing
                     if isinstance(dep_params, dict)
                     else None
                 )
@@ -688,7 +690,7 @@ def _selected_model_id(response: object, request_data: Dict[str, object]) -> str
     confined here."""
 
     def _dict(value: object) -> Dict[str, object]:
-        return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+        return cast("dict[str, object]", value) if isinstance(value, dict) else {}  # cast-ok: hot-path dict narrowing
 
     hidden_params = _dict(getattr(response, "_hidden_params", None))
     from_hidden = hidden_params.get("model_id")

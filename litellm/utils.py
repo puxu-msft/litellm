@@ -2713,7 +2713,7 @@ def register_model(model_cost: Union[str, dict]):
         else:
             builtin_model_info = _get_builtin_model_info_for_registration(model=_key_str)
             if builtin_model_info is not None:
-                existing_model = cast(dict, builtin_model_info)
+                existing_model = cast(dict, builtin_model_info)  # cast-ok: builtin model-cost entry is a dict
                 model_cost_key = existing_model["key"]
             else:
                 existing_model = {}

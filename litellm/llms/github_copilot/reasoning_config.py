@@ -49,7 +49,7 @@ def resolve_reasoning_config(model_info: Union[Mapping[str, object], None]) -> R
         return ResolvedReasoningConfig()
     if not isinstance(raw, Mapping):
         return InvalidReasoningConfig("github_copilot_reasoning-not-a-mapping")
-    raw_map = cast("Mapping[str, object]", raw)
+    raw_map = cast("Mapping[str, object]", raw)  # cast-ok: config mapping narrowing
     carrier = raw_map.get("carrier", _DEFAULT_CARRIER)
     summary = raw_map.get("summary", _DEFAULT_SUMMARY)
     if carrier not in _VALID_CARRIERS:
