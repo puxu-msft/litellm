@@ -7,6 +7,9 @@ from __future__ import annotations
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
+import pytest
+from uvicorn.main import STARTUP_FAILURE
+
 from litellm.proxy.shutdown.uvicorn_runner import run_uvicorn_with_draining_server
 
 
@@ -69,3 +72,28 @@ def test_keyboard_interrupt_from_server_run_is_swallowed_and_returns_normally():
         mock_server_cls.return_value = server
         run_uvicorn_with_draining_server(_base_args(), workers=1)  # must not raise
     server.run.assert_called_once_with()
+
+
+def test_direct_mode_exits_startup_failure_when_server_never_started():
+    """Mirror uvicorn.main.run(): a direct-mode server that never reached
+    'started' must exit code 3, so a failed boot isn't reported as a clean exit."""
+    with patch("litellm.proxy.shutdown.uvicorn_runner.DrainingServer") as mock_server_cls:
+        server = _mock_server(should_reload=False, workers=1)
+        server.started = False
+        mock_server_cls.return_value = server
+        with pytest.raises(SystemExit) as exc_info:
+            run_uvicorn_with_draining_server(_base_args(), workers=1)
+    assert exc_info.value.code == STARTUP_FAILURE
+
+
+def test_reload_mode_does_not_startup_fail_even_when_parent_never_started():
+    """The startup-failure exit is direct-mode only; reload/workers manage their
+    own child lifecycle, so an unstarted supervisor parent must not sys.exit."""
+    with (
+        patch("litellm.proxy.shutdown.uvicorn_runner.DrainingServer") as mock_server_cls,
+        patch("litellm.proxy.shutdown.uvicorn_runner.ChangeReload"),
+    ):
+        server = _mock_server(should_reload=True, workers=1)
+        server.started = False
+        mock_server_cls.return_value = server
+        run_uvicorn_with_draining_server(_base_args(reload=True), workers=1)  # must not raise SystemExit

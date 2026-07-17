@@ -8,9 +8,11 @@ uvicorn's own dispatch order deliberately, not reimplemented from memory.
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict
 
 import uvicorn
+from uvicorn.main import STARTUP_FAILURE
 from uvicorn.supervisors import ChangeReload, Multiprocess
 
 from litellm.proxy.shutdown.draining_server import DrainingServer
@@ -36,3 +38,9 @@ def run_uvicorn_with_draining_server(uvicorn_args: Dict[str, Any], *, workers: i
         # contract instead of letting the exception change the process's exit
         # behavior out from under the CLI.
         pass
+
+    # Match uvicorn.main.run(): a direct (non-reload, single-worker) server that
+    # never reached "started" is a startup failure and must exit non-zero (3),
+    # so the CLI/orchestrator doesn't misread a failed boot as a clean exit.
+    if not server.started and not server.config.should_reload and server.config.workers == 1:
+        sys.exit(STARTUP_FAILURE)
