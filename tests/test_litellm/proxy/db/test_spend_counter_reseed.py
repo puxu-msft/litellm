@@ -28,21 +28,30 @@ def _reset():
 async def test_from_db_skips_query_and_logs_distinctly_during_shutdown():
     GracefulShutdownManager.start_shutdown()
     prisma_client = MagicMock()
-    with patch("litellm.proxy.db.spend_counter_reseed.verbose_proxy_logger") as mock_log:
+    with (
+        patch("litellm.proxy.db.spend_counter_reseed.verbose_proxy_logger") as mock_log,
+        patch("litellm.proxy.db.spend_counter_reseed.VerificationTokenRepository") as mock_repo,
+    ):
         result = await SpendCounterReseed.from_db(prisma_client, "spend:key:abc")
     assert result is None
-    assert mock_log.info.called
     assert "spend_counter_reseed_skipped_during_shutdown" in mock_log.info.call_args[0][0]
+    # The DB repository is never even constructed -> no find_unique on the dead
+    # client. Without this, dropping the early `return None` (but keeping the log)
+    # survives, because from_db's own except swallows the resulting error to None.
+    mock_repo.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_window_from_spend_logs_skips_group_by_during_shutdown():
     GracefulShutdownManager.start_shutdown()
     prisma_client = MagicMock()
-    with patch("litellm.proxy.db.spend_counter_reseed.verbose_proxy_logger") as mock_log:
+    with (
+        patch("litellm.proxy.db.spend_counter_reseed.verbose_proxy_logger") as mock_log,
+        patch("litellm.proxy.db.spend_counter_reseed.SpendLogsRepository") as mock_repo,
+    ):
         result = await SpendCounterReseed.window_from_spend_logs(
             prisma_client, entity_type="Key", entity_id="abc", window_start=datetime(2026, 1, 1)
         )
     assert result is None
-    assert mock_log.info.called
     assert "spend_counter_reseed_window_skipped_during_shutdown" in mock_log.info.call_args[0][0]
+    mock_repo.assert_not_called()  # no group_by on the dead client
