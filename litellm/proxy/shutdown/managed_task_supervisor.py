@@ -25,7 +25,7 @@ import contextvars
 import dataclasses
 from typing import Callable, Coroutine, Optional
 
-from litellm.proxy.shutdown.managed_task_set import ManagedTaskSet
+from litellm.litellm_core_utils.managed_task_set import ManagedTaskSet
 
 _DRAIN_POLL_INTERVAL_SECONDS = 0.02
 
@@ -167,16 +167,17 @@ class ManagedTaskSupervisor:
                 return await self._cancel_and_settle(forced=True)
             if deadline_remaining() <= 0:
                 return await self._cancel_and_settle(forced=False)
-            if self._is_quiescent():
+            if self.is_quiescent():
                 # Confirm stability across one event-loop tick: a parent about to
                 # spawn its last child is still in the task set, so this only
                 # returns when nothing can produce more work.
                 await asyncio.sleep(0)
-                if self._is_quiescent():
+                if self.is_quiescent():
                     return Drained()
             await asyncio.sleep(min(_DRAIN_POLL_INTERVAL_SECONDS, max(deadline_remaining(), 0.0)))
 
-    def _is_quiescent(self) -> bool:
+    def is_quiescent(self) -> bool:
+        """Return whether no accounting task or synchronous admission is active."""
         return len(self._tasks) == 0 and self._admissions_in_progress == 0
 
     async def _cancel_and_settle(self, *, forced: bool) -> "DrainOutcome":

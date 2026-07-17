@@ -1,8 +1,10 @@
 # Graceful Shutdown — Phase 1b 实施计划：进程级记账 drain 正确性
 
+> **状态：已降级为设计参考，不可逐行执行。** Phase 1b 已转为 TDD 增量实现；真实进度、已裁决并发不变量、组件 4/5 的修订契约见 `docs/superpowers/2026-07-18-graceful-shutdown-handover.md`。本计划保留用于追溯设计讨论，其中的文件布局、签名、任务清单和代码片段可能与已落地实现不一致。
+
 - Spec: `docs/superpowers/specs/2026-07-14-in-flight-observability-graceful-shutdown-design.md`（已冻结，3 轮 adversarial review）
 - 前置计划: `docs/superpowers/plans/2026-07-14-graceful-shutdown-phase1a.md`（review-cleared，**假定已落地**；本计划所有对 `GracefulShutdownManager`/`DrainingServer`/`AccountingSkippedDuringShutdown` 的引用均以该计划文本中定义的签名为准，而非当前仓库里 Phase 1a 落地前的旧代码）
-- 状态: Draft，待 subagent review
+- 状态: Superseded as executable plan；仅作设计参考
 
 ## Goal
 

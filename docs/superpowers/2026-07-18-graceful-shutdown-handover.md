@@ -14,7 +14,7 @@
 
 **当前状态**：
 - **Phase 1a：完整落地 + 加固 + E2E 验证**。用户的原始问题（单进程 direct 模式）已修复并端到端验证
-- **Phase 1b：supervisor 核心（组件 1-3/5）完成**，最难的并发正确性已 TDD 锁定；剩组件 4（`LoggingWorker.quiesce`，共享 SDK 集成，方案已定稿见 §6）+ 组件 5（记账点接入 + lifespan 9 步 + E2E）
+- **Phase 1b：组件 1-4/5 完成**。supervisor 并发状态机与 `LoggingWorker.quiesce` 共享 SDK 集成均已 TDD 锁定；剩组件 5（记账点接入 + lifespan 9 步 + E2E）
 - **Phase 1b 已从「纸面 plan」转为「TDD 增量实现」**（见 §5 决策）——`docs/.../plans/...-phase1b.md` 仅作**设计参考**，不要照它逐行执行（它与真实实现有已知漂移，见 §6）
 
 **先跑一遍确认基线绿**：
@@ -63,11 +63,11 @@ E2E：`tests/e2e/shutdown/`（marker `spawned_proxy_e2e`，自拉起子进程发
 
 ---
 
-## 3. Phase 1b：supervisor 核心已完成（组件 1-3/5）
+## 3. Phase 1b：supervisor + LoggingWorker 已完成（组件 1-4/5）
 
-`litellm/proxy/shutdown/`：
-- `managed_task_set.py`（`ManagedTaskSet`）— 标准 asyncio task 注册表：`add` + done-callback 自移除 + `is_empty` + `cancel_all_and_count_failures`。5 测试
-- `managed_task_supervisor.py`（`ManagedTaskSupervisor` + `AccountingLease` + `AccountingScope` + `current_accounting_scope` ContextVar + `Drained|DeadlineExceeded|ForcedExit`）— 状态机 + `drain`。13 测试
+`litellm/litellm_core_utils/managed_task_set.py`：`ManagedTaskSet` 标准 asyncio task 注册表，供 `LoggingWorker` 与 supervisor 组合复用；含 `add` + done-callback 自移除 + `is_empty` + `cancel_all_and_count_failures`。5 测试。
+
+`litellm/proxy/shutdown/managed_task_supervisor.py`：`ManagedTaskSupervisor` + `AccountingLease` + `AccountingScope` + `current_accounting_scope` ContextVar + `Drained|DeadlineExceeded|ForcedExit`，实现状态机 + `drain`。14 测试。
 
 **四轮评审萃取、已由测试钉死的不变量（改动它们前务必理解）**：
 1. `_root_admission_open` 与 `_hard_shutdown` **两个独立状态**
@@ -76,7 +76,7 @@ E2E：`tests/e2e/shutdown/`（marker `spawned_proxy_e2e`，自拉起子进程发
 4. `drain()` fixed-point：`task 集空 AND admissions_in_progress==0`，await 一 tick 后重检确认稳定；deadline/force-exit → **先 `begin_hard_shutdown()`**（封住走私 child）再 cancel+settle → 三变体 outcome
 
 ```bash
-.venv/bin/python -m pytest tests/test_litellm/proxy/shutdown/test_managed_task_set.py tests/test_litellm/proxy/shutdown/test_managed_task_supervisor.py -q
+.venv/bin/python -m pytest tests/test_litellm/litellm_core_utils/test_managed_task_set.py tests/test_litellm/proxy/shutdown/test_managed_task_supervisor.py tests/test_litellm/litellm_core_utils/test_logging_worker.py -q -W error::RuntimeWarning
 ```
 
 ---
@@ -100,28 +100,33 @@ E2E：`tests/e2e/shutdown/`（marker `spawned_proxy_e2e`，自拉起子进程发
 
 ---
 
-## 6. 组件 4 设计（LoggingWorker.quiesce，已定稿、可直接执行）
+## 6. 组件 4（LoggingWorker.quiesce，已实现）
 
 **背景**：记账不是裸 `asyncio.create_task`，而是先进 `GLOBAL_LOGGING_WORKER` 队列（`litellm/litellm_core_utils/logging_worker.py`，已读清）。所以记账 lease 必须绑到**最早的 logging enqueue 边界**并随 queue item 走，`LoggingWorker` 的关停必须成为记账 drain 的一环。
 
 **硬约束**：`LoggingWorker` 是共享 SDK 基础设施（SDK/router/proxy 都用）——**不能 import proxy 类型**，**token=None 纯 SDK 路径必须字节不变**（回归测试守）。
 
-**建议分 4a / 4b 两个 TDD 切片**：
+实现按 4a / 4b 两个 TDD 切片完成：
 
 **切片 4a（基础，先做）**：
-- 定义中立 `CompletionToken` Protocol（`settle() -> None`，放 core-utils 或 logging_worker.py 内，**不依赖 proxy**）——proxy 的 `AccountingLease.settle()` 已结构满足
+- 先做纯重构子步：`LoggingTask` 从 `TypedDict` 改 `frozen dataclass(slots=True)`，改掉全部 `task["coroutine"]`/`task["context"]` 访问为属性访问，跑既有 LoggingWorker 测试证明无行为变化；再做 token 行为子步，避免把机械迁移与生命周期改动混在一个红灯里
+- 定义中立 `CompletionToken` Protocol（`settle() -> None`，放 core-utils 或 `logging_worker.py` 内，**不依赖 proxy**）——proxy 的 `AccountingLease.settle()` 已结构满足。冻结 spec §B 早期文本曾写 `settle(outcome)`，这里裁决为无参 `settle()`：token 只表达「该 queue item 已终结」，三变体 outcome 由 worker/supervisor 的 drain 结果在高层表达
 - `LoggingTask` 从 `TypedDict` 改 `frozen dataclass(slots=True)`，加 `token: CompletionToken | None = None`；改掉全部 `task["coroutine"]`/`task["context"]` 访问（`_process_log_task` L91、`_process_single_task` L304、`clear_queue` L389、`_flush_on_exit` L501）为 `task.coroutine`/`task.context`
 - `enqueue(coroutine, *, token=None)` + `ensure_initialized_and_enqueue(coroutine, *, token=None)`；`token` 存进 `LoggingTask`
-- token 在**每条终结路径**的 finally `settle()`（非空才 settle，幂等）：`_process_log_task`（正常处理完）、`clear_queue`、`_process_single_task`（aggressive-clear）、`_retry_enqueue_task` 无 loop drop（L244）、`_ensure_queue` 换 loop 丢旧 queue（L74）、`_handle_queue_full`/`_schedule_delayed_enqueue_retry` 的 no-loop drop（L232-234）
+- **唯一所有权规则**：token 随 `LoggingTask` 走，只在 callback 真正结束（成功、异常、超时、取消）或该 task 被确定丢弃时 settle；转交到 retry/aggressive-clear helper 时不得提前 settle。所有终结路径都必须先 `close()` 未执行的 coroutine，再 settle 非空 token；`settle()` 幂等但每条路径仍应只有一个逻辑 owner
+- callback 执行终结路径：`_process_log_task`、`clear_queue`、`_process_single_task`、`_flush_on_exit` 的每个已取出 item，均在各自 finally settle；`clear_queue` 必须在清空局部 `task` 引用前 settle
+- drop/rebind 终结路径：`enqueue()` 发现 queue 未初始化、`_schedule_delayed_enqueue_retry()` 无 running loop、`_retry_enqueue_task()` 醒来后 queue 已不存在、`_ensure_queue()` 换 loop 丢旧 queue、`_flush_on_exit()` 达到时间/迭代上限后的全部剩余 item。loop rebind 必须保存旧 queue，再逐项 `get_nowait()`、`task_done()`、close+settle，不能直接丢 queue 引用
+- queue-full aggressive-clear 还有一个与 4b 正确性直接相关的预存缺陷：`new_task` 从未 put 入 queue，却与 extracted queue items 一样在 `_process_single_task` 调 `task_done()`，会让 unfinished counter 少 1、使 `flush()`/`quiesce()` 提前返回。4a 必须让处理函数显式区分 queue-owned item 与 direct `new_task`，只有前者调用 `task_done()`
+- retry/aggressive-clear helper task 必须进强引用 task set并在完成时自移除；否则 4b 无法按契约 cancel+await helper，helper 也可能被 GC 或在 quiesce 判空后重新入队
 - 回归测试：`token=None` 时 enqueue/flush/stop 行为与改动前完全一致；`token` 提供时处理后被 settle、各 drop 路径也 settle
 - **注意评审 major**：测试若要人为阻止 dequeue，用 `LoggingWorker(concurrency=1)` 并在 start 后取唯一 semaphore permit（默认 concurrency=100，只 acquire 一次挡不住）
 
 **切片 4b（quiesce）**：
-- 新增 `quiesce(deadline_remaining, admission_policy) -> LoggingDrainOutcome`（**不复用** `flush`/`stop`）：关 proxy root logging admission；正常阶段等 `queue.join()` 让已登记 item 执行；deadline 后**不再执行 queued coroutine**，逐项 `close()` + settle token + `task_done()`；cancel worker processing + retry + aggressive-clear task 并 await settlement
+- 新增 `quiesce(*, deadline_remaining, is_force_exit, admission_policy, downstream_is_quiescent) -> LoggingDrainOutcome`（**不复用** `flush`/`stop`）：关 proxy root logging admission；正常阶段让已登记 item 执行；deadline 后**不再执行 queued coroutine**，逐项 `close()` + settle token + `task_done()`；cancel worker processing + retry + aggressive-clear task 并 await settlement。`is_force_exit` 是三变体 outcome 所必需的独立输入，不能从 deadline 推断
 - `_worker_loop` 的 `except CancelledError: await clear_queue()`（L130-133）加 **quiesced 状态**：quiesce 态下取消只 drop+settle，**禁止 `clear_queue()` 跑业务 callback**（评审 blocker：否则 deadline 后仍执行 callback 撞 teardown）
 - 新增 `stop_after_quiesce()` 供 Task 10 显式停 worker loop
 - 统一 retry admission：`_retry_enqueue_task`（L236）现在直接 `put_nowait` 绕过 admission——改为统一入口检查 admission/quiesced（评审 blocker）
-- fixed-point **联合** LoggingWorker + supervisor（不只查 supervisor）
+- fixed-point 必须**联合** LoggingWorker + supervisor（不只查任一方）：worker 不能 import proxy supervisor，故 `quiesce` 接收中立的 downstream-quiescent 观察回调；只有 `queue unfinished == 0`、processing/retry/aggressive-clear helper 均空、supervisor task/admission 均空，并在 `await sleep(0)` 后复检仍稳定，才可返回 `Drained`。单纯「先 `queue.join()` 返回，再 `supervisor.drain()`」存在 producer 在两次检查之间重新 enqueue/spawn 的竞态，不是可接受实现
 - `LoggingDrainOutcome` 与 supervisor 一致的三变体
 - 普通 `flush()` 语义保持不变（全仓 `flush()` 仅 3 处**测试**调用，无生产调用方，安全）
 

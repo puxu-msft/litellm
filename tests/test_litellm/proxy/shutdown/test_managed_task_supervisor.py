@@ -34,6 +34,27 @@ async def test_acquire_root_lease_returns_valid_lease_while_admission_open():
 
 
 @pytest.mark.asyncio
+async def test_is_quiescent_observes_running_task_until_completion():
+    sup = ManagedTaskSupervisor()
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def _root():
+        started.set()
+        await finish.wait()
+
+    assert sup.is_quiescent() is True
+    sup.spawn_root(_root())
+    await started.wait()
+    assert sup.is_quiescent() is False
+
+    finish.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert sup.is_quiescent() is True
+
+
+@pytest.mark.asyncio
 async def test_acquire_root_lease_returns_none_after_root_admission_closed():
     sup = ManagedTaskSupervisor()
     sup.close_root_admission()

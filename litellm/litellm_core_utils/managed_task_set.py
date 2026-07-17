@@ -16,12 +16,12 @@ import asyncio
 
 class ManagedTaskSet:
     def __init__(self) -> None:
-        # mutable-ok: a live registry of in-flight tasks is inherently mutable —
+        # mutable-ok: a live registry of in-flight tasks is inherently mutable -
         # tasks are added as they spawn and discarded as they finish, so there
         # is no one-shot immutable construction that models it.
-        self._tasks: "set[asyncio.Task]" = set()
+        self._tasks: set[asyncio.Task[object]] = set()
 
-    def add(self, task: "asyncio.Task") -> None:
+    def add(self, task: asyncio.Task[object]) -> None:
         self._tasks.add(task)
         # discard (not remove) so a task that was already cancel-drained out of
         # the set by cancel_all_and_count_failures doesn't raise on its late
