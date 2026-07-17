@@ -57,9 +57,7 @@ async def test_direct_increment_runs_when_reservation_reconcile_hits_redis_failu
     monkeypatch.setattr(proxy_server, "prisma_client", None)
     monkeypatch.setattr(proxy_server, "user_api_key_cache", DualCache())
     monkeypatch.setattr(proxy_server.spend_counter_cache, "redis_cache", flaky_redis)
-    proxy_server.spend_counter_cache.in_memory_cache.set_cache(
-        key=counter_key, value=reserved_cost
-    )
+    proxy_server.spend_counter_cache.in_memory_cache.set_cache(key=counter_key, value=reserved_cost)
 
     budget_reservation = {
         "reserved_cost": reserved_cost,
@@ -85,3 +83,31 @@ async def test_direct_increment_runs_when_reservation_reconcile_hits_redis_failu
 
     enforced_spend = await flaky_redis.async_get_cache(key=counter_key)
     assert enforced_spend == response_cost
+
+
+@pytest.mark.asyncio
+async def test_reserve_counter_returns_none_without_typeerror_during_shutdown(monkeypatch):
+    """Regression: _increment_spend_counter_cache short-circuits to None during
+    shutdown; _reserve_counter does `float(reserved_value)` on it, so returning
+    anything non-float-able (an earlier tagged dataclass) would raise TypeError,
+    fall into the except branch, log with exc_info and re-touch Redis — exactly
+    the shutdown spam/teardown race the guard is meant to remove. The reserve
+    must instead cleanly skip (return None)."""
+    from litellm.proxy.spend_tracking.budget_reservation import _BudgetCounter, _reserve_counter
+
+    counter = _BudgetCounter(
+        counter_key="spend:key:shutdown",
+        max_budget=10.0,
+        fallback_spend=0.0,
+        entity_type="Key",
+        entity_id="k",
+    )  # no source_cache_key / window -> goes straight to _increment_spend_counter_cache
+
+    proxy_server.GracefulShutdownManager.reset()
+    proxy_server.GracefulShutdownManager.start_shutdown()
+    try:
+        result = await _reserve_counter(counter, reservation_cost=1.0)
+    finally:
+        proxy_server.GracefulShutdownManager.reset()
+
+    assert result is None

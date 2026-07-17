@@ -1097,8 +1097,9 @@ async def test_increment_spend_counter_cache_redis_error_raises_and_invalidates(
 async def test_increment_spend_counter_cache_skips_during_shutdown(monkeypatch):
     """During shutdown the redis touch is skipped entirely — async_increment is
     never called (so no ClientNotConnectedError/redis 'Connection closed' spam),
-    and a distinguishable AccountingSkippedDuringShutdown is returned. The redis
-    mock is armed to raise, so a regression that drops the guard fails loudly."""
+    and None is returned (the existing "skip" signal every caller handles). The
+    redis mock is armed to raise, so a regression that drops the guard fails
+    loudly."""
     fake_cache = _make_spend_counter_cache(redis_increment_side_effect=RuntimeError("would spam"))
     monkeypatch.setattr(ps, "spend_counter_cache", fake_cache)
     ps.GracefulShutdownManager.reset()
@@ -1108,7 +1109,7 @@ async def test_increment_spend_counter_cache_skips_during_shutdown(monkeypatch):
     finally:
         ps.GracefulShutdownManager.reset()
 
-    assert result == ps.AccountingSkippedDuringShutdown(reason="spend_counter_increment_skipped_during_shutdown")
+    assert result is None
     fake_cache.redis_cache.async_increment.assert_not_called()
 
 

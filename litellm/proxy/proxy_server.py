@@ -474,7 +474,6 @@ from litellm.proxy.rerank_endpoints.endpoints import router as rerank_router
 from litellm.proxy.response_api_endpoints.endpoints import router as response_router
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.search_endpoints.endpoints import router as search_router
-from litellm.proxy.shutdown.accounting_outcome import AccountingSkippedDuringShutdown
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
 from litellm.proxy.spend_tracking.spend_management_endpoints import (
@@ -2663,15 +2662,21 @@ async def _is_spend_counter_cache_warm(counter_key: str) -> bool:
     return spend_counter_cache.in_memory_cache.get_cache(key=counter_key) is not None
 
 
-async def _increment_spend_counter_cache(counter_key: str, increment: float) -> Union[float, AccountingSkippedDuringShutdown]:
+async def _increment_spend_counter_cache(counter_key: str, increment: float) -> Optional[float]:
     if GracefulShutdownManager.is_shutting_down():
         # Skip the redis/DB touch entirely while tearing down: the connection
         # is likely gone (or about to be), so calling async_increment here just
         # raises a ClientNotConnectedError/redis ConnectionError and spams the
-        # shutdown log. Callers discard the return value; spec accepts the
-        # small spend-tracking loss during shutdown. Phase 1b replaces this
+        # shutdown log. Returns None (the existing "skip" signal every caller
+        # already handles: bare-await callers ignore it, _reserve_counter treats
+        # None as "reservation unavailable"). Spec accepts the small
+        # spend-tracking loss during shutdown; Phase 1b replaces this
         # transitional skip with a proper drain of in-flight accounting.
-        return AccountingSkippedDuringShutdown(reason="spend_counter_increment_skipped_during_shutdown")
+        verbose_proxy_logger.info(
+            "spend_counter_increment_skipped_during_shutdown counter_key=%s",
+            counter_key,
+        )
+        return None
     if spend_counter_cache.redis_cache is not None:
         try:
             current_value = await spend_counter_cache.redis_cache.async_increment(
