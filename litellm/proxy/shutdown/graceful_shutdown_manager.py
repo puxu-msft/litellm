@@ -147,7 +147,13 @@ class GracefulShutdownManager:
         cls._drain_performed = True
 
         if timeout is None:
-            timeout = cls.get_timeout()
+            # Consume the single frozen shutdown deadline rather than opening a
+            # fresh full window: DrainingServer.shutdown() already spent part of
+            # the deadline on uvicorn's connection drain, so wait_for_drain must
+            # only wait for whatever remains (and 0 once a second SIGINT forced
+            # exit). Falls back to get_timeout() when shutdown was never started
+            # through start_shutdown() (e.g. a bare /health/drain probe).
+            timeout = cls.deadline_remaining() if cls._deadline is not None else cls.get_timeout()
         if count_fn is None:
             count_fn = get_in_flight_requests
 

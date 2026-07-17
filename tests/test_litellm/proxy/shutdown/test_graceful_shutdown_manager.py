@@ -223,3 +223,34 @@ def test_reset_clears_deadline_and_force_exit(monkeypatch):
     GracefulShutdownManager.reset()
     assert GracefulShutdownManager.deadline_remaining() == 0.0
     assert GracefulShutdownManager.is_force_exit() is False
+
+
+@pytest.mark.asyncio
+async def test_wait_for_drain_no_arg_consumes_remaining_frozen_deadline(monkeypatch):
+    """After start_shutdown freezes the deadline (and uvicorn's connection drain
+    has already spent part of it), a no-arg wait_for_drain must wait only the
+    REMAINING deadline, not open a fresh full timeout window — otherwise the
+    total shutdown window is uvicorn-drain + full-timeout, breaking the single
+    frozen-deadline bound."""
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "0.3")
+    GracefulShutdownManager.start_shutdown()
+    time.sleep(0.2)  # simulate the deadline partly consumed by uvicorn's drain
+
+    start = time.monotonic()
+    # counter never drains -> it waits out the REMAINING (~0.1s), not a fresh 0.3s
+    await GracefulShutdownManager.wait_for_drain(count_fn=lambda: 5)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.25  # remaining ~0.1s; a regression to get_timeout() would wait ~0.3s
+
+
+@pytest.mark.asyncio
+async def test_wait_for_drain_no_arg_returns_immediately_on_force_exit(monkeypatch):
+    """A second SIGINT (force exit) collapses the remaining deadline to 0, so a
+    no-arg wait_for_drain must not block at all."""
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "30")
+    GracefulShutdownManager.start_shutdown()
+    GracefulShutdownManager.request_force_exit()
+
+    start = time.monotonic()
+    await GracefulShutdownManager.wait_for_drain(count_fn=lambda: 5)
+    assert time.monotonic() - start < 0.2
