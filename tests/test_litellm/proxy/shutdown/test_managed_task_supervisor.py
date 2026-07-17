@@ -17,6 +17,9 @@ import asyncio
 import pytest
 
 from litellm.proxy.shutdown.managed_task_supervisor import (
+    Drained,
+    DeadlineExceeded,
+    ForcedExit,
     ManagedTaskSupervisor,
     current_accounting_scope,
 )
@@ -141,4 +144,103 @@ async def test_spawn_root_drops_and_closes_coroutine_when_admission_closed():
     sup.spawn_root(_root())
     await asyncio.sleep(0.01)
     assert ran is False
+    assert sup.active_task_count() == 0
+
+
+# ── drain / fixed-point ──────────────────────────────────────────────────────
+
+
+def _never_force() -> bool:
+    return False
+
+
+@pytest.mark.asyncio
+async def test_drain_returns_drained_immediately_when_empty():
+    sup = ManagedTaskSupervisor()
+    outcome = await sup.drain(deadline_remaining=lambda: 5.0, is_force_exit=_never_force)
+    assert isinstance(outcome, Drained)
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_inflight_children_then_returns_drained():
+    """The core teardown guarantee: drain does not return until the root AND its
+    detached children have finished, so DB/cache teardown can't race them."""
+    sup = ManagedTaskSupervisor()
+    child_done = asyncio.Event()
+
+    async def _child():
+        await asyncio.sleep(0.05)
+        child_done.set()
+
+    async def _root():
+        sup.spawn_child(current_accounting_scope.get(), _child())
+
+    sup.spawn_root(_root())
+    await asyncio.sleep(0)  # root scheduled
+    outcome = await sup.drain(deadline_remaining=lambda: 5.0, is_force_exit=_never_force)
+    assert isinstance(outcome, Drained)
+    assert child_done.is_set() is True  # drain waited for the child
+    assert sup.active_task_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_deadline_exceeded_cancels_remaining_and_reports_counts():
+    sup = ManagedTaskSupervisor()
+
+    async def _hang():
+        await asyncio.sleep(100)
+
+    async def _root():
+        sup.spawn_child(current_accounting_scope.get(), _hang())
+        await asyncio.sleep(100)
+
+    sup.spawn_root(_root())
+    await asyncio.sleep(0.01)  # root + child both parked
+    outcome = await sup.drain(deadline_remaining=lambda: 0.0, is_force_exit=_never_force)
+    assert isinstance(outcome, DeadlineExceeded)
+    assert outcome.cancelled >= 2  # root + child
+    assert outcome.cancellation_failed == 0
+    assert sup.active_task_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_force_exit_returns_forced_exit_variant():
+    sup = ManagedTaskSupervisor()
+
+    async def _hang():
+        await asyncio.sleep(100)
+
+    sup.spawn_root(_hang())
+    await asyncio.sleep(0.01)
+    outcome = await sup.drain(deadline_remaining=lambda: 30.0, is_force_exit=lambda: True)
+    assert isinstance(outcome, ForcedExit)
+    assert outcome.cancelled >= 1
+    assert sup.active_task_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_deadline_hard_shutdown_stops_new_children_during_cancel():
+    """When drain hits the deadline it hard-shuts-down first, so a task caught
+    mid-run cannot smuggle a new child past the cancellation."""
+    sup = ManagedTaskSupervisor()
+    smuggled_child_ran = False
+
+    async def _smuggled_child():
+        nonlocal smuggled_child_ran
+        smuggled_child_ran = True
+
+    async def _smuggle():
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            # try to spawn a child on the way out — must be dropped (scope now invalid)
+            sup.spawn_child(current_accounting_scope.get(), _smuggled_child())
+            raise
+
+    sup.spawn_root(_smuggle())
+    await asyncio.sleep(0.01)
+    outcome = await sup.drain(deadline_remaining=lambda: 0.0, is_force_exit=_never_force)
+    await asyncio.sleep(0.01)  # give any (wrongly) admitted child a chance to run
+    assert isinstance(outcome, DeadlineExceeded)
+    assert smuggled_child_ran is False
     assert sup.active_task_count() == 0

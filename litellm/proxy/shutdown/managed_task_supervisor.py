@@ -23,9 +23,35 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import dataclasses
-from typing import Coroutine, Optional
+from typing import Callable, Coroutine, Optional
 
 from litellm.proxy.shutdown.managed_task_set import ManagedTaskSet
+
+_DRAIN_POLL_INTERVAL_SECONDS = 0.02
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Drained:
+    """Every accounting task finished on its own before the deadline."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DeadlineExceeded:
+    """The shutdown deadline elapsed with work still running; it was cancelled."""
+
+    cancelled: int
+    cancellation_failed: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ForcedExit:
+    """A second SIGINT forced exit while draining; remaining work was cancelled."""
+
+    cancelled: int
+    cancellation_failed: int
+
+
+DrainOutcome = Drained | DeadlineExceeded | ForcedExit
 
 
 class AccountingLease:
@@ -121,6 +147,47 @@ class ManagedTaskSupervisor:
             self._spawn_tracked(coro)
         finally:
             self._admissions_in_progress -= 1
+
+    # ── drain ────────────────────────────────────────────────────────────────
+
+    async def drain(
+        self,
+        deadline_remaining: "Callable[[], float]",
+        is_force_exit: "Callable[[], bool]",
+    ) -> "DrainOutcome":
+        """
+        Wait for all accounting work to finish, or cancel it once the shutdown
+        deadline elapses (or a second SIGINT forces exit). Fixed-point: only
+        return Drained when the task set is empty AND no spawn is mid-flight,
+        re-checked after a loop tick so a child being admitted right now isn't
+        missed.
+        """
+        while True:
+            if is_force_exit():
+                return await self._cancel_and_settle(forced=True)
+            if deadline_remaining() <= 0:
+                return await self._cancel_and_settle(forced=False)
+            if self._is_quiescent():
+                # Confirm stability across one event-loop tick: a parent about to
+                # spawn its last child is still in the task set, so this only
+                # returns when nothing can produce more work.
+                await asyncio.sleep(0)
+                if self._is_quiescent():
+                    return Drained()
+            await asyncio.sleep(min(_DRAIN_POLL_INTERVAL_SECONDS, max(deadline_remaining(), 0.0)))
+
+    def _is_quiescent(self) -> bool:
+        return len(self._tasks) == 0 and self._admissions_in_progress == 0
+
+    async def _cancel_and_settle(self, *, forced: bool) -> "DrainOutcome":
+        # Hard-shutdown first so any task caught mid-run cannot smuggle a new
+        # child past the cancellation (every scope becomes invalid).
+        self.begin_hard_shutdown()
+        cancelled = len(self._tasks)
+        cancellation_failed = await self._tasks.cancel_all_and_count_failures()
+        if forced:
+            return ForcedExit(cancelled=cancelled, cancellation_failed=cancellation_failed)
+        return DeadlineExceeded(cancelled=cancelled, cancellation_failed=cancellation_failed)
 
     # ── internals ────────────────────────────────────────────────────────────
 
