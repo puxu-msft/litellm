@@ -802,7 +802,7 @@ def request_started(data: Any, call_type: Any = None) -> None:
         return
     provider = str(data.get("model") or "").split("/", 1)[0] if "/" in str(data.get("model") or "") else "?"
     surface = "anthropic" if call_type == "anthropic_messages" else _short_call_type(str(call_type))
-    model_label = f"{surface}/{_short_model(data.get('model'))} · {_short_provider(provider)}"
+    model_label = f"{surface}/{_short_model(data.get('model'))}@{_short_provider(provider)}"
     _LIVE_DISPLAY.start(
         call_id,
         model_label,

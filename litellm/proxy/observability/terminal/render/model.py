@@ -106,7 +106,7 @@ def format_footer(groups: tuple[InFlightGroup, ...], *, width: int) -> str:
     rendered: tuple[str, ...] = ()
     for index, group in enumerate(ordered):
         item = (
-            f"{group.surface}/{group.model} · {group.provider}"
+            f"{group.surface}/{group.model}@{group.provider}"
             f"{' ×' + str(group.count) if group.count > 1 else ''} {group.oldest_elapsed_seconds:.2f}s"
         )
         remaining = len(ordered) - index - 1

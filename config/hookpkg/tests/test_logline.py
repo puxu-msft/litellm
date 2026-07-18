@@ -199,13 +199,13 @@ class TestFormatLine(unittest.TestCase):
         )
         self.assertEqual(
             line,
-            "[ OK ] 17:18:53 ■ 7K3M anthropic/claude-sonnet-5 · ghc 200 3.42s "
+            "[ OK ] 17:18:53 ■ 7K3M anthropic/claude-sonnet-5@ghc 200 3.42s "
             "↑338.2KB ↓11.0KB ↑2+104.7k+534 ↻0%+99%+1% ↓370 end_turn",
         )
 
     def test_meta_replaces_repeated_provider_and_tail_calltype(self):
         line = format_line(self._slp(), "end_turn", self._usage())
-        self.assertIn("anthropic/claude-sonnet-5 · ghc", line)
+        self.assertIn("anthropic/claude-sonnet-5@ghc", line)
         self.assertNotIn("github_copilot", line)
         self.assertNotIn("anthropic_messages", line)  # call_type 已缩写并移到头部
 
@@ -345,7 +345,7 @@ class TestLogSuccessEndToEnd(unittest.TestCase):
         self.assertEqual(len(self.cap.messages), 1)
         msg = _strip_ansi(self.cap.messages[0])
         self.assertIn("[ OK ]", msg)
-        self.assertIn("anthropic/claude-sonnet-5 · ghc 200", msg)
+        self.assertIn("anthropic/claude-sonnet-5@ghc 200", msg)
         self.assertIn("↑10+900+90", msg)   # creation+read+fresh
         self.assertIn("↻1%+90%+9%", msg)
         self.assertIn("↓20", msg)
@@ -398,7 +398,7 @@ class TestLogFailureEndToEnd(unittest.TestCase):
         self.assertEqual(len(self.cap.messages), 1)
         message = _strip_ansi(self.cap.messages[0])
         self.assertIn("[FAIL]", message)
-        self.assertIn("anthropic/claude-opus-4.8 · ghc 429", message)
+        self.assertIn("anthropic/claude-opus-4.8@ghc 429", message)
         self.assertTrue(message.endswith("x" * 200))
 
     def test_formatting_failure_still_discards_inflight_request(self):

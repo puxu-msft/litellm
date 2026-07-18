@@ -1,0 +1,58 @@
+general_settings:
+  master_key: admin
+  database_url: "postgresql://xp@localhost:5432/litellm"
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
+
+litellm_settings:
+  drop_params: true
+  callbacks: hooks.proxy_handler_instance
+
+  cache: true
+  cache_params:
+    type: redis
+    host: os.environ/REDIS_HOST
+    port: os.environ/REDIS_PORT
+    password: os.environ/REDIS_PASSWORD
+    namespace: "litellm.cache"
+    ttl: 3600
+
+router_settings:
+  model_group_alias:
+    opus: github_copilot/claude-opus-4.8
+    claude-opus-4-8: github_copilot/claude-opus-4.8
+    claude-opus-4.8: github_copilot/claude-opus-4.8
+    sonnet: github_copilot/claude-sonnet-5
+    claude-sonnet-5: github_copilot/claude-sonnet-5
+    haiku: github_copilot/claude-haiku-4.5
+    claude-haiku-4-5: github_copilot/claude-haiku-4.5
+    claude-haiku-4.5: github_copilot/claude-haiku-4.5
+    claude-haiku-4-5-20251001: github_copilot/claude-haiku-4.5
+    gpt: github_copilot/gpt-5.6-sol
+    gpt-5.5: github_copilot/gpt-5.6-sol
+
+model_list:
+  - model_name: config/gpt-5.5
+    litellm_params:
+      model: github_copilot/gpt-5.5
+    model_info:
+      mode: responses
+
+  - model_name: config/claude-opus-4-8
+    litellm_params:
+      model: github_copilot/claude-opus-4.8
+    model_info:
+      mode: chat
+      supported_endpoints:
+        - /v1/chat/completions
+        - /v1/messages
+
+  - model_name: config/claude-sonnet-5
+    litellm_params:
+      model: github_copilot/claude-sonnet-5
+    model_info:
+      mode: chat
+      supported_endpoints:
+        - /v1/chat/completions
+        - /v1/messages
+

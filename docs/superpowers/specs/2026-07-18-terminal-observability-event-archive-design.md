@@ -231,13 +231,13 @@ renderer 异常最多原地重建一次；再次失败停止 Live、恢复原 ha
 字段采用会话优先顺序：
 
 ```text
-[ OK ] 17:18:53 ■ 7K3M anthropic/claude-opus-4.8 · ghc 200 27.30s ttft:1.24s ↑1.5MB ↓17.6KB ↑2+567.3k+4.7k ↻0%+99%+1% ↓1.8k tool_use(Bash,Bash,Read) think:enc(1)
+[ OK ] 17:18:53 ■ 7K3M anthropic/claude-opus-4.8@ghc 200 27.30s ttft:1.24s ↑1.5MB ↓17.6KB ↑2+567.3k+4.7k ↻0%+99%+1% ↓1.8k tool_use(Bash,Bash,Read) think:enc(1)
 ```
 
 - marker：`[ OK ]`、`[FAIL]`、`[CANC]`、`[TIME]`；`shutdown_dropped` 使用 `[CANC]` 并附 reason
 - 时间：本地完成时间 `HH:mm:ss`；JSON/SQLite 保存 UTC ISO 与 monotonic timing
 - session：`■ short-hash`；无 session 为 `□ ----`
-- identity：逻辑 API surface/model + provider badge，例如 `anthropic/claude-opus-4.8 · ghc`
+- identity：逻辑 API surface/model + provider badge，例如 `anthropic/claude-opus-4.8@ghc`
 - HTTP：客户端最终状态；有上游重试才附 `retry(429×2,timeout×1)`，按发生顺序保留不同原因并折叠相邻同类
 - duration：固定两位小数；流式请求在 downstream 首次真实 yield 时自行计时并显示可靠 TTFT；generation timing 进入 archive/JSON，不默认占行
 - session badge 后各字段使用稳定语义 style；慢请求固定阈值默认 ≥10s 黄、≥30s 红，可配置
@@ -254,7 +254,7 @@ renderer 异常最多原地重建一次；再次失败停止 Live、恢复原 ha
 ### 11.4 在途 footer 契约
 
 ```text
-[ .. ] 3 in-flight  anthropic/claude-opus-4.8 · ghc ×2 12.40s  responses/gpt-5.6-sol · ghc 2.10s
+[ .. ] 3 in-flight  anthropic/claude-opus-4.8@ghc ×2 12.40s  responses/gpt-5.6-sol@ghc 2.10s
 ```
 
 按 `surface + model + provider` 聚合，不按 session 拆组，也不在 footer 显示 session。每组只显示最早请求 elapsed；最久组优先。4Hz 刷新，elapsed 固定两位小数。宽度不足时保留最久的若干完整组，尾部显示 `+N groups`；不得硬截断半个字段或轮播。阶段详情只进 archive/JSON，不在 footer 展示。

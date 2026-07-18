@@ -39,7 +39,7 @@ def _record() -> CompletionRecord:
 
 def test_completion_golden_text() -> None:
     assert format_completion(_record()) == (
-        "[ OK ] 17:18:53 ■ 7K3M anthropic/claude-opus-4.8 · ghc 200 27.30s ttft:1.24s "
+        "[ OK ] 17:18:53 ■ 7K3M anthropic/claude-opus-4.8@ghc 200 27.30s ttft:1.24s "
         "↑1.5MB ↓17.6KB ↑2+567.3k+4.7k ↻0%+99%+1% ↓1.8k tool_use(Bash,Bash,Read) think:enc(1)"
     )
 
