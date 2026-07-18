@@ -10,6 +10,13 @@ from typing import Any, Optional
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from litellm.proxy.middleware.in_flight_registry import (
+    GLOBAL_IN_FLIGHT_REGISTRY,
+    InFlightRegistry,
+    RequestTerminalReason,
+)
+from litellm.proxy.observability.terminal.bootstrap import bootstrap_shadow_from_env
+
 
 class InFlightRequestsMiddleware:
     """
@@ -30,8 +37,10 @@ class InFlightRequestsMiddleware:
     _gauge: Optional[Any] = None
     _gauge_init_attempted: bool = False
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, registry: InFlightRegistry = GLOBAL_IN_FLIGHT_REGISTRY) -> None:
         self.app = app
+        self.registry = registry
+        self.shadow_bootstrap = bootstrap_shadow_from_env(registry)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -39,12 +48,23 @@ class InFlightRequestsMiddleware:
             return
 
         InFlightRequestsMiddleware._in_flight += 1
+        client = scope.get("client")
+        record = self.registry.register(
+            method=scope.get("method", ""),
+            path=scope.get("path", ""),
+            client_ip=client[0] if client else None,
+        )
         gauge = InFlightRequestsMiddleware._get_gauge()
         if gauge is not None:
             gauge.inc()  # type: ignore
+        terminal_reason = RequestTerminalReason.COMPLETED
         try:
             await self.app(scope, receive, send)
+        except BaseException:
+            terminal_reason = RequestTerminalReason.FAILED
+            raise
         finally:
+            self.registry.finish(record.id, terminal_reason)
             InFlightRequestsMiddleware._in_flight -= 1
             if gauge is not None:
                 gauge.dec()  # type: ignore

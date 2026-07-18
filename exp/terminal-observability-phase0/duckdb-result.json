@@ -1,0 +1,44 @@
+{
+  "bundled_offline": {
+    "error": "IOException: IO Error: Extension \"/home/xp/.duckdb/extensions/v1.5.4/linux_amd64/sqlite_scanner.duckdb_extension\" not found.\nExtension \"sqlite\" is an existing extension.\n\nInstall it first using \"INSTALL sqlite\".",
+    "passed": false,
+    "rows": []
+  },
+  "duckdb_version": "1.5.4",
+  "offline_policy": {
+    "autoinstall_known_extensions": false,
+    "autoload_known_extensions": false
+  },
+  "passed": true,
+  "sqlite_extension": [],
+  "vendored_offline": {
+    "attempted": true,
+    "auto_align_rows": [
+      [
+        "r1",
+        "opus",
+        null
+      ],
+      [
+        "r2",
+        "sonnet",
+        200
+      ]
+    ],
+    "install_error": null,
+    "load_or_query_error": null,
+    "passed": true,
+    "rows": [
+      [
+        "r1",
+        "opus",
+        null
+      ],
+      [
+        "r2",
+        "sonnet",
+        200
+      ]
+    ]
+  }
+}

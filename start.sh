@@ -22,6 +22,10 @@ export AIOHTTP_KEEPALIVE_TIMEOUT=900
 
 export GHC_REASONING_POC=1
 
+# Durable shadow event archive. The existing hookpkg request log remains the
+# only TTY owner until the Rich renderer cutover gate is completed.
+export LITELLM_TERMINAL_ARCHIVE_DIR="$HOME/.local/share/litellm/terminal-events"
+
 pushd "$(dirname "$0")" || exit 1
 
 uv run --no-sync -- litellm --config "$HOME/.config/litellm/config.yaml" --host 127.0.0.1 --port 4142

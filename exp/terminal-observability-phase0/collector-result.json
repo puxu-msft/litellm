@@ -1,0 +1,195 @@
+{
+  "passed": true,
+  "repeat_count": 3,
+  "runs": [
+    {
+      "modes": [
+        {
+          "collector_pids": [
+            2205881
+          ],
+          "leaked_worker_pids": [],
+          "mode": "direct",
+          "parent_pid": 2205881,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "worker_crashing_count": 0,
+          "worker_pids": [
+            2205881
+          ],
+          "worker_started_count": 1,
+          "worker_stopped_count": 1
+        },
+        {
+          "collector_pids": [
+            2206076
+          ],
+          "leaked_worker_pids": [],
+          "mode": "multiprocess",
+          "parent_pid": 2206076,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "worker_crashing_count": 1,
+          "worker_pids": [
+            2206967,
+            2206968,
+            2208273
+          ],
+          "worker_started_count": 3,
+          "worker_stopped_count": 2
+        },
+        {
+          "collector_pids": [
+            2208318
+          ],
+          "leaked_worker_pids": [],
+          "mode": "reload",
+          "parent_pid": 2208318,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "WARNING:  StatReload detected changes in '/tmp/terminal-collector-reload-vyvqj7ia/reload/trigger.py'. Reloading...\n",
+          "stdout_tail": "",
+          "worker_crashing_count": 0,
+          "worker_pids": [
+            2208371,
+            2208527
+          ],
+          "worker_started_count": 2,
+          "worker_stopped_count": 2
+        }
+      ],
+      "passed": true,
+      "repeat": 1
+    },
+    {
+      "modes": [
+        {
+          "collector_pids": [
+            2208860
+          ],
+          "leaked_worker_pids": [],
+          "mode": "direct",
+          "parent_pid": 2208860,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "worker_crashing_count": 0,
+          "worker_pids": [
+            2208860
+          ],
+          "worker_started_count": 1,
+          "worker_stopped_count": 1
+        },
+        {
+          "collector_pids": [
+            2208957
+          ],
+          "leaked_worker_pids": [],
+          "mode": "multiprocess",
+          "parent_pid": 2208957,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "worker_crashing_count": 1,
+          "worker_pids": [
+            2209387,
+            2209388,
+            2209449
+          ],
+          "worker_started_count": 3,
+          "worker_stopped_count": 2
+        },
+        {
+          "collector_pids": [
+            2209612
+          ],
+          "leaked_worker_pids": [],
+          "mode": "reload",
+          "parent_pid": 2209612,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "WARNING:  StatReload detected changes in '/tmp/terminal-collector-reload-sh3grhyo/reload/trigger.py'. Reloading...\n",
+          "stdout_tail": "",
+          "worker_crashing_count": 0,
+          "worker_pids": [
+            2209940,
+            2209985
+          ],
+          "worker_started_count": 2,
+          "worker_stopped_count": 2
+        }
+      ],
+      "passed": true,
+      "repeat": 2
+    },
+    {
+      "modes": [
+        {
+          "collector_pids": [
+            2210280
+          ],
+          "leaked_worker_pids": [],
+          "mode": "direct",
+          "parent_pid": 2210280,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "worker_crashing_count": 0,
+          "worker_pids": [
+            2210280
+          ],
+          "worker_started_count": 1,
+          "worker_stopped_count": 1
+        },
+        {
+          "collector_pids": [
+            2211516
+          ],
+          "leaked_worker_pids": [],
+          "mode": "multiprocess",
+          "parent_pid": 2211516,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "worker_crashing_count": 1,
+          "worker_pids": [
+            2211627,
+            2211628,
+            2211661
+          ],
+          "worker_started_count": 3,
+          "worker_stopped_count": 2
+        },
+        {
+          "collector_pids": [
+            2212418
+          ],
+          "leaked_worker_pids": [],
+          "mode": "reload",
+          "parent_pid": 2212418,
+          "passed": true,
+          "returncode": 0,
+          "stderr_tail": "WARNING:  StatReload detected changes in '/tmp/terminal-collector-reload-j4efhi8a/reload/trigger.py'. Reloading...\n",
+          "stdout_tail": "",
+          "worker_crashing_count": 0,
+          "worker_pids": [
+            2212924,
+            2212998
+          ],
+          "worker_started_count": 2,
+          "worker_stopped_count": 2
+        }
+      ],
+      "passed": true,
+      "repeat": 3
+    }
+  ]
+}

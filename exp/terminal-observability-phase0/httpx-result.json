@@ -1,0 +1,1083 @@
+{
+  "case_count": 64,
+  "cases": [
+    {
+      "chunk_lengths": [
+        1,
+        51
+      ],
+      "cuts": [
+        1
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        2,
+        50
+      ],
+      "cuts": [
+        2
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        3,
+        49
+      ],
+      "cuts": [
+        3
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        4,
+        48
+      ],
+      "cuts": [
+        4
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        47
+      ],
+      "cuts": [
+        5
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        6,
+        46
+      ],
+      "cuts": [
+        6
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        7,
+        45
+      ],
+      "cuts": [
+        7
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        8,
+        44
+      ],
+      "cuts": [
+        8
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        9,
+        43
+      ],
+      "cuts": [
+        9
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        10,
+        42
+      ],
+      "cuts": [
+        10
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        11,
+        41
+      ],
+      "cuts": [
+        11
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        12,
+        40
+      ],
+      "cuts": [
+        12
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        13,
+        39
+      ],
+      "cuts": [
+        13
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        14,
+        38
+      ],
+      "cuts": [
+        14
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        15,
+        37
+      ],
+      "cuts": [
+        15
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        16,
+        36
+      ],
+      "cuts": [
+        16
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        17,
+        35
+      ],
+      "cuts": [
+        17
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        18,
+        34
+      ],
+      "cuts": [
+        18
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        19,
+        33
+      ],
+      "cuts": [
+        19
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        20,
+        32
+      ],
+      "cuts": [
+        20
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        21,
+        31
+      ],
+      "cuts": [
+        21
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        22,
+        30
+      ],
+      "cuts": [
+        22
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        23,
+        29
+      ],
+      "cuts": [
+        23
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        24,
+        28
+      ],
+      "cuts": [
+        24
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        25,
+        27
+      ],
+      "cuts": [
+        25
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        26,
+        26
+      ],
+      "cuts": [
+        26
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        27,
+        25
+      ],
+      "cuts": [
+        27
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        28,
+        24
+      ],
+      "cuts": [
+        28
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        29,
+        23
+      ],
+      "cuts": [
+        29
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        30,
+        22
+      ],
+      "cuts": [
+        30
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        31,
+        21
+      ],
+      "cuts": [
+        31
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        32,
+        20
+      ],
+      "cuts": [
+        32
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        33,
+        19
+      ],
+      "cuts": [
+        33
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        34,
+        18
+      ],
+      "cuts": [
+        34
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        35,
+        17
+      ],
+      "cuts": [
+        35
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        36,
+        16
+      ],
+      "cuts": [
+        36
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        37,
+        15
+      ],
+      "cuts": [
+        37
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        38,
+        14
+      ],
+      "cuts": [
+        38
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        39,
+        13
+      ],
+      "cuts": [
+        39
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        40,
+        12
+      ],
+      "cuts": [
+        40
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        41,
+        11
+      ],
+      "cuts": [
+        41
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        42,
+        10
+      ],
+      "cuts": [
+        42
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        43,
+        9
+      ],
+      "cuts": [
+        43
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        44,
+        8
+      ],
+      "cuts": [
+        44
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        45,
+        7
+      ],
+      "cuts": [
+        45
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        46,
+        6
+      ],
+      "cuts": [
+        46
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        47,
+        5
+      ],
+      "cuts": [
+        47
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        48,
+        4
+      ],
+      "cuts": [
+        48
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        49,
+        3
+      ],
+      "cuts": [
+        49
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        50,
+        2
+      ],
+      "cuts": [
+        50
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        51,
+        1
+      ],
+      "cuts": [
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": "scripted upstream failure",
+      "fail_after": 0,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": "scripted upstream failure",
+      "fail_after": 1,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": "scripted upstream failure",
+      "fail_after": 2,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": "scripted upstream failure",
+      "fail_after": 3,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": "scripted upstream failure",
+      "fail_after": 4,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [
+        "scripted observer failure"
+      ],
+      "observer_fail_at": 0,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [
+        "scripted observer failure"
+      ],
+      "observer_fail_at": 1,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [
+        "scripted observer failure"
+      ],
+      "observer_fail_at": 2,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [
+        "scripted observer failure"
+      ],
+      "observer_fail_at": 3,
+      "passed": true,
+      "stop_after": null
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": 1
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": 2
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": 3
+    },
+    {
+      "chunk_lengths": [
+        5,
+        6,
+        12,
+        28,
+        1
+      ],
+      "cuts": [
+        5,
+        11,
+        23,
+        51
+      ],
+      "error": null,
+      "fail_after": null,
+      "observer_errors": [],
+      "observer_fail_at": null,
+      "passed": true,
+      "stop_after": 4
+    }
+  ],
+  "chunked_request": {
+    "body_hex": "7b2274657874223a2268c3a96c6c6f227d",
+    "chunk_lengths": [
+      8,
+      4,
+      5
+    ],
+    "passed": true
+  },
+  "expected_request_body_hex": "7b2274657874223a2268c3a96c6c6f227d",
+  "passed": true,
+  "request_body_hex": "7b2274657874223a2268c3a96c6c6f227d",
+  "transport": {
+    "passed": true,
+    "request_chunk_lengths": [
+      12,
+      2,
+      1
+    ],
+    "response_chunk_lengths": [
+      12,
+      10
+    ]
+  },
+  "transport_error": {
+    "error": "scripted transport failure",
+    "passed": true,
+    "request_chunk_lengths": [
+      5,
+      6
+    ]
+  }
+}
