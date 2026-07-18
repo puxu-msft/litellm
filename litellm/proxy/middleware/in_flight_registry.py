@@ -31,6 +31,7 @@ class RequestRecord:
     client_ip: str | None
     started_at_monotonic: float
     started_at_wall: float
+    session_hash: str | None = None
     model: str | None = None
     call_type: str | None = None
     provider: str | None = None
@@ -69,11 +70,12 @@ class InFlightRegistry:
         method: str,
         path: str,
         client_ip: str | None,
+        session_hash: str | None = None,
         id_source: Callable[[], UUID] = uuid4,
         monotonic_clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> RequestRecord:
-        record = RequestRecord(id_source(), method, path, client_ip, monotonic_clock(), wall_clock())
+        record = RequestRecord(id_source(), method, path, client_ip, monotonic_clock(), wall_clock(), session_hash)
         self._records = (*self._records, record)
         self._publish(record, None)
         return record

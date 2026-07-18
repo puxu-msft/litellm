@@ -29,10 +29,15 @@ class RichLiveRenderer:
         if self._degraded:
             return RendererDegraded("renderer permanently degraded")
         try:
-            self._live = Live(Text(footer), console=self._console, refresh_per_second=self._refresh_hz)
+            self._live = Live(
+                Text(footer),
+                console=self._console,
+                refresh_per_second=self._refresh_hz,
+                transient=True,
+            )
             self._live.start(refresh=True)
             return RendererStarted()
-        except Exception as exception:
+        except Exception as exception:  # noqa: BLE001 - renderer failure degrades without affecting requests
             return self._handle_failure(exception)
 
     def update(self, footer: str) -> RendererStarted | RendererDegraded:
@@ -41,14 +46,14 @@ class RichLiveRenderer:
         try:
             self._live.update(Text(footer), refresh=True)
             return RendererStarted()
-        except Exception as exception:
+        except Exception as exception:  # noqa: BLE001 - renderer failure degrades without affecting requests
             return self._handle_failure(exception)
 
     def log(self, line: str) -> RendererStarted | RendererDegraded:
         try:
             self._console.print(Text.from_ansi(line))
             return RendererStarted()
-        except Exception as exception:
+        except Exception as exception:  # noqa: BLE001 - renderer failure degrades without affecting requests
             return self._handle_failure(exception)
 
     def stop(self) -> None:

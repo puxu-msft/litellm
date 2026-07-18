@@ -1,6 +1,6 @@
 # 终端可观测、跨 worker 事件档案与请求档案实施计划
 
-状态：已冻结；两轮独立评审完成（round-1：0 blocker/2 major，全部闭合；round-2：0 blocker/0 major，结论“可冻结”），可从 Phase 1 kick-off 实施
+状态：✅ 全部实施完成并 live 验收。设计/计划评审 findings 全部闭合；核心提交 `ab12036bc1`，最终接线提交见 git history。当前单机 standalone 已启用 Rich TTY、InFlightRegistry、durable shadow archive、四边界 capture、SQL/Web查询与replay primitives
 
 日期：2026-07-18
 
@@ -284,7 +284,7 @@ litellm/proxy/observability/terminal/
 
 ## 4. Phase 3 — Rich renderer（显式实验开关，PoC 默认 owner）
 
-状态：✅ primitives 已完成，未接生产 owner。Golden completion/footer、单 Console Live 与 handler restore 测试通过；PoC 仍唯一 TTY owner。
+状态：✅ 已完成并切换生产 owner。Rich `Console+Live` 接管 request footer；PTY+pyte 屏幕测试验证多行日志、footer update与stop清理；旧DECSTBM类仅保留回归对照
 
 ### Task 3.1：Render model 与响应式布局
 
@@ -315,7 +315,7 @@ litellm/proxy/observability/terminal/
 
 ## 5. Phase 4 — 四边界 capture 与 GitHub Copilot httpx observer
 
-状态：✅ capture primitives 已完成，未接 shared production transport。ASGI client边界、github_copilot-gated AsyncBaseTransport、observer fail-open与最终语义工具/thinking摘要均有typed测试。
+状态：✅ 已完成并接生产 transport。真实 Claude stream请求在同一request ID下持久化 client request/upstream request/upstream response/client response四边界，终态completed
 
 ### Task 4.1：客户端 ingress/final downstream observer
 
@@ -350,7 +350,7 @@ litellm/proxy/observability/terminal/
 
 ## 6. Phase 5 — Uvicorn main-process collector、Unix IPC 与 worker spool
 
-状态：✅ IPC/spool replay primitives 已完成，生产uvicorn runner接线留到最终cutover。Unix range/ack、durable ack后compact、断连保留pending均有真实socket测试；Phase0 runner三拓扑合同保留。
+状态：✅ 已完成。Unix range/ack、durable ack后compact、断连保留pending均有真实socket测试；Phase0 direct/multiprocess/reload三拓扑连续三轮验证父进程单owner与worker replacement
 
 ### Task 5.1：把 Phase 0 ownership接入正式 runner
 
@@ -378,6 +378,8 @@ Phase 0九-run oracle迁入正式测试；连续运行；无 orphan process/sock
 
 ## 7. Phase 6 — DuckDB query coordinator、公开 SQL 与 Web inspector
 
+状态：✅ 已完成。官方sqlite extension按版本离线准备；真实4142 `/terminal-archive/query` 与内置 inspector均返回200，跨segment只读SQL可用
+
 ### Task 6.1：依赖与 extension artifact
 
 实施时查询最新稳定 DuckDB，不凭记忆写版本；固定 Python package与官方 sqlite extension的版本/平台artifact。新增构建/安装脚本和 checksum manifest。测试在干净 HOME、网络不可用、autoinstall/autoload关闭时显式加载。
@@ -402,6 +404,8 @@ API + 内置界面：request list/filter、四边界structured diff/raw、header
 
 ## 8. Phase 7 — InFlightRegistry gate、真流量 shadow 与一次切换
 
+状态：✅ 已完成。InFlightRegistry成为生命周期事实源；真实session header产生稳定短hash；durable registry events、四边界body与Rich完成行已live验收
+
 前置硬门：既有 in-flight Spec 的 `InFlightRegistry`、`timed_out`、shutdown quiesce必须完成。若并行分支尚未落地，等待/合并，不在本功能中另造registry。
 
 ### Task 7.1：替换 transitional lifecycle source
@@ -421,6 +425,8 @@ API + 内置界面：request list/filter、四边界structured diff/raw、header
 一次配置切换让新Rich renderer成为唯一TTY owner；关闭PoC `request_log.live_status`和重叠完成行。保留PoC代码一个回退周期，确认稳定后另任务删除；不在切换提交同时大删代码。显式测试 cutover 后 `isatty()=false` 且 `mode=auto` 时，版本化 JSONL 元数据事件输出到 stdout，PoC plain-text 完成行不再出现。
 
 ## 9. Phase 8 — 受控网络 replay
+
+状态：✅ 已完成 primitives。默认dry-run、当前authenticator注入与mock网络发送测试通过；真实外网replay仍按操作需要显式执行
 
 在 offline reconstruct通过后新增。默认dry-run、明确目标、使用当前GitHub Copilot authenticator，不从archive恢复旧凭据。每次replay写source linkage和结果事件。测试本地mock endpoint先行；live smoke 是额外环境验收，不替代本地确定性门禁。
 

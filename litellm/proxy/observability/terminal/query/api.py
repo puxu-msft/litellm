@@ -4,7 +4,13 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict
 
-from litellm.proxy.observability.terminal.query.coordinator import QueryCoordinator, QueryFailed, QueryRejected
+from typing import Protocol
+
+from litellm.proxy.observability.terminal.query.coordinator import QueryFailed, QueryRejected, QueryResult
+
+
+class QueryService(Protocol):
+    def query(self, sql: str) -> QueryResult: ...
 
 
 class SQLRequest(BaseModel):
@@ -12,7 +18,7 @@ class SQLRequest(BaseModel):
     sql: str
 
 
-def build_query_router(coordinator: QueryCoordinator) -> APIRouter:
+def build_query_router(coordinator: QueryService) -> APIRouter:
     router = APIRouter()
 
     async def query(request: SQLRequest):

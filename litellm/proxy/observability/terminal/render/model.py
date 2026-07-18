@@ -61,36 +61,43 @@ def format_completion(record: CompletionRecord) -> str:
         str(record.http_status),
         f"{record.duration_seconds:.2f}s",
     ]
-    if record.ttft_seconds is not None:
-        parts.append(f"ttft:{record.ttft_seconds:.2f}s")
-    if record.upstream_request_bytes is not None:
-        parts.append(f"↑{_bytes(record.upstream_request_bytes)}")
-    if record.upstream_response_bytes is not None:
-        parts.append(f"↓{_bytes(record.upstream_response_bytes)}")
-    if record.tokens is not None:
-        token_parts = tuple(
-            _count(value) for value in (record.tokens.cache_write, record.tokens.cache_read, record.tokens.uncached)
+    return " ".join((*parts, *_timing_and_bytes(record), *_token_parts(record.tokens), *_detail_parts(record)))
+
+
+def _timing_and_bytes(record: CompletionRecord) -> tuple[str, ...]:
+    return tuple(
+        value
+        for value in (
+            f"ttft:{record.ttft_seconds:.2f}s" if record.ttft_seconds is not None else None,
+            f"↑{_bytes(record.upstream_request_bytes)}" if record.upstream_request_bytes is not None else None,
+            f"↓{_bytes(record.upstream_response_bytes)}" if record.upstream_response_bytes is not None else None,
         )
-        parts.append("↑" + "+".join(token_parts))
-        if all(
-            value is not None for value in (record.tokens.cache_write, record.tokens.cache_read, record.tokens.uncached)
-        ):
-            values = (record.tokens.cache_write or 0, record.tokens.cache_read or 0, record.tokens.uncached or 0)
-            total = sum(values)
-            if total:
-                parts.append("↻" + "+".join(f"{round(value * 100 / total)}%" for value in values))
-        if record.tokens.output is not None:
-            parts.append(f"↓{_count(record.tokens.output)}")
-    if record.retry_summary:
-        parts.append("retry(" + ",".join(record.retry_summary) + ")")
-    if record.tools:
-        parts.append("tool_use(" + ",".join(record.tools) + ")")
-    parts.extend(f"think:{kind}({count})" for kind, count in record.thinking)
-    if record.non_stream:
-        parts.append("(non-stream)")
-    if record.reason:
-        parts.append(f"reason={record.reason}")
-    return " ".join(parts)
+        if value is not None
+    )
+
+
+def _token_parts(tokens: TokenBreakdown | None) -> tuple[str, ...]:
+    if tokens is None:
+        return ()
+    values = (tokens.cache_write, tokens.cache_read, tokens.uncached)
+    inputs = "↑" + "+".join(_count(value) for value in values)
+    percentages: tuple[str, ...] = ()
+    if all(value is not None for value in values):
+        known = tuple(value or 0 for value in values)
+        total = sum(known)
+        if total:
+            percentages = ("↻" + "+".join(f"{round(value * 100 / total)}%" for value in known),)
+    output = (f"↓{_count(tokens.output)}",) if tokens.output is not None else ()
+    return (inputs, *percentages, *output)
+
+
+def _detail_parts(record: CompletionRecord) -> tuple[str, ...]:
+    retry = ("retry(" + ",".join(record.retry_summary) + ")",) if record.retry_summary else ()
+    tools = ("tool_use(" + ",".join(record.tools) + ")",) if record.tools else ()
+    thinking = tuple(f"think:{kind}({count})" for kind, count in record.thinking)
+    stream = ("(non-stream)",) if record.non_stream else ()
+    reason = (f"reason={record.reason}",) if record.reason else ()
+    return (*retry, *tools, *thinking, *stream, *reason)
 
 
 def format_footer(groups: tuple[InFlightGroup, ...], *, width: int) -> str:

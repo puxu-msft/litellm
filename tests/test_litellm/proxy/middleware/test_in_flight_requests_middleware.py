@@ -74,6 +74,22 @@ def test_counter_returns_to_zero_after_request():
     assert get_in_flight_requests() == 0
 
 
+@pytest.mark.parametrize("path", ("/metrics", "/health", "/health/in-flight/stream", "/terminal-archive/query"))
+def test_control_plane_paths_are_not_counted(path: str):
+    captured = []
+
+    async def handler(request: Request) -> Response:
+        captured.append(InFlightRequestsMiddleware.get_count())
+        return JSONResponse({})
+
+    from starlette.applications import Starlette
+
+    app = Starlette(routes=[Route(path, handler)])
+    app.add_middleware(InFlightRequestsMiddleware)
+    TestClient(app).get(path)
+    assert captured == [0]
+
+
 def test_counter_decrements_after_error():
     """Counter must reach 0 even when the handler raises."""
 

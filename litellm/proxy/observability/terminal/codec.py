@@ -10,6 +10,7 @@ import orjson
 from pydantic import JsonValue, TypeAdapter
 
 from litellm.proxy.observability.terminal.events import (
+    SYSTEM_EVENT_TYPES,
     BodyBoundary,
     BodyEventPayload,
     BodyState,
@@ -23,7 +24,6 @@ from litellm.proxy.observability.terminal.events import (
     LogEventPayload,
     LogSeverity,
     RequestTerminalPayload,
-    SYSTEM_EVENT_TYPES,
     SystemEventPayload,
     TerminalReason,
 )

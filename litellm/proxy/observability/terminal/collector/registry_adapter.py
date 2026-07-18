@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import time
 from uuid import UUID, uuid4
 
 from litellm.proxy.middleware.in_flight_registry import RegistryEvent, RequestStage
@@ -34,7 +34,7 @@ class RegistryEventAdapter:
             worker_instance_id=self.worker_instance_id,
             worker_sequence=event.sequence,
             request_id=event.record.id,
-            session_hash=None,
+            session_hash=event.record.session_hash,
             occurred_at_utc=datetime.fromtimestamp(self.wall_clock(), timezone.utc),
             monotonic_offset_ns=max(
                 0,

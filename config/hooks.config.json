@@ -130,7 +130,8 @@
   },
   "request_log": {
     "enabled": true,
-    "diagnose": true,
+    "diagnose": false,
+    "live_status": true,
     "suppress_uvicorn_access": true,
     "color": "auto",
     "timing_file": "/home/xp/.config/litellm/probe-logs/request-timing.jsonl"

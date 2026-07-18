@@ -246,16 +246,10 @@ class EventEnvelope:
 
 def _validate_payload(event_type: EventType, payload: EventPayload) -> None:
     if event_type in _TERMINAL_EVENT_TYPES:
-        if not isinstance(payload, RequestTerminalPayload):
-            raise TypeError(f"{event_type.value} requires RequestTerminalPayload")
-        if event_type_for_terminal_reason(payload.reason) is not event_type:
-            raise ValueError(f"terminal reason {payload.reason.value} does not match {event_type.value}")
+        _validate_terminal_payload(event_type, payload)
         return
     if event_type in _BODY_EVENT_TYPES:
-        if not isinstance(payload, BodyEventPayload):
-            raise TypeError(f"{event_type.value} requires BodyEventPayload")
-        if _BODY_STATES[event_type] is not payload.state:
-            raise ValueError(f"body state {payload.state.value} does not match {event_type.value}")
+        _validate_body_payload(event_type, payload)
         return
     if event_type is EventType.LOG_RECORD:
         if not isinstance(payload, LogEventPayload):
@@ -267,3 +261,17 @@ def _validate_payload(event_type: EventType, payload: EventPayload) -> None:
         return
     if not isinstance(payload, LifecycleEventPayload):
         raise TypeError(f"{event_type.value} requires LifecycleEventPayload")
+
+
+def _validate_terminal_payload(event_type: EventType, payload: EventPayload) -> None:
+    if not isinstance(payload, RequestTerminalPayload):
+        raise TypeError(f"{event_type.value} requires RequestTerminalPayload")
+    if event_type_for_terminal_reason(payload.reason) is not event_type:
+        raise ValueError(f"terminal reason {payload.reason.value} does not match {event_type.value}")
+
+
+def _validate_body_payload(event_type: EventType, payload: EventPayload) -> None:
+    if not isinstance(payload, BodyEventPayload):
+        raise TypeError(f"{event_type.value} requires BodyEventPayload")
+    if _BODY_STATES[event_type] is not payload.state:
+        raise ValueError(f"body state {payload.state.value} does not match {event_type.value}")

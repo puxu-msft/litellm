@@ -13,5 +13,5 @@ def observe_fail_open(observer: ChunkObserver, boundary: BodyBoundary, chunk: by
     try:
         observer.observe(boundary, chunk)
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 - observers must never alter the business stream
         return False

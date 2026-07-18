@@ -10,6 +10,8 @@
 | 上游 http_client 超时 | ✅ 完成(全 5 phase + 变异测试 98.4%) | [upstream-timeout](superpowers/specs/2026-07-13-upstream-http-client-config-design.md) | [upstream-timeout](superpowers/plans/2026-07-14-upstream-http-client-config.md) | 已完成;plan 已标 ALL PHASES COMPLETE,详见下方小节 |
 | github_copilot messages 原生路由 | 见 plan | [routing](superpowers/specs/2026-07-13-github-copilot-messages-native-routing-design.md) | [routing](superpowers/plans/2026-07-13-github-copilot-messages-native-routing.md) | 见该 plan |
 | gpt reasoning↔thinking 保真 | 见 plan(PoC 已出结果) | — | [fidelity](superpowers/plans/2026-07-14-gpt-reasoning-thinking-fidelity.md) / [poc](superpowers/plans/2026-07-14-gpt-reasoning-poc-results.md) | 见该 plan |
+| Anthropic 协议/工具/流保真 block 2/3/4 | ✅ 已实现 + live 验证 | [fidelity](superpowers/specs/2026-07-17-anthropic-protocol-tool-stream-fidelity-design.md) | [fidelity](superpowers/plans/2026-07-17-anthropic-protocol-tool-stream-fidelity.md) | 完成；`is_error` 为协议不可表示的已知有损 |
+| 终端可观测 + 跨 worker 事件档案 | 🚧 Phase 1 完成，Phase 2 进行中 | [terminal-observability](superpowers/specs/2026-07-18-terminal-observability-event-archive-design.md)；依赖 [in-flight registry](superpowers/specs/2026-07-14-in-flight-observability-graceful-shutdown-design.md) | [TDD plan](superpowers/plans/2026-07-18-terminal-observability-event-archive.md) / [kick-off](superpowers/plans/2026-07-18-terminal-observability-event-archive-kickoff.md) | Single-worker shadow archive + JSONL；当前 PoC 保持唯一 TTY owner |
 
 ---
 

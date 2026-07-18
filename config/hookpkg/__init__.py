@@ -25,7 +25,7 @@ from hookpkg.config import load_config
 from hookpkg.probes import append_jsonl, ProbeContext
 from hookpkg import orphans as _orphans
 from hookpkg.thinking import fix_thinking_blocks
-from hookpkg.logline import log_success, log_failure  # noqa: F401  薄壳经 impl.log_success/log_failure 调用
+from hookpkg.logline import log_success, log_failure, request_started  # noqa: F401  薄壳经 impl 调用
 # 薄壳通过 impl.stream_transform 调用。链路(从上游到客户端):
 #   response -> [block_audit 观测入站] -> stream.stream_transform(改写) ->
 #   [block_audit 观测出站] -> dedup(相邻重复 tool_use 去重) -> 客户端
@@ -560,6 +560,7 @@ def _fix_orphan_tool_result(data, cfg) -> int:
 
 def process(data: dict, call_type: str) -> dict:
     """薄壳调用的入口。"""
+    request_started(data, call_type)
     cfg = load_config()
     # 诊断:记录每个请求的 stream 标志与工具名单,判定 AskUserQuestion 走不走流式。
     sf = cfg.get("stream_fix") or {}

@@ -15,7 +15,10 @@ from litellm.proxy.middleware.in_flight_registry import (
     InFlightRegistry,
     RequestTerminalReason,
 )
-from litellm.proxy.observability.terminal.bootstrap import bootstrap_shadow_from_env
+from litellm.proxy.observability.terminal.bootstrap import bootstrap_shadow_from_env, session_hash_from_headers
+from litellm.proxy.observability.terminal.bootstrap import observe_current_request_chunk
+from litellm.proxy.observability.terminal.capture.context import reset_current_request, set_current_request
+from litellm.proxy.observability.terminal.events import BodyBoundary
 
 
 class InFlightRequestsMiddleware:
@@ -43,7 +46,7 @@ class InFlightRequestsMiddleware:
         self.shadow_bootstrap = bootstrap_shadow_from_env(registry)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] != "http" or _exclude_control_plane(scope.get("path", "")):
             await self.app(scope, receive, send)
             return
 
@@ -53,17 +56,31 @@ class InFlightRequestsMiddleware:
             method=scope.get("method", ""),
             path=scope.get("path", ""),
             client_ip=client[0] if client else None,
+            session_hash=session_hash_from_headers(tuple(scope.get("headers", ()))),
         )
         gauge = InFlightRequestsMiddleware._get_gauge()
         if gauge is not None:
             gauge.inc()  # type: ignore
         terminal_reason = RequestTerminalReason.COMPLETED
+        capture_token = set_current_request(record.id)
+
+        async def observed_receive():
+            message = await receive()
+            if message["type"] == "http.request" and message.get("body"):
+                observe_current_request_chunk(BodyBoundary.CLIENT_REQUEST, message["body"])
+            return message
+
+        async def observed_send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                observe_current_request_chunk(BodyBoundary.CLIENT_RESPONSE, message["body"])
+            await send(message)
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, observed_receive, observed_send)
         except BaseException:
             terminal_reason = RequestTerminalReason.FAILED
             raise
         finally:
+            reset_current_request(capture_token)
             self.registry.finish(record.id, terminal_reason)
             InFlightRequestsMiddleware._in_flight -= 1
             if gauge is not None:
@@ -102,3 +119,7 @@ class InFlightRequestsMiddleware:
 def get_in_flight_requests() -> int:
     """Module-level convenience wrapper used by the /health/backlog endpoint."""
     return InFlightRequestsMiddleware.get_count()
+
+
+def _exclude_control_plane(path: str) -> bool:
+    return path == "/metrics" or path.startswith("/health") or path.startswith("/terminal-archive")

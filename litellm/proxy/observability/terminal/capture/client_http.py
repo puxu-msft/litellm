@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from pydantic import TypeAdapter
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from litellm.proxy.observability.terminal.capture.stream import ChunkObserver, observe_fail_open
 from litellm.proxy.observability.terminal.events import BodyBoundary

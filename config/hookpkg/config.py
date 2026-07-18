@@ -131,13 +131,15 @@ _DEFAULT_CONFIG = {
     "dedup_tool_use": {
         "enabled": False,
     },
-    # 每个模型请求成功/失败后打一行紧凑访问日志到 stdout(见 logline.py)。靠空格分组 + 颜色区分,例:
-    #   claude-sonnet-5 ghc/am  ↑338.2KB ↓11.0KB  ↑2+104.7k+534 ↻99%+1% ↓370  3.42s end_turn stream
-    # 依次:模型 缩写provider/call_type | 请求/响应字节 | ↑cache创建+cache读+新输入 ↻命中率 ↓输出 | 用时 结束原因 stream。
+    # 每个模型请求成功/失败后打一行紧凑访问日志到 stdout，并在 TTY 最后一行实时显示在途请求。
+    # 完成行例:[ OK ] 17:18:53 200 github_copilot/claude-sonnet-5 3.4s ■ ↑338.2KB ↓11.0KB
+    #          ↑2+104.7k+534 ↻99%+1% ↓370 tool_use(Bash) think:enc(1) (thinking:adaptive)
     "request_log": {
         "enabled": True,
         # 诊断:行尾附加 response_obj 类型与原始 finish_reason,用于坐实活管线形态;确认后可关。
-        "diagnose": True,
+        "diagnose": False,
+        # 真实 TTY 才启用:最后一行实时刷新模型/在途数量/耗时，同模型请求合并为 ×N。
+        "live_status": True,
         # 抑制 uvicorn 的 per-request access log(那条 "POST /v1/messages ... 200 OK"),由本行接管,
         # 避免同一请求两行重复。注意:非模型端点(GET / 等)的 access 行也会一并静默。
         "suppress_uvicorn_access": True,

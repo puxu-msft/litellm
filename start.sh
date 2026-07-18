@@ -25,6 +25,7 @@ export GHC_REASONING_POC=1
 # Durable shadow event archive. The existing hookpkg request log remains the
 # only TTY owner until the Rich renderer cutover gate is completed.
 export LITELLM_TERMINAL_ARCHIVE_DIR="$HOME/.local/share/litellm/terminal-events"
+export LITELLM_DUCKDB_EXTENSION_DIR="$HOME/.local/share/litellm/duckdb-extensions"
 
 pushd "$(dirname "$0")" || exit 1
 

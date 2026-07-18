@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import TypeAlias
 from uuid import UUID, uuid4
 
+from pydantic import TypeAdapter
+
 from litellm.proxy.observability.terminal.archive.catalog import Catalog, SegmentRecord, SegmentState
 from litellm.proxy.observability.terminal.archive.content_pool import BlobCorrupt, BlobMissing, ContentPool
-
-from pydantic import TypeAdapter
 
 SEGMENT_SCHEMA_VERSION = 1
 Clock = Callable[[], int]
@@ -138,6 +138,10 @@ class SegmentManager:
                 "blob_digest TEXT NOT NULL REFERENCES content_blobs(digest));"
                 "CREATE TABLE IF NOT EXISTS terminal_events("
                 "event_id TEXT PRIMARY KEY,event_type TEXT NOT NULL,frame BLOB NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS captured_chunks("
+                "request_id TEXT NOT NULL,boundary TEXT NOT NULL,sequence INTEGER NOT NULL,"
+                "blob_digest TEXT NOT NULL REFERENCES content_blobs(digest),byte_count INTEGER NOT NULL,"
+                "PRIMARY KEY(request_id,boundary,sequence));"
             )
         self._catalog.register_segment(
             SegmentRecord(

@@ -3,11 +3,14 @@
 import logging
 import re
 import unittest
+from dataclasses import dataclass
+from unittest.mock import patch
 
 from hookpkg import logline
 from hookpkg.logline import (
-    _Usage, _bytes, _extract_usage, _json_bytes, _raw_finish_reason, _short_call_type,
-    _short_model, _short_provider, _si, _to_anthropic_stop_reason, format_line,
+    _InFlight, _LiveDisplay, _Usage, _bytes, _extract_thinking, _extract_tool_names, _extract_usage,
+    _json_bytes, _raw_finish_reason, _short_call_type, _short_model, _short_provider, _si,
+    _to_anthropic_stop_reason, format_inflight, format_line,
 )
 
 
@@ -41,6 +44,34 @@ class _ModelResponse:
     def __init__(self, finish_reason, usage=None):
         self.choices = [_Choice(finish_reason)]
         self.usage = usage
+
+
+@dataclass
+class _Function:
+    name: str
+
+
+@dataclass
+class _ToolCall:
+    function: _Function
+
+
+@dataclass
+class _Message:
+    tool_calls: list
+    thinking_blocks: list
+
+
+class _RichChoice(_Choice):
+    def __init__(self, finish_reason, message):
+        super().__init__(finish_reason)
+        self.message = message
+
+
+class _RichModelResponse(_ModelResponse):
+    def __init__(self, finish_reason, message, usage=None):
+        super().__init__(finish_reason, usage)
+        self.choices = [_RichChoice(finish_reason, message)]
 
 
 class TestRawFinishReason(unittest.TestCase):
@@ -129,6 +160,23 @@ class TestExtractUsage(unittest.TestCase):
         self.assertEqual(u.hit_pct, 0)
 
 
+class TestResponseDetails(unittest.TestCase):
+    def test_extracts_tool_names_and_encrypted_thinking(self):
+        response = _RichModelResponse(
+            "tool_calls",
+            _Message(
+                tool_calls=[_ToolCall(_Function("Bash")), _ToolCall(_Function("Read"))],
+                thinking_blocks=[{"type": "thinking", "thinking": "...", "signature": "opaque"}],
+            ),
+        )
+        self.assertEqual(_extract_tool_names(response), ("Bash", "Read"))
+        self.assertEqual(_extract_thinking(response, {"thinking": {"type": "adaptive"}}), (1, "adaptive"))
+
+    def test_missing_details_are_omitted(self):
+        self.assertEqual(_extract_tool_names(_ModelResponse("stop")), ())
+        self.assertEqual(_extract_thinking(_ModelResponse("stop"), {}), (0, None))
+
+
 class TestFormatLine(unittest.TestCase):
     def _slp(self, **over):
         base = {
@@ -145,16 +193,20 @@ class TestFormatLine(unittest.TestCase):
         return _Usage(prompt=105236, completion=370, cache_read=104700, cache_creation=2)
 
     def test_full_line_no_color(self):
-        line = format_line(self._slp(), "end_turn", self._usage(), req_bytes=346317, resp_bytes=11 * 1024)
+        line = format_line(
+            self._slp(), "end_turn", self._usage(), req_bytes=346317, resp_bytes=11 * 1024,
+            completed_at="17:18:53", session_hash="7K3M",
+        )
         self.assertEqual(
             line,
-            "claude-sonnet-5 ghc/am  ↑338.2KB ↓11.0KB  ↑2+104.7k+534 ↻99%+1% ↓370  3.42s end_turn stream",
+            "[ OK ] 17:18:53 ■ 7K3M anthropic/claude-sonnet-5 · ghc 200 3.42s "
+            "↑338.2KB ↓11.0KB ↑2+104.7k+534 ↻0%+99%+1% ↓370 end_turn",
         )
 
     def test_meta_replaces_repeated_provider_and_tail_calltype(self):
         line = format_line(self._slp(), "end_turn", self._usage())
-        self.assertIn("claude-sonnet-5 ghc/am", line)
-        self.assertNotIn("github_copilot", line)     # provider 前缀已剥、不重复
+        self.assertIn("anthropic/claude-sonnet-5 · ghc", line)
+        self.assertNotIn("github_copilot", line)
         self.assertNotIn("anthropic_messages", line)  # call_type 已缩写并移到头部
 
     def test_usage_none_degrades_to_simple_tokens(self):
@@ -170,10 +222,21 @@ class TestFormatLine(unittest.TestCase):
 
     def test_failed_marker(self):
         line = format_line(self._slp(stream=False), None, None, failed=True)
-        self.assertIn("FAILED", line)
+        self.assertIn("[FAIL]", line)
+
+    def test_tool_and_thinking_details(self):
+        line = format_line(
+            self._slp(), "tool_use", self._usage(), tool_names=("Bash",), thinking_count=1,
+            thinking_mode="adaptive", completed_at="17:18:53",
+        )
+        self.assertIn("tool_use(Bash)", line)
+        self.assertIn("think:enc(1)", line)
+        self.assertNotIn("thinking:adaptive", line)
 
     def test_color_wraps_and_strips_back(self):
-        colored = format_line(self._slp(), "end_turn", self._usage(), req_bytes=346317, resp_bytes=11 * 1024, color=True)
+        colored = format_line(
+            self._slp(), "end_turn", self._usage(), req_bytes=346317, resp_bytes=11 * 1024, color=True,
+        )
         self.assertIn("\033[32mend_turn\033[0m", colored)   # 绿 end_turn
         self.assertIn("\033[32m104.7k\033[0m", colored)      # cache_read 绿
         self.assertIn("\033[33m2\033[0m", colored)           # cache_creation 黄
@@ -181,6 +244,61 @@ class TestFormatLine(unittest.TestCase):
             _strip_ansi(colored),
             format_line(self._slp(), "end_turn", self._usage(), req_bytes=346317, resp_bytes=11 * 1024, color=False),
         )
+
+
+class TestInflightLine(unittest.TestCase):
+    def test_groups_requests_by_model_and_uses_oldest_elapsed(self):
+        requests = (
+            _InFlight("a", "claude-opus-4.8", 100.0),
+            _InFlight("b", "claude-opus-4.8", 104.0),
+            _InFlight("c", "claude-sonnet-5", 108.0),
+        )
+        self.assertEqual(
+            format_inflight(requests, now=110.0, color=False),
+            "[ .. ] 3 in-flight  claude-opus-4.8 ×2 10.00s  claude-sonnet-5 2.00s",
+        )
+
+    def test_empty_requests_have_no_footer(self):
+        self.assertEqual(format_inflight((), now=110.0, color=False), "")
+
+
+class _MemoryTTY:
+    def __init__(self):
+        self.output = ""
+
+    def isatty(self):
+        return True
+
+    def write(self, value):
+        self.output += value
+
+    def flush(self):
+        pass
+
+
+class TestLiveDisplay(unittest.TestCase):
+    def test_reserves_footer_groups_requests_and_restores_terminal(self):
+        stream = _MemoryTTY()
+        display = _LiveDisplay(
+            stream=stream,
+            clock=lambda: 110.0,
+            terminal_size=lambda: (100, 24),
+            auto_refresh=False,
+        )
+
+        display.start("a", "claude-opus-4.8", started_at=100.0, color=False)
+        display.start("b", "claude-opus-4.8", started_at=104.0, color=False)
+        self.assertIn("\033[1;23r", stream.output)
+        self.assertIn("claude-opus-4.8 ×2 10.00s", stream.output)
+
+        display.finish_and_emit("a", "DONE-A")
+        self.assertIn("DONE-A", stream.output)
+        self.assertIn("[ .. ] 1 in-flight", stream.output)
+
+        display.finish_and_emit("b", "DONE-B")
+        self.assertIn("DONE-B", stream.output)
+        self.assertTrue(stream.output.endswith("\033[r\033[24;1H"))
+        self.assertEqual(display.snapshot(), ())
 
 
 class _Capture(logging.Handler):
@@ -196,8 +314,18 @@ class TestLogSuccessEndToEnd(unittest.TestCase):
     def setUp(self):
         self.cap = _Capture()
         logline._LOGGER.addHandler(self.cap)
+        self.config = patch.object(logline, "load_config", return_value={"request_log": {
+            "enabled": True,
+            "diagnose": False,
+            "suppress_uvicorn_access": False,
+            "color": "never",
+            "live_status": False,
+            "timing_file": None,
+        }})
+        self.config.start()
 
     def tearDown(self):
+        self.config.stop()
         logline._LOGGER.removeHandler(self.cap)
 
     def test_emits_mapped_line_with_cache(self):
@@ -216,12 +344,95 @@ class TestLogSuccessEndToEnd(unittest.TestCase):
         logline.log_success(kwargs, resp, 0.0, 1.5)
         self.assertEqual(len(self.cap.messages), 1)
         msg = _strip_ansi(self.cap.messages[0])
-        self.assertIn("claude-sonnet-5 ghc/am", msg)
+        self.assertIn("[ OK ]", msg)
+        self.assertIn("anthropic/claude-sonnet-5 · ghc 200", msg)
         self.assertIn("↑10+900+90", msg)   # creation+read+fresh
-        self.assertIn("↻90%+10%", msg)
+        self.assertIn("↻1%+90%+9%", msg)
         self.assertIn("↓20", msg)
         self.assertIn("end_turn", msg)     # OpenAI stop 已映射
         self.assertRegex(msg, r"↑\d+B ↓\d+B")  # 字节段(messages/response 存在,小内容显示为 B)
+
+    def test_formatting_failure_still_discards_inflight_request(self):
+        stream = _MemoryTTY()
+        display = _LiveDisplay(stream=stream, terminal_size=lambda: (100, 24), auto_refresh=False)
+        display.start("call-1", "claude-opus-4.8", started_at=100.0)
+        kwargs = {"standard_logging_object": {"litellm_call_id": "call-1"}}
+
+        with patch.object(logline, "_LIVE_DISPLAY", display), patch.object(
+            logline, "format_line", side_effect=RuntimeError("broken formatter"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "broken formatter"):
+                logline.log_success(kwargs, _ModelResponse("stop"), 0.0, 1.0)
+
+        self.assertEqual(display.snapshot(), ())
+
+
+class TestLogFailureEndToEnd(unittest.TestCase):
+    def setUp(self):
+        self.cap = _Capture()
+        logline._LOGGER.addHandler(self.cap)
+        self.config = patch.object(logline, "load_config", return_value={"request_log": {
+            "enabled": True,
+            "diagnose": False,
+            "suppress_uvicorn_access": False,
+            "color": "never",
+            "live_status": False,
+        }})
+        self.config.start()
+
+    def tearDown(self):
+        self.config.stop()
+        logline._LOGGER.removeHandler(self.cap)
+
+    def test_emits_failure_status_and_truncated_error(self):
+        kwargs = {"standard_logging_object": {
+            "litellm_call_id": "call-fail",
+            "model": "github_copilot/claude-opus-4.8",
+            "custom_llm_provider": "github_copilot",
+            "response_time": 2.5,
+            "call_type": "anthropic_messages",
+            "error_str": "x" * 250,
+            "error_information": {"status_code": 429},
+        }}
+        logline.log_failure(kwargs, None, 0.0, 2.5)
+        self.assertEqual(len(self.cap.messages), 1)
+        message = _strip_ansi(self.cap.messages[0])
+        self.assertIn("[FAIL]", message)
+        self.assertIn("anthropic/claude-opus-4.8 · ghc 429", message)
+        self.assertTrue(message.endswith("x" * 200))
+
+    def test_formatting_failure_still_discards_inflight_request(self):
+        stream = _MemoryTTY()
+        display = _LiveDisplay(stream=stream, terminal_size=lambda: (100, 24), auto_refresh=False)
+        display.start("call-fail", "claude-opus-4.8", started_at=100.0)
+        kwargs = {"standard_logging_object": {"litellm_call_id": "call-fail"}}
+
+        with patch.object(logline, "_LIVE_DISPLAY", display), patch.object(
+            logline, "format_line", side_effect=RuntimeError("broken formatter"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "broken formatter"):
+                logline.log_failure(kwargs, None, 0.0, 1.0)
+
+        self.assertEqual(display.snapshot(), ())
+
+
+class TestAccessLogHandler(unittest.TestCase):
+    def test_tty_record_is_emitted_above_footer_and_request_is_removed(self):
+        stream = _MemoryTTY()
+        display = _LiveDisplay(stream=stream, terminal_size=lambda: (100, 24), auto_refresh=False)
+        display.start("call-1", "claude-opus-4.8", started_at=100.0)
+        handler = logline._AccessLogHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        record = logging.LogRecord("test", logging.INFO, "", 0, "DONE", (), None)
+        record.litellm_call_id = "call-1"
+        record.live_status = True
+
+        with patch.object(logline, "_LIVE_DISPLAY", display):
+            handler.emit(record)
+
+        self.assertIn("DONE", stream.output)
+        self.assertEqual(display.snapshot(), ())
+        self.assertTrue(stream.output.endswith("\033[r\033[24;1H"))
 
 
 class TestUvicornSuppression(unittest.TestCase):

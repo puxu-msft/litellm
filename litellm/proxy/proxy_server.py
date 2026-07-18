@@ -216,6 +216,8 @@ from litellm import Router
 from litellm._logging import verbose_proxy_logger, verbose_router_logger
 from litellm.caching.caching import DualCache, RedisCache
 from litellm.caching.redis_cluster_cache import RedisClusterCache
+from litellm.proxy.observability.terminal.query.api import build_query_router
+from litellm.proxy.observability.terminal.query.service import query_service_from_env
 from litellm.constants import (
     _REALTIME_BODY_CACHE_SIZE,
     APSCHEDULER_COALESCE,
@@ -746,6 +748,10 @@ def cleanup_router_config_variables():
     prisma_client = None
 
 
+    from litellm.proxy.observability.terminal.bootstrap import shutdown_shadow_runtimes
+
+    for shadow_error in shutdown_shadow_runtimes():
+        verbose_proxy_logger.warning("terminal shadow archive shutdown failed: %s", shadow_error)
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
@@ -15707,6 +15713,9 @@ async def get_routes():
 #     token = auth_jwt_sso.create_access_token()
 
 #     return {"token": token}
+_terminal_query_service = query_service_from_env()
+if _terminal_query_service is not None:
+    app.include_router(build_query_router(_terminal_query_service))
 
 
 app.include_router(router)

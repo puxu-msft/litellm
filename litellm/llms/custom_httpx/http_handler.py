@@ -630,7 +630,47 @@ class AsyncHTTPHandler:
                 files=files,
                 content=request_content,
             )
-            response = await self.client.send(req, stream=stream)
+            observe_copilot = (
+                (
+                    logging_obj is not None
+                    and logging_obj.model_call_details.get("custom_llm_provider") == "github_copilot"
+                )
+                or "githubcopilot.com" in str(req.url.host)
+            )
+            observed_request_stream = None
+            if observe_copilot:
+                from litellm.proxy.observability.terminal.bootstrap import CURRENT_SHADOW_OBSERVER
+                from litellm.proxy.observability.terminal.capture.upstream_httpx import ObservedAsyncStream
+                from litellm.proxy.observability.terminal.events import BodyBoundary
+
+                try:
+                    materialized_request = req.content
+                except httpx.RequestNotRead:
+                    materialized_request = None
+                if materialized_request is not None:
+                    if materialized_request:
+                        CURRENT_SHADOW_OBSERVER.observe(BodyBoundary.UPSTREAM_REQUEST, materialized_request)
+                elif isinstance(req.stream, httpx.AsyncByteStream):
+                    observed_request_stream = ObservedAsyncStream(
+                        req.stream,
+                        CURRENT_SHADOW_OBSERVER,
+                        BodyBoundary.UPSTREAM_REQUEST,
+                    )
+                    req.stream = observed_request_stream
+            try:
+                response = await self.client.send(req, stream=stream)
+            finally:
+                if observed_request_stream is not None:
+                    await observed_request_stream.aclose()
+            if observe_copilot:
+                if stream and isinstance(response.stream, httpx.AsyncByteStream):
+                    response.stream = ObservedAsyncStream(
+                        response.stream,
+                        CURRENT_SHADOW_OBSERVER,
+                        BodyBoundary.UPSTREAM_RESPONSE,
+                    )
+                elif response.content:
+                    CURRENT_SHADOW_OBSERVER.observe(BodyBoundary.UPSTREAM_RESPONSE, response.content)
             response.raise_for_status()
             return response
         except (httpx.RemoteProtocolError, httpx.ConnectError):
