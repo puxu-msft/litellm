@@ -39,18 +39,32 @@ class QueryCoordinator:
         self._connection.execute("SET autoload_known_extensions=false")
         self._connection.execute("SET extension_directory=?", [str(extension_directory)])
         self._connection.execute("LOAD sqlite")
-        relations: tuple[str, ...] = ()
+        event_relations: tuple[str, ...] = ()
+        chunk_relations: tuple[str, ...] = ()
+        blob_relations: tuple[str, ...] = ()
         for index, segment in enumerate(segments):
             schema = f"segment_{index}"
             path = root / segment.path
             escaped_path = str(path).replace("'", "''")
             self._connection.execute(f"ATTACH '{escaped_path}' AS {schema} (TYPE SQLITE, READ_ONLY)")
-            relations = (*relations, f"SELECT * FROM {schema}.terminal_events")
-        if relations:
-            self._connection.execute("CREATE VIEW terminal_events AS " + " UNION ALL BY NAME ".join(relations))
+            event_relations = (*event_relations, f"SELECT * FROM {schema}.terminal_events")
+            chunk_relations = (*chunk_relations, f"SELECT * FROM {schema}.captured_chunks")
+            blob_relations = (*blob_relations, f"SELECT * FROM {schema}.content_blobs")
+        if event_relations:
+            self._connection.execute("CREATE VIEW terminal_events AS " + " UNION ALL BY NAME ".join(event_relations))
+            self._connection.execute("CREATE VIEW captured_chunks AS " + " UNION ALL BY NAME ".join(chunk_relations))
+            self._connection.execute("CREATE VIEW content_blobs AS " + " UNION ALL BY NAME ".join(blob_relations))
         else:
             self._connection.execute(
                 "CREATE VIEW terminal_events AS SELECT NULL::VARCHAR event_id,NULL::VARCHAR event_type,NULL::BLOB frame WHERE false"
+            )
+            self._connection.execute(
+                "CREATE VIEW captured_chunks AS SELECT NULL::VARCHAR request_id,NULL::VARCHAR boundary,"
+                "NULL::BIGINT sequence,NULL::VARCHAR blob_digest,NULL::BIGINT byte_count WHERE false"
+            )
+            self._connection.execute(
+                "CREATE VIEW content_blobs AS SELECT NULL::VARCHAR digest,NULL::BIGINT byte_count,"
+                "NULL::BLOB compressed WHERE false"
             )
 
     def query(self, sql: str) -> QueryResult:
