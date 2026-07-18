@@ -133,6 +133,7 @@
     "diagnose": false,
     "live_status": true,
     "suppress_uvicorn_access": true,
+    "suppress_aiohttp_noise": true,
     "color": "auto",
     "timing_file": "/home/xp/.config/litellm/probe-logs/request-timing.jsonl"
   },

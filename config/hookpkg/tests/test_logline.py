@@ -435,6 +435,33 @@ class TestAccessLogHandler(unittest.TestCase):
         self.assertTrue(stream.output.endswith("\033[r\033[24;1H"))
 
 
+class _TtyStub:
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+class TestForceTerminal(unittest.TestCase):
+    """#4 颜色决策:Console.force_terminal 跟随 color 配置,不让 Rich 自检 strip ANSI。"""
+
+    def test_always_and_never_override_tty(self):
+        self.assertTrue(logline._force_terminal(_TtyStub(False), "always"))
+        self.assertFalse(logline._force_terminal(_TtyStub(True), "never"))
+
+    def test_auto_follows_stream_tty(self):
+        self.assertTrue(logline._force_terminal(_TtyStub(True), "auto"))
+        self.assertFalse(logline._force_terminal(_TtyStub(False), "auto"))
+        self.assertFalse(logline._force_terminal(_TtyStub(False), None))  # 默认按 auto
+
+    def test_isatty_error_degrades_to_false(self):
+        class _Bad:
+            def isatty(self):
+                raise OSError("no tty")
+        self.assertFalse(logline._force_terminal(_Bad(), "auto"))
+
+
 class TestUvicornSuppression(unittest.TestCase):
     def tearDown(self):
         logging.getLogger("uvicorn.access").disabled = False
@@ -446,21 +473,50 @@ class TestUvicornSuppression(unittest.TestCase):
         self.assertFalse(logging.getLogger("uvicorn.access").disabled)
 
 
+class TestAiohttpNoiseSuppression(unittest.TestCase):
+    def tearDown(self):
+        logline._apply_aiohttp_noise_suppression(False)
+
+    def test_filter_drops_only_unclosed_session_records(self):
+        f = logline._AIOHTTP_NOISE_FILTER
+        drop = logging.LogRecord("asyncio", logging.ERROR, "", 0, "Unclosed client session <obj>", (), None)
+        keep = logging.LogRecord("asyncio", logging.ERROR, "", 0, "some real asyncio error", (), None)
+        self.assertFalse(f.filter(drop))   # 命中 -> 丢弃
+        self.assertTrue(f.filter(keep))    # 无关错误 -> 保留
+
+    def test_toggle_installs_and_removes_filter_idempotently(self):
+        asyncio_logger = logging.getLogger("asyncio")
+        logline._apply_aiohttp_noise_suppression(True)
+        logline._apply_aiohttp_noise_suppression(True)  # 幂等
+        self.assertEqual(asyncio_logger.filters.count(logline._AIOHTTP_NOISE_FILTER), 1)
+        logline._apply_aiohttp_noise_suppression(False)
+        self.assertNotIn(logline._AIOHTTP_NOISE_FILTER, asyncio_logger.filters)
+
+
 class TestBuildTimingRecord(unittest.TestCase):
     """端到端计时记录:total/ttft/gen 三段拆分 + 缺字段降级。"""
 
-    def test_stream_three_way_split(self):
-        # startTime=100, 首 token=100.5, end=103.0 -> total=3.0, ttft=0.5, gen=2.5
+    def test_stream_omits_ttft_gen(self):
+        # 流式:total 有效,但 ttft/gen 无意义故置 None(completionStartTime≈endTime,拿不到真实首 token)
         slp = {"startTime": 100.0, "completionStartTime": 100.5, "endTime": 103.0,
                "response_time": 3.0, "model": "github_copilot/claude-opus-4.8",
                "custom_llm_provider": "github_copilot", "call_type": "anthropic_messages",
                "stream": True}
         rec = logline.build_timing_record(slp, None)
         self.assertEqual(rec["total_s"], 3.0)
-        self.assertEqual(rec["ttft_s"], 0.5)
-        self.assertEqual(rec["gen_s"], 2.5)
+        self.assertIsNone(rec["ttft_s"])
+        self.assertIsNone(rec["gen_s"])
         self.assertEqual(rec["model"], "claude-opus-4.8")  # provider 前缀已剥
         self.assertTrue(rec["stream"])
+
+    def test_non_stream_keeps_three_way_split(self):
+        # 非流式:ttft/gen 仍拆分(startTime=10,首 token=12,end=20 -> ttft=2,gen=8)
+        slp = {"startTime": 10.0, "completionStartTime": 12.0, "endTime": 20.0,
+               "response_time": 10.0, "stream": False}
+        rec = logline.build_timing_record(slp, None)
+        self.assertEqual(rec["total_s"], 10.0)
+        self.assertEqual(rec["ttft_s"], 2.0)
+        self.assertEqual(rec["gen_s"], 8.0)
 
     def test_response_time_preferred_over_endminusstart(self):
         # response_time 存在时用它当 total(不重算 end-start,二者可能因取样点略异)

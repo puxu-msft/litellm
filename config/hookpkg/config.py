@@ -143,6 +143,9 @@ _DEFAULT_CONFIG = {
         # 抑制 uvicorn 的 per-request access log(那条 "POST /v1/messages ... 200 OK"),由本行接管,
         # 避免同一请求两行重复。注意:非模型端点(GET / 等)的 access 行也会一并静默。
         "suppress_uvicorn_access": True,
+        # 抑制 aiohttp 'Unclosed client session' 噪音(github_copilot provider 的 session 未显式关闭,
+        # 根因在上游,这里仅日志层降噪)。在 asyncio logger 上装 filter 拦该 message。
+        "suppress_aiohttp_noise": True,
         # 颜色:"auto"(stdout 是 TTY 才上色)/"always"/"never"。
         "color": "auto",
         # 端到端计时落盘(可选):配了路径才落,每条成功请求追加一行 total/ttft/gen/tokens,

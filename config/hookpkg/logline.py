@@ -26,6 +26,7 @@ import shutil
 import sys
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -344,6 +345,22 @@ def _duration(seconds: Any) -> str:
     return f"{seconds:.2f}s"
 
 
+def _force_terminal(stream: Any, mode: Any) -> bool:
+    """Rich Console 的 force_terminal:跟随 color 决策,不让 Rich 自检。
+    "always"→强制上色、"never"→强制无色、其余("auto")→跟随 stream 是否 TTY。
+    根因:Console(force_terminal=None) 在 uv/systemd 启动环境自检会判非终端而 strip ANSI,
+    而 format_line 已按同一 color 决策加了 ANSI,两边必须一致否则颜色被吞。"""
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+
 def _session_color(session_hash: Optional[str]) -> str:
     if not session_hash:
         return _DIM
@@ -531,7 +548,10 @@ class _RichLiveDisplay:
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._renderer = RichLiveRenderer(Console(file=stream, force_terminal=None), refresh_hz=4)
+        color_mode = (load_config().get("request_log") or {}).get("color")
+        self._renderer = RichLiveRenderer(
+            Console(file=stream, force_terminal=_force_terminal(stream, color_mode)), refresh_hz=4
+        )
 
     def _is_tty(self) -> bool:
         try:
@@ -695,8 +715,7 @@ def format_line(
         marker,
         completed_at or _completed_at(s),
         _c(session, _session_color(session_hash), color),
-        _c(surface_model, _CYAN, color),
-        _c(f"· {provider_badge}", _DIM, color),
+        _c(surface_model, _CYAN, color) + _c(f"@{provider_badge}", _DIM, color),
         str(code) if code is not None else "ERR",
         _c(_duration(response_time), _dur_color(response_time), color),
     ]
@@ -738,6 +757,32 @@ def _apply_uvicorn_suppression(suppress: Any) -> None:
     logging.getLogger("uvicorn.access").disabled = bool(suppress)
 
 
+class _DropAiohttpUnclosedSession(logging.Filter):
+    """拦截 aiohttp `ClientSession.__del__` 经 asyncio exception handler 发出的
+    'Unclosed client session' 噪音。根因是 github_copilot provider 的 aiohttp session 未显式关闭
+    (上游资源管理问题),这里仅在日志层降噪,不影响功能。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return "Unclosed client session" not in record.getMessage()
+        except Exception:
+            return True
+
+
+_AIOHTTP_NOISE_FILTER = _DropAiohttpUnclosedSession()
+
+
+def _apply_aiohttp_noise_suppression(suppress: Any) -> None:
+    """装/卸 asyncio logger 上的降噪 filter(幂等)+ 静默对应 ResourceWarning。热读即时生效。"""
+    asyncio_logger = logging.getLogger("asyncio")
+    installed = _AIOHTTP_NOISE_FILTER in asyncio_logger.filters
+    if suppress and not installed:
+        asyncio_logger.addFilter(_AIOHTTP_NOISE_FILTER)
+        warnings.filterwarnings("ignore", message="Unclosed client session", category=ResourceWarning)
+    elif not suppress and installed:
+        asyncio_logger.removeFilter(_AIOHTTP_NOISE_FILTER)
+
+
 def _epoch(v: Any) -> Optional[float]:
     """把 StandardLoggingPayload 的时间字段归一化为 epoch 秒 float。
     litellm 里 startTime/endTime/completionStartTime 多为 float(epoch),偶为 datetime;
@@ -756,30 +801,31 @@ def _epoch(v: Any) -> Optional[float]:
 
 
 def build_timing_record(slp: dict, usage: Optional[_Usage]) -> dict:
-    """从 standard_logging_object 抽端到端计时,拆成 total / ttft / gen 三段。纯函数,便于单测。
+    """从 standard_logging_object 抽端到端计时。纯函数,便于单测。
 
-    - response_time: litellm 已算好的端到端总耗时(秒)。
-    - ttft: completionStartTime - startTime,首 token 到达(含上游模型首字节 + 请求侧 hook + 网络)。
-    - gen:  endTime - completionStartTime,首 token 之后的生成/流式时长(响应侧 hook 分摊在此段)。
-    非流式请求 completionStartTime 常等于 endTime,ttft≈total、gen≈0。字段缺失时对应量为 None。
+    - total: litellm 已算好的端到端总耗时(response_time),缺失时回退 endTime-startTime。
+    - ttft/gen: 仅对**非流式**有意义。流式端点(anthropic_messages)的 completionStartTime≈endTime,
+      拆分拿不到真实首 token 时刻,故流式时 ttft/gen 一律置 None(见反馈:流式拆分无意义就不落)。
+      非流式时 ttft=completionStartTime-startTime、gen=endTime-completionStartTime。
     """
     start = _epoch(slp.get("startTime"))
     comp = _epoch(slp.get("completionStartTime"))
     end = _epoch(slp.get("endTime"))
     rt = slp.get("response_time")
+    is_stream = bool(slp.get("stream"))
     total = (
         float(rt)
         if isinstance(rt, (int, float)) and not isinstance(rt, bool)
         else (end - start if start is not None and end is not None else None)
     )
-    ttft = comp - start if start is not None and comp is not None else None
-    gen = end - comp if end is not None and comp is not None else None
+    ttft = None if is_stream else (comp - start if start is not None and comp is not None else None)
+    gen = None if is_stream else (end - comp if end is not None and comp is not None else None)
     return {
         "ts": end,
         "model": _short_model(slp.get("model")),
         "provider": slp.get("custom_llm_provider"),
         "call_type": slp.get("call_type"),
-        "stream": bool(slp.get("stream")),
+        "stream": is_stream,
         "total_s": round(total, 4) if total is not None else None,
         "ttft_s": round(ttft, 4) if ttft is not None else None,
         "gen_s": round(gen, 4) if gen is not None else None,
@@ -795,6 +841,7 @@ def request_started(data: Any, call_type: Any = None) -> None:
     cfg = load_config()
     request_log = cfg.get("request_log") or {}
     _apply_uvicorn_suppression(request_log.get("suppress_uvicorn_access"))
+    _apply_aiohttp_noise_suppression(request_log.get("suppress_aiohttp_noise", True))
     if not request_log.get("enabled") or not request_log.get("live_status", True) or not isinstance(data, dict):
         return
     call_id = data.get("litellm_call_id")
@@ -853,6 +900,7 @@ def _log_success(
     cfg = load_config()
     rc = cfg.get("request_log") or {}
     _apply_uvicorn_suppression(rc.get("suppress_uvicorn_access"))
+    _apply_aiohttp_noise_suppression(rc.get("suppress_aiohttp_noise", True))
     if not rc.get("enabled"):
         return
     s = slp or {}
@@ -914,6 +962,7 @@ def _log_failure(
     cfg = load_config()
     rc = cfg.get("request_log") or {}
     _apply_uvicorn_suppression(rc.get("suppress_uvicorn_access"))
+    _apply_aiohttp_noise_suppression(rc.get("suppress_aiohttp_noise", True))
     if not rc.get("enabled"):
         return
     err = (slp or {}).get("error_str") if isinstance(slp, dict) else None
@@ -932,8 +981,10 @@ def _log_failure(
     _emit_access_line(line, call_id, rc, logging.WARNING)
 
 
-# 进程启动/热重载时按当前配置应用一次 uvicorn 抑制(best-effort;之后每次 log 再同步)。
+# 进程启动/热重载时按当前配置应用一次噪音抑制(best-effort;之后每次 log 再同步)。
 try:
-    _apply_uvicorn_suppression((load_config().get("request_log") or {}).get("suppress_uvicorn_access"))
+    _startup_rc = load_config().get("request_log") or {}
+    _apply_uvicorn_suppression(_startup_rc.get("suppress_uvicorn_access"))
+    _apply_aiohttp_noise_suppression(_startup_rc.get("suppress_aiohttp_noise", True))
 except Exception:  # pragma: no cover - 启动期配置不可读时不致命,log 时会再试
     pass
