@@ -216,7 +216,7 @@ from litellm import Router
 from litellm._logging import verbose_proxy_logger, verbose_router_logger
 from litellm.caching.caching import DualCache, RedisCache
 from litellm.caching.redis_cluster_cache import RedisClusterCache
-from litellm.proxy.observability.terminal.query.api import build_query_router
+from litellm.proxy.observability.terminal.query.api import install_query_routes
 from litellm.proxy.observability.terminal.query.service import query_service_from_env
 from litellm.constants import (
     _REALTIME_BODY_CACHE_SIZE,
@@ -15713,12 +15713,12 @@ async def get_routes():
 #     token = auth_jwt_sso.create_access_token()
 
 #     return {"token": token}
-_terminal_query_service = query_service_from_env()
-if _terminal_query_service is not None:
-    app.include_router(build_query_router(_terminal_query_service))
 
 
 app.include_router(router)
+_terminal_query_service = query_service_from_env()
+if _terminal_query_service is not None:
+    install_query_routes(app, _terminal_query_service)
 app.include_router(response_router)
 app.include_router(public_endpoints_router)
 app.include_router(rerank_router)

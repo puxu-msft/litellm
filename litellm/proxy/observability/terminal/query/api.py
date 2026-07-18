@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -18,9 +18,7 @@ class SQLRequest(BaseModel):
     sql: str
 
 
-def build_query_router(coordinator: QueryService) -> APIRouter:
-    router = APIRouter()
-
+def install_query_routes(app: FastAPI, coordinator: QueryService) -> None:
     async def query(request: SQLRequest):
         result = coordinator.query(request.sql)
         if isinstance(result, QueryRejected):
@@ -29,13 +27,12 @@ def build_query_router(coordinator: QueryService) -> APIRouter:
             return {"ok": False, "error": result.detail, "kind": "failed"}
         return {"ok": True, "columns": result.columns, "rows": result.rows}
 
-    router.add_api_route("/terminal-archive/query", query, methods=["POST"])
+    app.add_api_route("/terminal-archive/query", query, methods=["POST"])
 
     async def inspector() -> HTMLResponse:
         return HTMLResponse(_INSPECTOR_HTML)
 
-    router.add_api_route("/terminal-archive", inspector, methods=["GET"], response_class=HTMLResponse)
-    return router
+    app.add_api_route("/terminal-archive", inspector, methods=["GET"], response_class=HTMLResponse)
 
 
 _INSPECTOR_HTML = """<!doctype html>
