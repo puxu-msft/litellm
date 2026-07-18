@@ -52,6 +52,19 @@ async def test_preserves_multibyte_utf8_split_across_chunks():
 
 
 @pytest.mark.asyncio
+async def test_every_single_byte_cut_preserves_frame_exactly():
+    frame = 'event: content_block_delta\ndata: {"type":"content_block_delta","text":"你好🎉"}\n\n'.encode()
+    for cut in range(1, len(frame)):
+        out = [
+            chunk
+            async for chunk in normalize_anthropic_sse_frames(
+                _aiter([frame[:cut], frame[cut:]])
+            )
+        ]
+        assert out == [frame], f"frame changed at byte cut {cut}"
+
+
+@pytest.mark.asyncio
 async def test_two_frames_in_one_chunk_not_glued():
     chunks = [b"event: a\n\nevent: b\n\n"]
     out = [f async for f in normalize_anthropic_sse_frames(_aiter(chunks))]

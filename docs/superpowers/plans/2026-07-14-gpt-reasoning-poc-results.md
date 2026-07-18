@@ -21,7 +21,7 @@
 
 ## 本轮已验证（server/wire 侧，curl 直打运行中的代理）
 
-代理已带新流式插桩 + `GHC_REASONING_POC=1` 重启。原始数据 `~/.claude/litellm/probe-logs/poc-live.sse`。
+代理已带新流式插桩 + `GHC_REASONING_POC=1` 重启。原始数据 `~/.config/litellm/probe-logs/poc-live.sse`。
 
 - **响应侧插桩在线上真的触发**: model=gpt 流式响应里出现 1 个 `signature_delta`，载体 `ghc-rsn:v1:...`，位于 reasoning 块的 `content_block_stop` 之前。
 - **oracle 1（encrypted_content 可得且被捕获）✅**: 解码载体得到真实 `encrypted_content` **1688 字符**（head `UYavmpbScfYJcMPZ...`）+ 真实 reasoning item id。证明 encrypted_content 在 `output_item.done` 确实在手、被正确搬进 envelope。
@@ -43,7 +43,7 @@
 
 1. 起一个 Claude Code 会话，**model 设为 gpt**，发一句能触发推理的话。
 2. 找该会话 transcript（`~/.claude/projects/<proj>/<uuid>.jsonl`），`grep -o 'ghc-rsn:v1:' <file> | head` —— 有命中 = **oracle 2 ✅**（Claude Code 存下了载体）。
-3. 在同会话再发一句；看 `~/.claude/litellm/probe-logs/`（或 `stream_fix.probe_only`）里该轮请求的 assistant 历史是否带 `ghc-rsn` 载体 = 客户端**回放**了它。
+3. 在同会话再发一句；看 `~/.config/litellm/probe-logs/`（或 `stream_fix.probe_only`）里该轮请求的 assistant 历史是否带 `ghc-rsn` 载体 = 客户端**回放**了它。
 4. 记录该会话头部 SSE 是否因双 `message_start` 出问题（渲染错乱/报错）= oracle 8。
 
 ## Oracle 表 · A 载体（signature，当前 PoC 实现）

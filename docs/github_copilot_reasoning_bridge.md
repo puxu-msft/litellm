@@ -73,6 +73,6 @@ gpt-origin 的 `ghc-rsn` 载体若被回放进 **claude 请求**，claude 后端
 - §4.3: 非载体 thinking 当 gpt 目标时**保留为 output_text**（非丢弃）——避免回退 litellm 既有契约（`test_assistant_thinking_block_becomes_output_text`），且 gpt 容忍、跨模型安全另由 §5 strip 保证。
 - §4.4: summary 默认 `auto`（可见），但仅 github_copilot；非 copilot no-op。
 
-## 8. 已知缺口（block 2）
+## 8. block 2 协议信封状态
 
-**双 `message_start`**（`responses_adapters/streaming_iterator.py` fallback + 上游 `response.created` 各发一次）破坏**严格 anthropic SDK** 的 stream thinking_delta 累积——严格 SDK 客户端收不到可见 reasoning 文本（curl 原始流、Claude Code 均正常）。已固化成 xfail 测试（`tests/e2e/github_copilot_reasoning/test_anthropic_sdk_reasoning.py::test_streaming_reasoning_is_visible_summary`），block 2 修好双 start 后会 xpass 报警。属 BACKLOG block 2（协议信封正确性）。
+2026-07-17 已修 direct Responses 双 `message_start`：fallback 已发 start 后，上游 `response.created` 为幂等 no-op。strict Anthropic SDK live 验证通过：显式 `summary=detailed` 能累积 thinking_delta，最终 carrier 可解码；默认 `summary=auto` 是 best-effort，不保证每次返回非空摘要。同期 direct Responses 与 Chat wrapper 均已补自然/异常 EOF 完整信封，真实 Claude CLI carrier 存储、Bash 工具配对和跨轮 replay/tamper 门禁均通过。其余 block 2/3/4 结果见 `docs/superpowers/specs/2026-07-17-anthropic-protocol-tool-stream-fidelity-design.md`。

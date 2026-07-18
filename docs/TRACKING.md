@@ -11,7 +11,7 @@
 | github_copilot messages 原生路由 | 见 plan | [routing](superpowers/specs/2026-07-13-github-copilot-messages-native-routing-design.md) | [routing](superpowers/plans/2026-07-13-github-copilot-messages-native-routing.md) | 见该 plan |
 | gpt reasoning↔thinking 保真 | 见 plan(PoC 已出结果) | — | [fidelity](superpowers/plans/2026-07-14-gpt-reasoning-thinking-fidelity.md) / [poc](superpowers/plans/2026-07-14-gpt-reasoning-poc-results.md) | 见该 plan |
 | Anthropic 协议/工具/流保真 block 2/3/4 | ✅ 已实现 + live 验证 | [fidelity](superpowers/specs/2026-07-17-anthropic-protocol-tool-stream-fidelity-design.md) | [fidelity](superpowers/plans/2026-07-17-anthropic-protocol-tool-stream-fidelity.md) | 完成；`is_error` 为协议不可表示的已知有损 |
-| 终端可观测 + 跨 worker 事件档案 | 🚧 Phase 1 完成，Phase 2 进行中 | [terminal-observability](superpowers/specs/2026-07-18-terminal-observability-event-archive-design.md)；依赖 [in-flight registry](superpowers/specs/2026-07-14-in-flight-observability-graceful-shutdown-design.md) | [TDD plan](superpowers/plans/2026-07-18-terminal-observability-event-archive.md) / [kick-off](superpowers/plans/2026-07-18-terminal-observability-event-archive-kickoff.md) | Single-worker shadow archive + JSONL；当前 PoC 保持唯一 TTY owner |
+| 终端可观测 + 跨 worker 事件档案 | ✅ 全部实现 + live验收 | [terminal-observability](superpowers/specs/2026-07-18-terminal-observability-event-archive-design.md)；复用 [in-flight registry](superpowers/specs/2026-07-14-in-flight-observability-graceful-shutdown-design.md) | [TDD plan](superpowers/plans/2026-07-18-terminal-observability-event-archive.md) / [Phase 0](../exp/terminal-observability-phase0/CONCLUSION.md) | Rich TTY、四边界archive、SQL/Web、IPC/replay均已落地；zip-transcripts归档仍按Spec保留TODO |
 
 ---
 
@@ -24,7 +24,7 @@
 - **配置**:`litellm_settings.stream_keepalive: {enabled, interval}` + per-model `litellm_params.stream_keepalive` 覆盖
 - **可观测性**:Prometheus 4 series(`litellm_keepalive_active_streams` / `_pings_sent_total` / `_stream_duration_seconds` / `_terminations_total{reason}`),default registry,lazy+guarded
 - **验证**:60 单测 + `create_response`/既有回归全绿;A 档 E2E(mock 慢上游 + 真实 litellm 代理 + 紧 read 探针)实测 PASS,见 `exp/downstream-keepalive-e2e/`(A 档 `run-a.sh` 自动化;B 档 `run-claude.sh` 真实 Claude 手动)。超时类型 PoC 见 `exp/downstream-keepalive-timeout/`(确认 read/idle 型)
-- **部署链路**:Caddy(`~/.claude/litellm/Caddyfile`,Claude→Caddy:4143→litellm:4142/4141)对保活透明(`response_header_timeout 0` / `read_timeout 0` / `stream_timeout 0` / `flush_interval -1`),无需改
+- **部署链路**:Caddy(`~/.config/litellm/Caddyfile`,Claude→Caddy:4143→litellm:4142/4141)对保活透明(`response_header_timeout 0` / `read_timeout 0` / `stream_timeout 0` / `flush_interval -1`),无需改
 - **延后**(BACKLOG):可观测性指标已做;外部固定 deadline(ingress/LB,非代码可解)、面 1 message_start 前原生 ping(留 PoC,默认只发注释)
 
 ## 上游 http_client 超时 — ✅ 完成
@@ -39,6 +39,16 @@ per-provider 上游 connect/read/pool 分轴超时 + total(asyncio 绝对 deadli
 ## 关联加固(已随会话完成)
 
 - proxy 加载期:`stream_keepalive` fail-fast 校验 + 缺上游超时 advisory(`should_advise_missing_upstream_timeout`);`http_client` 全局校验(见上)
+
+## Anthropic 协议/工具/流保真 block 2/3/4 — ✅ 已实现 + live 验证
+
+- **协议信封**：Chat wrapper 与 direct Responses wrapper 在自然 EOF、上游异常和缺失 finish/completed 事件时统一补 `content_block_stop → message_delta(end_turn) → message_stop`；direct Responses 的 fallback 与 `response.created` 只允许一个 `message_start`
+- **工具保真**：Anthropic `tool_choice.disable_parallel_tool_use` 映射为 OpenAI `parallel_tool_calls`；direct Responses function arguments 区分正常 delta、orphan 缓冲和 done-only 完整参数，三个来源互斥，避免丢失或重复
+- **流式规整**：direct Responses 按 item_id 幂等建块；reasoning orphan delta 先补 thinking start；function orphan delta 等 done 的 name/call_id 后重放；orphan done 补完整块生命周期；所有 index 从 0 连续生成，终止时关闭所有 open block
+- **验证**：Chat adapter/messages 310 例通过；direct Responses adapter 125 例通过；core SSE normalizer 13 例、hook stream 38 例通过；新增状态机测试覆盖 sync/async、自然/异常 EOF、双 start、orphan delta/stop、duplicate start/done、参数有序单次重放与 message_stop 后事件隔离
+- **live 验收**：strict SDK 显式 detailed thinking summary、流式/非流式 carrier、真实 Claude CLI carrier + Bash tool_use/tool_result 配对、valid replay、tampered rejection、跨轮 continuity 全通过；CLI transcript oracle 按本次 tmp project 精确隔离
+- **SSE 所有权**：解析前 hook 和 keepalive 前 core 是两个必要边界；hook 已复用 core delimiter/8 MiB 上限，保留 mixed chunks 与审计
+- **协议上限**：`tool_result.is_error` 在 Responses 私有扩展被 400 拒绝，Chat 私有扩展被模型忽略；content/id 保留，error bit 明确有损，不写污染模型内容的伪载体
 
 ## gpt→responses invalid_request_body 排查与修复(2026-07-15..17,已随会话完成)
 

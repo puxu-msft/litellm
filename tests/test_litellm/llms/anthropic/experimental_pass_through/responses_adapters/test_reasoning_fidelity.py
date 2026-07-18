@@ -98,20 +98,30 @@ def test_signature_delta_index_equals_reasoning_block_start(monkeypatch):
     assert sig["index"] == start["index"], "signature_delta must ride the reasoning block, not another"
 
 
-def test_unmapped_done_id_does_not_inject_carrier_into_other_block(monkeypatch):
+def test_unmapped_done_id_uses_new_reasoning_block_for_carrier(monkeypatch):
     monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
     w = _wrapper()
     # reasoning block opened for rs_s, then a text/message block opened
     w._process_event({"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_s"}})
     w._process_event({"type": "response.output_item.added", "item": {"type": "message", "id": "m1"}})
-    # done event with an unmapped reasoning id -> must NOT emit a carrier at all
+    # A done event with an unmapped reasoning id opens its own block. The
+    # carrier must use that block rather than either previously open block.
     w._process_event(
         {
             "type": "response.output_item.done",
             "item": {"type": "reasoning", "id": "other", "encrypted_content": "E", "summary": []},
         }
     )
-    assert not _sig_deltas(list(w._chunk_queue))
+    chunks = list(w._chunk_queue)
+    thinking_starts = [
+        chunk
+        for chunk in chunks
+        if chunk.get("type") == "content_block_start"
+        and chunk.get("content_block", {}).get("type") == "thinking"
+    ]
+    assert [chunk["index"] for chunk in thinking_starts] == [0, 2]
+    signature_delta = _sig_deltas(chunks)[0]
+    assert signature_delta["index"] == 2
 
 
 def test_malformed_summary_does_not_crash_and_still_carries(monkeypatch):
@@ -293,6 +303,37 @@ def test_b_carrier_emits_separate_redacted_block(monkeypatch):
     # both blocks get their own content_block_stop
     stops = {c["index"] for c in chunks if c.get("type") == "content_block_stop"}
     assert thinking_start["index"] in stops and red[0]["index"] in stops
+
+
+def test_b_carrier_duplicate_done_is_idempotent(monkeypatch):
+    monkeypatch.delenv("GHC_REASONING_DISABLE", raising=False)
+    wrapper = _wrapper_b()
+    wrapper._process_event(
+        {
+            "type": "response.output_item.added",
+            "item": {"type": "reasoning", "id": "rs_duplicate"},
+        }
+    )
+    done_event = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_duplicate",
+            "encrypted_content": "ENC-DUPLICATE==",
+            "summary": [],
+        },
+    }
+
+    wrapper._process_event(done_event)
+    wrapper._process_event(done_event)
+
+    redacted_starts = [
+        chunk
+        for chunk in wrapper._chunk_queue
+        if chunk.get("type") == "content_block_start"
+        and chunk.get("content_block", {}).get("type") == "redacted_thinking"
+    ]
+    assert len(redacted_starts) == 1
 
 
 def test_a_carrier_still_default_signature(monkeypatch):

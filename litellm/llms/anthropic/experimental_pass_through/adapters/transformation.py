@@ -935,6 +935,8 @@ class LiteLLMAnthropicMessagesAdapter:
         new_kwargs["tool_choice"] = self.translate_anthropic_tool_choice_to_openai(
             tool_choice=cast(AnthropicMessagesToolChoice, tool_choice)
         )
+        if "disable_parallel_tool_use" in tool_choice:
+            new_kwargs["parallel_tool_calls"] = not tool_choice["disable_parallel_tool_use"]
 
     def _translate_tools_to_openai(
         self,

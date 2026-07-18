@@ -79,6 +79,10 @@ class AnthropicResponsesStreamWrapper:
         self._item_id_to_block_index: Dict[str, int] = {}
         # Track open function_call items by item_id so we can emit tool_use start
         self._pending_tool_ids: Dict[str, str] = {}  # item_id -> call_id / name accumulator
+        self._orphan_function_argument_deltas: Dict[str, tuple[str, ...]] = {}
+        self._streamed_function_argument_item_ids: set[str] = set()
+        self._completed_item_ids: set[str] = set()
+        self._open_block_indices: set[int] = set()
         self._sent_message_start = False
         self._sent_message_stop = False
         self._chunk_queue: deque = deque()
@@ -107,6 +111,97 @@ class AnthropicResponsesStreamWrapper:
         self._current_block_index += 1
         return self._current_block_index
 
+    def _queue_content_block_start(self, block_idx: int, content_block: Dict[str, Any]) -> None:
+        self._open_block_indices.add(block_idx)
+        self._chunk_queue.append(
+            {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": content_block,
+            }
+        )
+
+    def _queue_content_block_stop(self, block_idx: int) -> None:
+        if block_idx not in self._open_block_indices:
+            return
+        self._open_block_indices.remove(block_idx)
+        self._chunk_queue.append({"type": "content_block_stop", "index": block_idx})
+
+    def _queue_function_argument_delta(self, item_id: Union[str, None], block_idx: int, delta: str) -> None:
+        if item_id:
+            self._streamed_function_argument_item_ids.add(item_id)
+        self._chunk_queue.append(
+            {
+                "type": "content_block_delta",
+                "index": block_idx,
+                "delta": {"type": "input_json_delta", "partial_json": delta},
+            }
+        )
+
+    @staticmethod
+    def _item_value(item: object, key: str) -> object:
+        return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
+
+    def _ensure_item_block(self, item: object) -> Union[int, None]:
+        item_type = self._item_value(item, "type")
+        item_id_value = self._item_value(item, "id")
+        item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+        if item_id is not None and item_id in self._item_id_to_block_index:
+            return self._item_id_to_block_index[item_id]
+
+        block_idx = self._next_block_index()
+        if item_id is not None:
+            self._item_id_to_block_index[item_id] = block_idx
+
+        if item_type == "message":
+            self._queue_content_block_start(block_idx, {"type": "text", "text": ""})
+            return block_idx
+        if item_type == "reasoning":
+            self._queue_content_block_start(block_idx, {"type": "thinking", "thinking": ""})
+            return block_idx
+        if item_type == "function_call":
+            call_id_value = self._item_value(item, "call_id")
+            name_value = self._item_value(item, "name")
+            call_id = call_id_value if isinstance(call_id_value, str) else ""
+            name = name_value if isinstance(name_value, str) else ""
+            if item_id is not None:
+                self._pending_tool_ids[item_id] = call_id
+            self._queue_content_block_start(
+                block_idx,
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {},
+                },
+            )
+            return block_idx
+
+        if item_id is not None:
+            self._item_id_to_block_index.pop(item_id, None)
+        self._current_block_index -= 1
+        return None
+
+    def _queue_terminal_events(
+        self,
+        *,
+        stop_reason: str = "end_turn",
+        usage: Union[Dict[str, Any], None] = None,
+    ) -> None:
+        if self._sent_message_stop:
+            return
+        for block_idx in sorted(self._open_block_indices):
+            self._queue_content_block_stop(block_idx)
+        self._chunk_queue.append(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": usage or {"input_tokens": 0, "output_tokens": 0},
+            }
+        )
+        self._chunk_queue.append({"type": "message_stop"})
+        self._sent_message_stop = True
+
     def _process_event(self, event: Any) -> None:
         """Convert one Responses API event into zero or more Anthropic chunks queued for emission."""
         event_type = getattr(event, "type", None)
@@ -115,9 +210,13 @@ class AnthropicResponsesStreamWrapper:
 
         if event_type is None:
             return
+        if self._sent_message_stop:
+            return
 
         # ---- message_start ----
         if event_type == "response.created":
+            if self._sent_message_start:
+                return
             self._sent_message_start = True
             self._chunk_queue.append(self._make_message_start())
             return
@@ -127,52 +226,13 @@ class AnthropicResponsesStreamWrapper:
             item = getattr(event, "item", None) or (event.get("item") if isinstance(event, dict) else None)
             if item is None:
                 return
-            item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
-            item_id = getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None)
-
-            if item_type == "message":
-                block_idx = self._next_block_index()
-                if item_id:
-                    self._item_id_to_block_index[item_id] = block_idx
-                self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                )
-            elif item_type == "function_call":
-                call_id = (
-                    getattr(item, "call_id", None) or (item.get("call_id") if isinstance(item, dict) else None) or ""
-                )
-                name = getattr(item, "name", None) or (item.get("name") if isinstance(item, dict) else None) or ""
-                block_idx = self._next_block_index()
-                if item_id:
-                    self._item_id_to_block_index[item_id] = block_idx
-                    self._pending_tool_ids[item_id] = call_id
-                self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call_id,
-                            "name": name,
-                            "input": {},
-                        },
-                    }
-                )
-            elif item_type == "reasoning":
-                block_idx = self._next_block_index()
-                if item_id:
-                    self._item_id_to_block_index[item_id] = block_idx
-                self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    }
-                )
+            block_idx = self._ensure_item_block(item)
+            item_type = self._item_value(item, "type")
+            item_id_value = self._item_value(item, "id")
+            item_id = item_id_value if isinstance(item_id_value, str) and item_id_value else None
+            if item_type == "function_call" and item_id is not None and block_idx is not None:
+                for buffered_delta in self._orphan_function_argument_deltas.pop(item_id, ()):
+                    self._queue_function_argument_delta(item_id, block_idx, buffered_delta)
             return
 
         # ---- text delta ----
@@ -187,13 +247,7 @@ class AnthropicResponsesStreamWrapper:
                 block_idx = self._next_block_index()
                 if item_id:
                     self._item_id_to_block_index[item_id] = block_idx
-                self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "text", "text": ""},
-                    }
-                )
+                self._queue_content_block_start(block_idx, {"type": "text", "text": ""})
             self._chunk_queue.append(
                 {
                     "type": "content_block_delta",
@@ -207,11 +261,11 @@ class AnthropicResponsesStreamWrapper:
         if event_type == "response.reasoning_summary_text.delta":
             item_id = getattr(event, "item_id", None) or (event.get("item_id") if isinstance(event, dict) else None)
             delta = getattr(event, "delta", "") or (event.get("delta", "") if isinstance(event, dict) else "")
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
+            block_idx = self._item_id_to_block_index.get(item_id) if item_id else None
+            if block_idx is None:
+                block_idx = self._ensure_item_block({"type": "reasoning", "id": item_id})
+            if block_idx is None:
+                return
             self._chunk_queue.append(
                 {
                     "type": "content_block_delta",
@@ -225,18 +279,13 @@ class AnthropicResponsesStreamWrapper:
         if event_type == "response.function_call_arguments.delta":
             item_id = getattr(event, "item_id", None) or (event.get("item_id") if isinstance(event, dict) else None)
             delta = getattr(event, "delta", "") or (event.get("delta", "") if isinstance(event, dict) else "")
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
-            self._chunk_queue.append(
-                {
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "input_json_delta", "partial_json": delta},
-                }
-            )
+            block_idx = self._item_id_to_block_index.get(item_id) if item_id else None
+            if block_idx is None:
+                if item_id:
+                    previous_deltas = self._orphan_function_argument_deltas.get(item_id, ())
+                    self._orphan_function_argument_deltas[item_id] = (*previous_deltas, delta)
+                return
+            self._queue_function_argument_delta(item_id, block_idx, delta)
             return
 
         # ---- output item done -> content_block_stop ----
@@ -245,11 +294,30 @@ class AnthropicResponsesStreamWrapper:
             item_id = (
                 getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None) if item else None
             )
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
+            if item_id and item_id in self._completed_item_ids:
+                return
+            block_idx = self._ensure_item_block(item) if item is not None else None
+            if block_idx is None:
+                return
+            item_type = self._item_value(item, "type") if item is not None else None
+            if item_type == "function_call" and item_id:
+                buffered_deltas = self._orphan_function_argument_deltas.pop(item_id, ())
+                arguments_value = self._item_value(item, "arguments")
+                argument_deltas = (
+                    buffered_deltas
+                    if buffered_deltas
+                    else (
+                        (arguments_value,)
+                        if item_id not in self._streamed_function_argument_item_ids
+                        and isinstance(arguments_value, str)
+                        and arguments_value
+                        else ()
+                    )
+                )
+                for argument_delta in argument_deltas:
+                    self._queue_function_argument_delta(item_id, block_idx, argument_delta)
+            if item_id:
+                self._completed_item_ids.add(item_id)
             # Attach the reasoning carrier only when this done event maps to a real
             # opened reasoning block; never fall back to the current (possibly text)
             # block, which would inject the carrier into the wrong content block.
@@ -260,16 +328,10 @@ class AnthropicResponsesStreamWrapper:
             if token is not None and self.reasoning_carrier == "redacted_thinking":
                 # B: close the summary thinking block, then a separate redacted_thinking
                 # carrier block (two independent content blocks, spec §4.2).
-                self._chunk_queue.append({"type": "content_block_stop", "index": reasoning_idx})
+                self._queue_content_block_stop(reasoning_idx)
                 red_idx = self._next_block_index()
-                self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": red_idx,
-                        "content_block": {"type": "redacted_thinking", "data": token},
-                    }
-                )
-                self._chunk_queue.append({"type": "content_block_stop", "index": red_idx})
+                self._queue_content_block_start(red_idx, {"type": "redacted_thinking", "data": token})
+                self._queue_content_block_stop(red_idx)
                 return
 
             if token is not None and self.reasoning_carrier == "signature":
@@ -281,12 +343,7 @@ class AnthropicResponsesStreamWrapper:
                         "delta": {"type": "signature_delta", "signature": token},
                     }
                 )
-            self._chunk_queue.append(
-                {
-                    "type": "content_block_stop",
-                    "index": block_idx,
-                }
-            )
+            self._queue_content_block_stop(block_idx)
             return
 
         # ---- response completed -> message_delta + message_stop ----
@@ -338,15 +395,7 @@ class AnthropicResponsesStreamWrapper:
             if cache_read_tokens:
                 usage_delta["cache_read_input_tokens"] = cache_read_tokens
 
-            self._chunk_queue.append(
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": usage_delta,
-                }
-            )
-            self._chunk_queue.append({"type": "message_stop"})
-            self._sent_message_stop = True
+            self._queue_terminal_events(stop_reason=stop_reason, usage=usage_delta)
             return
 
     def __aiter__(self) -> "AnthropicResponsesStreamWrapper":
@@ -373,6 +422,8 @@ class AnthropicResponsesStreamWrapper:
             pass
         except Exception as e:
             verbose_logger.error(f"AnthropicResponsesStreamWrapper error: {e}\n{traceback.format_exc()}")
+
+        self._queue_terminal_events()
 
         # Drain any remaining queued chunks
         if self._chunk_queue:

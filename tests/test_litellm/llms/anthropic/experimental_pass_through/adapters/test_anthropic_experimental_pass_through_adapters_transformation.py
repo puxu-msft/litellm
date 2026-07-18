@@ -402,6 +402,40 @@ def test_translate_anthropic_messages_to_openai_tool_message_placement():
     ), "Tool message should be placed before user message"
 
 
+def test_tool_result_is_error_is_explicitly_lossy_in_openai_chat_format():
+    """OpenAI Chat has no standard tool-result error flag.
+
+    Live Copilot differential testing showed that a private top-level
+    ``is_error`` key is accepted but ignored by the Claude backend. Preserve the
+    result content and pairing id without pretending the error bit round-trips.
+    """
+    messages = [
+        AnthropicMessagesUserMessageParam(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_error",
+                    "content": "permission denied",
+                    "is_error": True,
+                }
+            ],
+        )
+    ]
+
+    result = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=messages
+    )
+
+    assert result == [
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_error",
+            "content": "permission denied",
+        }
+    ]
+
+
 def test_translate_openai_content_to_anthropic_empty_function_arguments():
     """Test that empty function arguments are handled safely and don't cause JSON parsing errors."""
 
@@ -2922,6 +2956,30 @@ def test_translate_anthropic_tool_choice_none():
 
     result = adapter.translate_anthropic_tool_choice_to_openai({"type": "none"})
     assert result == "none"
+
+
+@pytest.mark.parametrize(
+    ("disable_parallel_tool_use", "expected_parallel_tool_calls"),
+    [(True, False), (False, True)],
+)
+def test_translate_anthropic_tool_choice_preserves_parallel_tool_use(
+    disable_parallel_tool_use: bool,
+    expected_parallel_tool_calls: bool,
+):
+    adapter = LiteLLMAnthropicMessagesAdapter()
+
+    result, _ = adapter.translate_anthropic_to_openai(
+        {
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tool_choice": {
+                "type": "auto",
+                "disable_parallel_tool_use": disable_parallel_tool_use,
+            },
+        }
+    )
+
+    assert result["parallel_tool_calls"] is expected_parallel_tool_calls
 
 
 # ---------------------------------------------------------------------------

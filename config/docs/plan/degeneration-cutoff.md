@@ -46,7 +46,7 @@
 
 ### 3. live 流式去重(边流边去重,不结束 turn)—— **已实现**(2026-07-14 改判为改进)
 
-初判「不改流式、搁置」;用户随后指出这是**改进而非取舍**(去重正确性与恢复保留和 buffered 一致,额外解冻屏幕,无功能性下风,只有实现工作量),按 `long-term-wins` 不该降级为 backlog。故已实现:
+初判「不改流式、搁置」;用户随后指出这是**改进而非取舍**(去重正确性与恢复保留和 buffered 一致,额外解冻屏幕,无功能性下风,只有实现工作量),按 `long-termism-wins` 不该降级为 backlog。故已实现:
 
 - `hookpkg/degen.py` 新增 `LiveDedup`(forward-then-suppress 纯状态机):有效内容实时转发;`\n\n` 相同短段游程达 `min_run` 时插一次 notice 并抑制后续重复;遇不同段(恢复)即续流。红线与 fold 对齐(空段透明、长段打断、仅 `\n\n` 级);非法阈值/unsafe notice 降级。
 - `hookpkg/stream.py` 加**附加 live 分支**(`degen_trim.mode=="live"` 且 convert_invoke 关时启用):text block 不全缓冲,start 立即外发、每 delta 过 `LiveDedup` 按段外发、stop 前 flush;message_delta/流末/异常三处均 flush live 尾段(不丢内容)。**不改 block 结构 / index_shift / stop_reason**(1 text block → 1 text block,不结束 turn)。

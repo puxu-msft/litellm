@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -30,15 +30,24 @@ _TASK = (
 )
 
 
-def _stored_carrier_signatures(started_at: float) -> list[str]:
+def _project_transcripts(cwd: Path, started_at: float) -> list[Path]:
+    project_slug = re.sub(r"[^A-Za-z0-9-]", "-", str(cwd.resolve()))
+    project_dir = Path.home() / ".claude" / "projects" / project_slug
+    if not project_dir.is_dir():
+        return []
+    return [
+        jsonl
+        for jsonl in project_dir.rglob("*.jsonl")
+        if jsonl.stat().st_mtime >= started_at - 1
+    ]
+
+
+def _stored_carrier_signatures(cwd: Path, started_at: float) -> list[str]:
     """Collect ghc-rsn carrier signatures from any Claude Code transcript touched since
     ``started_at`` (main sessions and subagents)."""
-    projects = Path.home() / ".claude" / "projects"
     sigs: list[str] = []
-    for jsonl in projects.rglob("*.jsonl"):
+    for jsonl in _project_transcripts(cwd, started_at):
         try:
-            if jsonl.stat().st_mtime < started_at - 1:
-                continue
             for line in jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     obj = json.loads(line)
@@ -58,6 +67,35 @@ def _stored_carrier_signatures(started_at: float) -> list[str]:
         except OSError:
             continue
     return sigs
+
+
+def _stored_paired_tool_uses(cwd: Path, started_at: float) -> list[dict]:
+    """Return tool_use blocks whose id has a tool_result in the same transcript."""
+    paired: list[dict] = []
+    for jsonl in _project_transcripts(cwd, started_at):
+        try:
+            tool_uses: dict[str, dict] = {}
+            result_ids: set[str] = set()
+            for line in jsonl.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                message = obj.get("message") or {}
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                        tool_uses[block["id"]] = block
+                    elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                        result_ids.add(block["tool_use_id"])
+            paired.extend(tool_uses[tool_id] for tool_id in result_ids if tool_id in tool_uses)
+        except OSError:
+            continue
+    return paired
 
 
 @pytest.mark.claude_cli
@@ -82,7 +120,7 @@ class TestClaudeCliReasoning:
         )
         assert proc.returncode == 0, f"claude CLI failed: {proc.stderr[-800:]}"
 
-        sigs = _stored_carrier_signatures(started_at)
+        sigs = _stored_carrier_signatures(tmp_path, started_at)
         assert sigs, (
             "Claude Code should store a ghc-rsn reasoning carrier for a gpt turn "
             "(R1). If empty, confirm the run used gpt via this proxy and triggered reasoning."
@@ -90,3 +128,15 @@ class TestClaudeCliReasoning:
         res = decode_carrier({"type": "thinking", "thinking": "", "signature": sigs[0]})
         assert isinstance(res, DecodedCarrier)
         assert len(res.envelope.encrypted_content) > 100, "stored carrier should decode to real encrypted reasoning"
+
+        bash_calls = [
+            block
+            for block in _stored_paired_tool_uses(tmp_path, started_at)
+            if block.get("name") == "Bash"
+            and isinstance(block.get("input"), dict)
+            and block["input"].get("command")
+        ]
+        assert bash_calls, (
+            "Claude Code should store a Bash tool_use with a non-empty command "
+            "and a matching tool_result in the same transcript"
+        )

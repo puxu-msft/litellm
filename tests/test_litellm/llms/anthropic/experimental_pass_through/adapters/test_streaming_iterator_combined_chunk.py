@@ -132,9 +132,15 @@ def test_delayed_usage_chunk_preserves_cache_tokens():
     wrapper = AnthropicStreamWrapper(completion_stream=iter(chunks), model="gpt-4o")
     events = list(wrapper)
 
-    message_delta = next(
-        event for event in events if event.get("type") == "message_delta"
-    )
+    event_types = [event.get("type") for event in events]
+    assert event_types[-3:] == [
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert event_types.count("message_delta") == 1
+    assert event_types.count("message_stop") == 1
+    message_delta = events[-2]
 
     assert message_delta["usage"]["input_tokens"] == 70
     assert message_delta["usage"]["output_tokens"] == 5

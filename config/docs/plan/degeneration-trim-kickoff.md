@@ -45,4 +45,4 @@ litellm 代理（`~/.config/litellm/`）的 hook 包 `hookpkg/` 在流式响应�
 
 - 兜底路径（末尾/异常/message_delta 早到 flush）**不折叠**，是有意降级，勿改。
 - 折叠 1→1 block **不动** index_shift。
-- 用户价值观：`never-swallow-errors`、`root-cause-over-patch`、`long-term-wins`；勿以 YAGNI 砍范围。
+- 用户价值观：`never-swallow-errors`、`root-cause-over-patch`、`long-termism-wins`；勿以 YAGNI 砍范围。

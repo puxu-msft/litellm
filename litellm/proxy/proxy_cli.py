@@ -1168,7 +1168,11 @@ def run_server(
                 )
 
                 if should_update_prisma_schema(general_settings.get("disable_prisma_schema_update")) is False:
-                    check_prisma_schema_diff(db_url=None)
+                    disable_prisma_schema_check = (
+                        str(general_settings.get("disable_prisma_schema_check", False)).lower() == "true"
+                    )
+                    if disable_prisma_schema_check is False:
+                        check_prisma_schema_diff(db_url=None)
                 else:
                     if not use_v2_migration_resolver:
                         print(

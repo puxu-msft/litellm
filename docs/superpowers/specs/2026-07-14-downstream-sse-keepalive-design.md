@@ -186,7 +186,7 @@ FirstChunkRace =
 实际部署拓扑：**Claude Code → Caddy `:4143` → litellm（`:4142` 主 / `:4141` 备）→ github_copilot 上游**。逐跳超时:
 
 - **Claude Code（客户端）**：`API_TIMEOUT_MS`（默认 600s，等响应头,头到即清）+ `API_FORCE_IDLE_TIMEOUT`（默认 300s，body 空闲 watchdog，收字节即重置）。**这是唯一会咬的计时器**,也是保活的目标
-- **Caddy（反代,`~/.claude/litellm/Caddyfile`）——对保活完全透明,无需改**:
+- **Caddy（反代,`~/.config/litellm/Caddyfile`）——对保活完全透明,无需改**:
   - 下游侧（client→Caddy）`servers.timeouts.idle 20m`、`stream_timeout 0`、`stream_close_delay 300s`
   - 上游侧（Caddy→litellm）`transport http`: `response_header_timeout 0`（等 litellm 首字节无上限,故 litellm TTFB 缓冲期间 Caddy 不切）、`read_timeout 0`、`write_timeout 0`、`dial_timeout 3s`
   - `flush_interval -1`（每个 chunk 立即透传不缓冲）→ `: ping` 帧即时到达客户端

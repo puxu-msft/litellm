@@ -73,7 +73,10 @@ def fetch_endpoint_pairs(
 
 _CAP_CACHE: _TTLCache = InMemoryCache(max_size_in_memory=64, default_ttl=1800)
 _CACHE_TTL_SECONDS = 1800
-_REFRESH_INTERVAL_SECONDS = 300
+# Kept below the ~5 min Copilot token refresh window (expires_at - refresh_in) so
+# the background loop reliably renews the api key a couple of times before expiry,
+# rather than racing the boundary at a 5 min cadence.
+_REFRESH_INTERVAL_SECONDS = 120
 
 
 def refresh_capabilities(

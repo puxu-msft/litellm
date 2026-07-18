@@ -17,11 +17,6 @@ import json
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-
-try:
-    from prisma.errors import UniqueViolationError
-except ImportError:
-    UniqueViolationError = None  # type: ignore
 from pydantic import BaseModel
 
 from litellm._logging import verbose_proxy_logger
@@ -50,6 +45,15 @@ def _is_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
 def _caller_key(user_api_key_dict: UserAPIKeyAuth) -> Optional[str]:
     """Return the hashed key token that identifies this caller, or None for master key."""
     return user_api_key_dict.token
+
+
+def _is_unique_violation_error(error: Exception) -> bool:
+    try:
+        from prisma.errors import UniqueViolationError
+    except ImportError:
+        return False
+
+    return isinstance(error, UniqueViolationError)
 
 
 # Status transitions driven by event_type
@@ -343,7 +347,7 @@ async def append_workflow_event(
             return event
 
         except Exception as e:
-            if UniqueViolationError is not None and isinstance(e, UniqueViolationError):
+            if _is_unique_violation_error(e):
                 if attempt == _MAX_SEQUENCE_RETRIES - 1:
                     verbose_proxy_logger.exception(
                         "Sequence number collision after %d retries for run %s",
@@ -427,7 +431,7 @@ async def append_workflow_message(
             return msg
 
         except Exception as e:
-            if UniqueViolationError is not None and isinstance(e, UniqueViolationError):
+            if _is_unique_violation_error(e):
                 if attempt == _MAX_SEQUENCE_RETRIES - 1:
                     verbose_proxy_logger.exception(
                         "Sequence number collision after %d retries for run %s",

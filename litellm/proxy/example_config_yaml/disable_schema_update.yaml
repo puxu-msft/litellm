@@ -15,3 +15,4 @@ litellm_settings:
 
 general_settings:
   disable_prisma_schema_update: true
+  disable_prisma_schema_check: true

@@ -1,8 +1,8 @@
 import os
 import sys
+from collections.abc import AsyncIterator, Iterator
 
 import pytest
-from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
@@ -10,6 +10,71 @@ from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterato
     AnthropicStreamWrapper,
 )
 from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+
+
+def _text_chunk(content: str) -> ModelResponseStream:
+    return ModelResponseStream(
+        choices=[
+            StreamingChoices(
+                delta=Delta(content=content), index=0, finish_reason=None
+            )
+        ],
+    )
+
+
+def _event_types(events: list[dict]) -> list[str]:
+    return [event["type"] for event in events]
+
+
+def _sync_stream(*, fail: bool) -> Iterator[ModelResponseStream]:
+    yield _text_chunk("partial")
+    if fail:
+        raise RuntimeError("upstream disconnected")
+
+
+async def _async_stream(*, fail: bool) -> AsyncIterator[ModelResponseStream]:
+    yield _text_chunk("partial")
+    if fail:
+        raise RuntimeError("upstream disconnected")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_sync_stream_eof_emits_complete_message_envelope(fail: bool):
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=_sync_stream(fail=fail), model="claude-3"
+    )
+
+    events = list(wrapper)
+
+    assert _event_types(events) == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events[-2]["delta"]["stop_reason"] == "end_turn"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_async_stream_eof_emits_complete_message_envelope(fail: bool):
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=_async_stream(fail=fail), model="claude-3"
+    )
+
+    events = [event async for event in wrapper]
+
+    assert _event_types(events) == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    assert events[-2]["delta"]["stop_reason"] == "end_turn"
 
 
 # Create a simple test

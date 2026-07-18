@@ -38,16 +38,10 @@ class TestAnthropicSdkReasoning:
         assert isinstance(res, DecodedCarrier)
         assert len(res.envelope.encrypted_content) > 100, "carrier should hold real encrypted reasoning"
 
-    @pytest.mark.xfail(
-        reason="double message_start (block 2 protocol-envelope defect) breaks the strict "
-        "anthropic SDK stream's thinking_delta accumulation; Claude Code (lenient) handles it "
-        "-- visible reasoning for the real client is covered by the claude_cli group. xpass "
-        "here signals block 2 fixed the double message_start.",
-        strict=False,
-    )
-    def test_streaming_reasoning_is_visible_summary(self, anthropic_client, gpt_model):
-        # Visible reasoning (summary=auto) is streamed as thinking_delta. Accumulate the raw
-        # deltas the SDK surfaces (currently suppressed by the double message_start, see xfail).
+    def test_streaming_detailed_reasoning_is_visible_summary(self, anthropic_client, gpt_model):
+        # ``auto`` may legitimately omit a summary. Use the bridge's explicit
+        # ``detailed`` extension so this test deterministically exercises strict
+        # SDK parsing and accumulation of thinking_delta events.
         thinking_text = ""
         with anthropic_client.messages.stream(
             model=gpt_model,
@@ -55,12 +49,19 @@ class TestAnthropicSdkReasoning:
             thinking={"type": "enabled", "budget_tokens": 1500},
             messages=[{"role": "user", "content": _PROMPT}],
             extra_headers={"anthropic-beta": _BETA},
+            extra_body={
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 1500,
+                    "summary": "detailed",
+                }
+            },
         ) as stream:
             for event in stream:
                 delta = getattr(event, "delta", None)
                 if getattr(event, "type", None) == "content_block_delta" and getattr(delta, "type", None) == "thinking_delta":
                     thinking_text += getattr(delta, "thinking", "") or ""
-        assert thinking_text.strip(), "summary=auto default should stream visible reasoning as thinking_delta"
+        assert thinking_text.strip(), "summary=detailed should stream visible reasoning as thinking_delta"
 
     def test_streaming_final_message_carries_carrier(self, anthropic_client, gpt_model):
         with anthropic_client.messages.stream(

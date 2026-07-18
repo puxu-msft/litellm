@@ -6,7 +6,7 @@
 
 ## 结论先行
 
-**hook 的 CPU 开销相对模型/网络时间可以忽略。** 真实 opus 请求(~400KB / 16-19 万 token 上下文)端到端 3-10s,而请求侧 hook `process()` 只花 ~3ms(≈0.03-0.1%);响应侧逐 chunk 7µs 分摊在秒级流上、被 chunk 间网络间隔淹没。体检的价值不在"发现卡顿",而在定位了一处**纯浪费**和一处**冗余计算**——都值得按 long-term-wins 清掉,但都不是延迟瓶颈。
+**hook 的 CPU 开销相对模型/网络时间可以忽略。** 真实 opus 请求(~400KB / 16-19 万 token 上下文)端到端 3-10s,而请求侧 hook `process()` 只花 ~3ms(≈0.03-0.1%);响应侧逐 chunk 7µs 分摊在秒级流上、被 chunk 间网络间隔淹没。体检的价值不在"发现卡顿",而在定位了一处**纯浪费**和一处**冗余计算**——都值得按 long-termism-wins 清掉,但都不是延迟瓶颈。
 
 ## 一、请求侧 `process()` —— 每请求一次(离线,生产配置)
 
@@ -53,7 +53,15 @@ sink 每条成功请求追加一行 `total_s / ttft_s / gen_s / tokens` 到 `pro
 
 **instrumentation 限制**:anthropic_messages 透传的流式路径上,litellm 把 `completionStartTime` 设成 ≈`endTime`,故 `ttft_s == total_s`、`gen_s == 0`,首 token/生成时长拆不开。`total_s` 可靠;ttft/gen 列在这条路上退化(其他路径如 responses API 可能不同)。要真 TTFT 需在 hook 首个 yield 处自计时(本次 TTFB 不在范围,未做)。
 
-## 建议(按 long-term-wins,均非延迟急件)
+## 四、TUI 请求日志（2026-07-18）
+
+`request_log` 的完成行采用访问日志式布局：`[ OK ] 17:18:53 200 github_copilot/claude-opus-4.8 27.3s ■ ↑1.5MB ↓17.6KB ↑2+567.3k+4.7k ↻99%+1% ↓1.8k tool_use(Bash) think:enc(1) (thinking:adaptive)`。工具名来自聚合 `ModelResponse.choices[].message.tool_calls`；`think:enc(N)` 统计带不透明 signature、data 或 encrypted_content 的 thinking block；请求 thinking 模式来自 `standard_logging_object.model_parameters.thinking.type`。字段缺失时直接省略，不输出诊断占位。
+
+真实 TTY 下，`async_pre_call_hook` 按 `litellm_call_id` 登记请求，最后一行每 200ms 实时刷新在途模型与耗时；同模型并发合并为 `model ×N elapsed`，其中 elapsed 是该组最早请求的耗时。成功或失败日志回调按同一 call ID 注销请求，并把完成行写入上方滚动区。footer 使用 DECSTBM 预留终端最后一行，刷新时保存并恢复光标；最后一个请求结束后清空 footer、恢复全屏滚动区。非 TTY 输出继续走普通逐行 logging，不写 ANSI 控制序列。
+
+配置入口为 `request_log.live_status`，默认开启；`request_log.diagnose` 已默认关闭。纯 formatter、终端生命周期和 logging handler 由 `hookpkg/tests/test_logline.py` 覆盖，并用 PTY + pyte 抓屏验证了双请求 `×2`、单请求、普通日志插入和全部完成后的 footer 清理。
+
+## 建议(按 long-termism-wins,均非延迟急件)
 
 1. **[已实施 ✅]** 干掉每请求的整份 messages JSON round-trip 快照。`_orphan_pre_fix_snapshot` 先用只读的 `orphans.find_orphans_any_format` 检测,**仅当确有孤儿**才取快照再修复(语义不变:快照本就只在有孤儿时用)。效果:large `process()` **3.9ms → 1.24ms(-68%)**,常态省掉 2.8ms + 一次 600KB 全量分配。回归测试 `tests/test_init.py::TestOrphanPreFixSnapshot`(两向锁定:干净不快照、有孤儿必快照)。已 reload 上线。
 2. **[已实施 ✅]** block_audit 稳态设 `violation_only:true`——干净流不再落盘(block-seq 只在真有违规时写),每流也不再为审计重复 parse。已线上生效(config 热读),流式 smoke 实测干净流零落盘。更彻底的消除重复 parse(状态机把已 parse 事件传给审计层复用)需改接口,列入 backlog。

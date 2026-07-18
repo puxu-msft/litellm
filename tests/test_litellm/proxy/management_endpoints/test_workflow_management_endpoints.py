@@ -4,6 +4,7 @@ Uses FastAPI TestClient with a mocked prisma_client.
 """
 
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -143,6 +144,23 @@ def _override_auth_user_with_token(token: str = "tok-abc") -> Any:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_module_import_does_not_eagerly_load_prisma() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "import litellm.proxy.management_endpoints.workflow_management_endpoints; "
+                "raise SystemExit('prisma' in sys.modules)"
+            ),
+        ],
+        check=False,
+    )
+
+    assert result.returncode == 0
 
 
 class TestCreateWorkflowRun:
@@ -412,6 +430,30 @@ class TestWorkflowMessages:
             json={"role": "user", "content": "fix the bug"},
         )
         assert resp.status_code == 200
+
+    @patch("litellm.proxy.proxy_server.prisma_client")
+    def test_sequence_collision_retries_and_succeeds(self, mock_pc):
+        mock_pc.db = self._prisma.db
+        self._prisma.db.litellm_workflowrun.find_unique = AsyncMock(
+            return_value=_make_run()
+        )
+        self._prisma.db.litellm_workflowmessage.find_many = AsyncMock(return_value=[])
+        self._prisma.db.litellm_workflowmessage.create = AsyncMock(
+            side_effect=[
+                UniqueViolationError(
+                    {"user_facing_error": {"message": "unique"}}
+                ),
+                _make_message(sequence_number=1),
+            ]
+        )
+
+        resp = self.client.post(
+            "/v1/workflows/runs/run-1/messages",
+            json={"role": "user", "content": "fix the bug"},
+        )
+
+        assert resp.status_code == 200
+        assert self._prisma.db.litellm_workflowmessage.create.await_count == 2
 
     @patch("litellm.proxy.proxy_server.prisma_client")
     def test_append_message_unknown_run_returns_404(self, mock_pc):

@@ -13,6 +13,11 @@ from __future__ import annotations
 import json
 import logging
 
+from litellm.proxy.common_utils.sse_frame_normalizer import (
+    DEFAULT_MAX_UNTERMINATED_BYTES,
+    find_frame_delimiter,
+)
+
 from hookpkg.config import load_config, default_degen_trim
 from hookpkg.probes import ProbeContext
 from hookpkg.sse import sse_parse, sse_serialize, is_truncated_json_frame
@@ -57,7 +62,11 @@ def _tool_out_integrity(input_obj, rule):
     return {"items_key": items_key, "items_type": "list", "n_items": len(items), "missing": missing}
 
 
-async def _reassemble_sse_frames(response, ctx=None):
+async def _reassemble_sse_frames(
+    response,
+    ctx=None,
+    max_unterminated_bytes=DEFAULT_MAX_UNTERMINATED_BYTES,
+):
     """把上游按网络 chunk 边界产出的 SSE bytes/str 重组成「一 chunk 一完整帧」。
 
     上游(github_copilot 双重转换 + httpx 分块)不保证 chunk 对齐 SSE 帧边界:一个
@@ -90,10 +99,16 @@ async def _reassemble_sse_frames(response, ctx=None):
                 carry = b""
             yield chunk
             continue
-        while b"\n\n" in carry:
-            frame, carry = carry.split(b"\n\n", 1)
-            full = frame + b"\n\n"
+        end = find_frame_delimiter(carry)
+        while end != -1:
+            full = carry[:end]
+            carry = carry[end:]
             yield full.decode("utf-8", "replace") if emit_str else full
+            end = find_frame_delimiter(carry)
+        if len(carry) > max_unterminated_bytes:
+            raise ValueError(
+                f"SSE frame exceeded {max_unterminated_bytes} bytes without a delimiter"
+            )
     if carry:
         yield carry.decode("utf-8", "replace") if emit_str else carry
     if stitched and ctx is not None:

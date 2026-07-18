@@ -1436,6 +1436,72 @@ class TestProxyInitializationHelpers:
 class TestRunServerDbSetup:
     """Tests for run_server's prisma setup_database behavior."""
 
+    @pytest.mark.parametrize(
+        ("disable_schema_check", "expected_check_count"),
+        [(True, 0), (False, 1)],
+    )
+    @patch("subprocess.run")
+    @patch("atexit.register")
+    @patch("litellm.proxy.db.prisma_client.PrismaManager.setup_database")
+    @patch("litellm.proxy.db.check_migration.check_prisma_schema_diff")
+    def test_prisma_schema_check_setting(
+        self,
+        mock_check_schema_diff,
+        mock_setup_database,
+        mock_atexit_register,
+        mock_subprocess_run,
+        disable_schema_check,
+        expected_check_count,
+    ):
+        from click.testing import CliRunner
+
+        from litellm.proxy.proxy_cli import run_server
+
+        mock_subprocess_run.return_value = MagicMock(returncode=0)
+        mock_proxy_module = MagicMock(
+            app=MagicMock(),
+            ProxyConfig=MagicMock(),
+            KeyManagementSettings=MagicMock(),
+            save_worker_config=MagicMock(),
+        )
+        mock_proxy_module.ProxyConfig.return_value.get_config = AsyncMock(
+            return_value={
+                "general_settings": {
+                    "database_url": "postgresql://test:test@localhost:5432/test",
+                    "disable_prisma_schema_update": True,
+                    "disable_prisma_schema_check": disable_schema_check,
+                }
+            }
+        )
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("DATABASE_URL", "DIRECT_URL")}
+
+        with (
+            patch.dict(os.environ, clean_env, clear=True),
+            patch.dict(
+                "sys.modules",
+                {
+                    "proxy_server": mock_proxy_module,
+                    "litellm.proxy.proxy_server": mock_proxy_module,
+                },
+            ),
+            patch(
+                "litellm.proxy.proxy_cli.ProxyInitializationHelpers._get_default_unvicorn_init_args",
+                return_value={
+                    "app": "litellm.proxy.proxy_server:app",
+                    "host": "localhost",
+                    "port": 8000,
+                },
+            ),
+        ):
+            result = CliRunner().invoke(
+                run_server,
+                ["--local", "--config", "test-config.yaml", "--skip_server_startup"],
+            )
+
+        assert result.exit_code == 0, f"exit_code={result.exit_code}, output={result.output}"
+        mock_setup_database.assert_not_called()
+        assert mock_check_schema_diff.call_count == expected_check_count
+
     @patch("subprocess.run")
     @patch("atexit.register")
     @patch("litellm.proxy.db.prisma_client.PrismaManager.setup_database")

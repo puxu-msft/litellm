@@ -363,6 +363,37 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
 
+    def test_user_tool_result_is_error_is_explicitly_lossy(self):
+        """Responses has no standard function-output error flag.
+
+        Copilot rejects a private ``is_error`` key with HTTP 400. Preserve the
+        output and call_id while making the unavoidable loss executable in the
+        contract instead of inventing a model-visible content carrier.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_error",
+                        "content": "permission denied",
+                        "is_error": True,
+                    }
+                ],
+            }
+        ]
+
+        result = _translate_messages(messages)
+
+        assert result == [
+            {
+                "type": "function_call_output",
+                "call_id": "call_error",
+                "output": "permission denied",
+            }
+        ]
+
     def test_user_tool_result_list_content(self):
         """tool_result with list of text blocks is joined into a single string."""
         messages = [

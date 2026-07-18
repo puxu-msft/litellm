@@ -653,6 +653,33 @@ class TestSSEFrameReassembly(unittest.TestCase):
         evs = parse_events(run(chunks, CFG_PLAIN))
         self.assertEqual(joined_text(evs), "one two")
 
+    def test_crlf_delimited_frames_are_split_individually(self):
+        async def gen():
+            yield b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n"
+            yield b"event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n"
+
+        async def collect():
+            return [chunk async for chunk in stream_mod._reassemble_sse_frames(gen())]
+
+        out = asyncio.run(collect())
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(chunk.endswith(b"\r\n\r\n") for chunk in out))
+
+    def test_unterminated_frame_over_limit_raises(self):
+        async def gen():
+            yield b"12345"
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in stream_mod._reassemble_sse_frames(
+                    gen(), max_unterminated_bytes=4
+                )
+            ]
+
+        with self.assertRaises(ValueError):
+            asyncio.run(collect())
+
     def test_genuine_trailing_truncation_still_dropped(self):
         # 真·流末尾截断(半截 data 且后面再无 chunk):重组后仍是半截,交由既有截断丢弃逻辑处理,
         # 不得泄漏给客户端。断言输出里不含未闭合的 `partial_json` 半截字符串。

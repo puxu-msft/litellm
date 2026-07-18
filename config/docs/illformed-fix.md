@@ -1,7 +1,7 @@
 # 流式畸形/截断响应修复 / Ill-formed & Truncated Stream Fix
 
-状态：**活文档**（本次「截断半截帧」修复已实施：根因确定性复现 + 8 测试全绿 + 线上已热重载启用）
-最近更新：2026-07-14
+状态：**活文档**（hook 字节层修复已在线；fork direct Responses 状态机第一阶段已落地）
+最近更新：2026-07-17
 
 > 本文是 `stream_transform`（`hookpkg/stream.py`）如何处理**上游畸形/截断 Anthropic SSE 流**的活文档，随代码演进持续更新。它汇总各类畸形模式、对应的客户端症状、hook 的现状（已修/观测中/已知缺口），并详解本轮针对 `JSON Parse error: Unterminated string` 的修复。改动 hook 处理逻辑时，请同步更新本文的「畸形模式映射表」「已知缺口」「变更记录」三处。
 
@@ -104,9 +104,17 @@ Claude Code 经本代理打到 copilot 后端时，`/v1/messages`（Anthropic �
 
 以下是本轮**未纳入**修复的相关畸形，症状不同，记录在此避免遗忘：
 
-- **未匹配透传块的 `unclosed`**：若上游 `content_block_start` 的是一个**未被缓冲**的块（未在 `stream_fix.tools` 里的工具，或普通结构块），它在 `ev is None`/透传路径被立即 yield；若随后上游断流，收尾逻辑因 `buffering`/`tbuf` 均为假而**不补 `stop`**，留下未闭合块 -> 客户端 `RangeError("Content block not found")`。这正是 block_audit.py 当初为 litellm#24765 建的场景。**建议**：在收尾逻辑追踪「已 yield 但未 stop 的最后一个 open index」，末尾一律补 `content_block_stop`。
-- **缺失 `message_stop` / `message_delta`**：上游断流常同时丢掉 `message_delta`（`stop_reason`）与 `message_stop` / `[DONE]`。目前仅在 `injected` 分支补 `message_delta`。**建议**：断流收尾时统一补 `message_delta(stop_reason=end_turn)` + `message_stop`，让客户端拿到完整信封。
-- **`orphan_delta` / `orphan_stop` / `index_gap` 的主动改写**：目前仅 block_audit 观测。若这些在线上持续出现且致客户端失败，可在 transform 侧做序列规整（补缺失 start、重排 index）。改写前务必先 `probe_only` 抓真实 wire 格式（见下）。
+- ~~**Chat 最终 SSE 未匹配透传块的 `unclosed`**~~：**已覆盖（2026-07-17）**。fork Chat/direct Responses adapter 统一补终止信封；解析前 hook 重组 raw provider chunks 并处理截断，callback 输出后 core normalizer 保护 keepalive 注入边界
+- ~~**核心 adapter 缺失 `message_stop` / `message_delta`**~~：**已实现（2026-07-17）**。Chat sync/async 与 direct Responses 的自然 EOF、异常 EOF 均关闭 open block，并补 `message_delta(stop_reason=end_turn)` + `message_stop`；真实 finish/completed 提供的 stop_reason/usage 优先
+- **`orphan_delta` / `orphan_stop` / `index_gap` 的主动改写**：direct Responses 已在 fork 核心按 item_id 规整 reasoning orphan delta、function arguments orphan 缓冲/重放、orphan done、duplicate added/done 和负 index；Chat 最终 SSE 继续由 block_audit 观测和 hook 边界恢复
+
+## Fork 核心迁移状态（2026-07-17）
+
+- `responses_adapters/streaming_iterator.py`：fallback 与 `response.created` 幂等，只发一个 `message_start`；所有 Responses item 通过统一生命周期建立连续 block index；completed/EOF/异常共用完整终止出口
+- `adapters/streaming_iterator.py`：sync/async 共用终结队列，断流时不再留下 open block 或缺 message 终止事件
+- 工具参数：normal delta、orphan 缓冲、done-only 完整 arguments 三个来源互斥；避免丢失、负 index 与 done 重复补发
+- 保留在 hook：SSE bytes 跨 chunk 重组、尾部截断帧丢弃、具体工具 schema 补全、`<invoke>` 恢复、末端重复工具去重和生产审计
+- 双边界结论：hook 位于 core keepalive normalizer 之前，不能删除解析前重组；core 位于 callback 输出之后，不能删除最终 frame normalizer。hook 现复用 core LF/CRLF/CR delimiter 与 8 MiB 上限 primitives
 
 以上是否要一并做掉，取决于线上是否真的出现对应症状 —— 用 block_audit 的 `violation_only` 数据驱动决策，别凭空加工。
 

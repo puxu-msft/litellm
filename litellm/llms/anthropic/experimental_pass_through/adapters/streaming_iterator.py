@@ -176,6 +176,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         # observable state inconsistent during the drain window.
         self.sent_compaction_block_start: bool = False
         self.sent_compaction_block_delta: bool = False
+        self.terminal_events_queued: bool = False
         # Per-instance queue for buffering multiple chunks. Must be initialized
         # here (not at class level) so concurrent streams don't share the same
         # deque and corrupt each other's SSE event order.
@@ -188,6 +189,44 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             type="text",
             text="",
         )
+
+    def _queue_terminal_events(self) -> None:
+        if self.terminal_events_queued:
+            return
+
+        if not self.queued_usage_chunk:
+            if self.holding_chunk is not None:
+                self.chunk_queue.append(self.holding_chunk)
+                self.holding_chunk = None
+
+            if not self.sent_content_block_finish and self.sent_content_block_start:
+                self.chunk_queue.append(
+                    {
+                        "type": "content_block_stop",
+                        "index": self.current_content_block_index,
+                    }
+                )
+                self.sent_content_block_finish = True
+
+            if self.holding_stop_reason_chunk is not None:
+                self.chunk_queue.append(self._augment_message_delta_usage(self.holding_stop_reason_chunk))
+                self.holding_stop_reason_chunk = None
+            else:
+                self.chunk_queue.append(
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": UsageDelta(input_tokens=0, output_tokens=0),
+                    }
+                )
+        else:
+            self.holding_chunk = None
+
+        if not self.sent_last_message:
+            self.sent_last_message = True
+            self.chunk_queue.append({"type": "message_stop"})
+
+        self.terminal_events_queued = True
 
     def _merge_usage_into_held_stop_reason_chunk(self, chunk: Any) -> Dict[str, Any]:
         """Merge usage data from ``chunk`` into the held ``message_delta`` chunk.
@@ -492,40 +531,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                     self.chunk_queue.append(processed_chunk)
                     return self.chunk_queue.popleft()
 
-            # Handle any remaining held chunks after stream ends. The
-            # buffered ``holding_chunk`` (a ``content_block_delta``) must
-            # precede the final ``message_delta`` so Anthropic SSE event
-            # ordering is preserved. When ``queued_usage_chunk`` is True,
-            # the final ``message_delta`` has already been emitted; any
-            # buffered content delta is dropped rather than emitted after
-            # ``message_delta`` (which would violate SSE ordering and may
-            # confuse strict Anthropic SDK clients).
-            if not self.queued_usage_chunk:
-                if self.holding_chunk is not None:
-                    self.chunk_queue.append(self.holding_chunk)
-                    self.holding_chunk = None
-                if self.holding_stop_reason_chunk is not None:
-                    # A final ``message_delta`` must be preceded by
-                    # ``content_block_stop`` so the emitted SSE stays in
-                    # valid Anthropic order (... -> content_block_stop ->
-                    # message_delta). Emit ``content_block_stop`` here if
-                    # the active content block was not already closed.
-                    if not self.sent_content_block_finish:
-                        self.chunk_queue.append(
-                            {
-                                "type": "content_block_stop",
-                                "index": self.current_content_block_index,
-                            }
-                        )
-                        self.sent_content_block_finish = True
-                    self.chunk_queue.append(self._augment_message_delta_usage(self.holding_stop_reason_chunk))
-                    self.holding_stop_reason_chunk = None
-            else:
-                self.holding_chunk = None
-
-            if not self.sent_last_message:
-                self.sent_last_message = True
-                self.chunk_queue.append({"type": "message_stop"})
+            self._queue_terminal_events()
 
             if self.chunk_queue:
                 return self.chunk_queue.popleft()
@@ -534,28 +540,12 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         except StopIteration:
             if self.chunk_queue:
                 return self.chunk_queue.popleft()
-            # Handle any held stop_reason chunk. Emit ``content_block_stop``
-            # first if the active content block was not already closed, so
-            # Anthropic SSE ordering is preserved (content_block_stop ->
-            # message_delta).
-            if self.holding_stop_reason_chunk is not None:
-                if not self.sent_content_block_finish:
-                    self.sent_content_block_finish = True
-                    self.chunk_queue.append(self._augment_message_delta_usage(self.holding_stop_reason_chunk))
-                    self.holding_stop_reason_chunk = None
-                    return {
-                        "type": "content_block_stop",
-                        "index": self.current_content_block_index,
-                    }
-                held = self._augment_message_delta_usage(self.holding_stop_reason_chunk)
-                self.holding_stop_reason_chunk = None
-                return held
-            if self.sent_last_message is False:
-                self.sent_last_message = True
-                return {"type": "message_stop"}
             raise StopIteration
         except Exception as e:
             verbose_logger.error("Anthropic Adapter - {}\n{}".format(e, traceback.format_exc()))
+            self._queue_terminal_events()
+            if self.chunk_queue:
+                return self.chunk_queue.popleft()
             raise StopIteration
 
     async def __anext__(self):
@@ -706,40 +696,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         self.chunk_queue.append(processed_chunk)
                         return self.chunk_queue.popleft()
 
-            # Handle any remaining held chunks after stream ends. The
-            # buffered ``holding_chunk`` (a ``content_block_delta``) must
-            # precede the final ``message_delta`` so Anthropic SSE event
-            # ordering is preserved. When ``queued_usage_chunk`` is True,
-            # the final ``message_delta`` has already been emitted; any
-            # buffered content delta is dropped rather than emitted after
-            # ``message_delta`` (which would violate SSE ordering and may
-            # confuse strict Anthropic SDK clients).
-            if not self.queued_usage_chunk:
-                if self.holding_chunk is not None:
-                    self.chunk_queue.append(self.holding_chunk)
-                    self.holding_chunk = None
-                if self.holding_stop_reason_chunk is not None:
-                    # A final ``message_delta`` must be preceded by
-                    # ``content_block_stop`` so the emitted SSE stays in
-                    # valid Anthropic order (... -> content_block_stop ->
-                    # message_delta). Emit ``content_block_stop`` here if
-                    # the active content block was not already closed.
-                    if not self.sent_content_block_finish:
-                        self.chunk_queue.append(
-                            {
-                                "type": "content_block_stop",
-                                "index": self.current_content_block_index,
-                            }
-                        )
-                        self.sent_content_block_finish = True
-                    self.chunk_queue.append(self._augment_message_delta_usage(self.holding_stop_reason_chunk))
-                    self.holding_stop_reason_chunk = None
-            else:
-                self.holding_chunk = None
-
-            if not self.sent_last_message:
-                self.sent_last_message = True
-                self.chunk_queue.append({"type": "message_stop"})
+            self._queue_terminal_events()
 
             # Return queued items if any
             if self.chunk_queue:
@@ -748,30 +705,14 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             raise StopIteration
 
         except StopIteration:
-            # Handle any remaining queued chunks before stopping
             if self.chunk_queue:
                 return self.chunk_queue.popleft()
-            # Handle any held stop_reason chunk — clear after capturing so a
-            # subsequent ``__anext__`` call doesn't re-emit the same chunk
-            # (matches the sync ``__next__`` path). Emit ``content_block_stop``
-            # first if the active content block was not already closed, so
-            # Anthropic SSE ordering is preserved (content_block_stop ->
-            # message_delta).
-            if self.holding_stop_reason_chunk is not None:
-                if not self.sent_content_block_finish:
-                    self.sent_content_block_finish = True
-                    self.chunk_queue.append(self._augment_message_delta_usage(self.holding_stop_reason_chunk))
-                    self.holding_stop_reason_chunk = None
-                    return {
-                        "type": "content_block_stop",
-                        "index": self.current_content_block_index,
-                    }
-                held = self._augment_message_delta_usage(self.holding_stop_reason_chunk)
-                self.holding_stop_reason_chunk = None
-                return held
-            if not self.sent_last_message:
-                self.sent_last_message = True
-                return {"type": "message_stop"}
+            raise StopAsyncIteration
+        except Exception as e:
+            verbose_logger.error("Anthropic Adapter - {}\n{}".format(e, traceback.format_exc()))
+            self._queue_terminal_events()
+            if self.chunk_queue:
+                return self.chunk_queue.popleft()
             raise StopAsyncIteration
 
     def anthropic_sse_wrapper(self) -> Iterator[bytes]:

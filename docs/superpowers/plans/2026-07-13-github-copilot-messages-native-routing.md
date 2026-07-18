@@ -898,7 +898,7 @@ Expected: 无 lint/type/format 报错；触及 budget 则 `make lint-budget-upda
 - [ ] **Step 4: 真实验证（起本地 proxy + curl，非 pytest 截图）**
 
 ```bash
-python litellm/proxy/proxy_cli.py --config /home/xp/.claude/litellm/config.yaml --detailed_debug --reload --use_v2_migration_resolver 2>&1 | tee litellm.log
+python litellm/proxy/proxy_cli.py --config /home/xp/.config/litellm/config.yaml --detailed_debug --reload --use_v2_migration_resolver 2>&1 | tee litellm.log
 ```
 
 对 `/v1/messages` 各发一条 curl：claude 模型、responses-only 的 gpt（如 `gpt-5.6-sol`）、chat-only 模型，观察 `litellm.log` 中实际命中的上游端点（`/v1/messages` vs `/responses` vs `/chat/completions`）与成功响应，整理进 PR 的 Proof of Fix。同时确认冷启动首个请求不因能力取值阻塞（定时刷新在后台）。

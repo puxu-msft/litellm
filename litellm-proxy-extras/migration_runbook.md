@@ -14,6 +14,8 @@ Before doing anything else, make sure all `schema.prisma` files in the repo are 
 | `litellm/proxy/schema.prisma` | Used by the proxy server |
 | `litellm-proxy-extras/litellm_proxy_extras/schema.prisma` | Used for migration generation |
 
+Keep `recursive_type_depth = -1` in every `generator client` block. The project uses basedpyright, so prisma-client-py's true recursive types preserve relation typing without generating the default depth-5 expansion; removing this setting makes `prisma/types.py` roughly four times larger and materially slows proxy startup
+
 **Sync process:**
 
 ```bash

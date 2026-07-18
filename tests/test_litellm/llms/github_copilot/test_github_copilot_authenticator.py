@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from litellm.llms.github_copilot.authenticator import Authenticator
+from litellm.llms.github_copilot.authenticator import (
+    Authenticator,
+    _should_refresh_api_key,
+)
 from litellm.llms.github_copilot.common_utils import (
     APIKeyExpiredError,
     GetAccessTokenError,
@@ -133,6 +136,97 @@ class TestGitHubCopilotAuthenticator:
             api_key = authenticator.get_api_key()
             assert api_key == "new-api-key"
             authenticator._refresh_api_key.assert_called_once()
+
+    def test_get_api_key_refreshes_at_refresh_in_before_expiry(self, authenticator):
+        """Proactive refresh: once refresh_in seconds have elapsed since the token
+        was obtained, refresh even though expires_at is still in the future.
+
+        Regression: the key used to be refreshed only after it had actually
+        expired, so the request that hit the expiry boundary paid the refresh
+        latency and logged a warning every ~30 min.
+        """
+        now = datetime.now().timestamp()
+        # Obtained 26 min ago; refresh_in = 25 min -> past the refresh point, yet
+        # expires_at is 4 min in the future so the key is technically still valid.
+        stale_but_valid = json.dumps(
+            {
+                "token": "stale-api-key",
+                "expires_at": now + 4 * 60,
+                "refresh_in": 25 * 60,
+                "last_refreshed": now - 26 * 60,
+            }
+        )
+        new_data = {"token": "fresh-api-key", "expires_at": now + 30 * 60, "refresh_in": 25 * 60}
+
+        with (
+            patch("builtins.open", mock_open(read_data=stale_but_valid)),
+            patch.object(authenticator, "_refresh_api_key", return_value=new_data) as mock_refresh,
+            patch("json.dump"),
+        ):
+            assert authenticator.get_api_key() == "fresh-api-key"
+            mock_refresh.assert_called_once()
+
+    def test_get_api_key_not_refreshed_before_refresh_in(self, authenticator):
+        """Stay on the cached key while still inside the refresh_in window; do not
+        refresh on every request just because refresh_in exists."""
+        now = datetime.now().timestamp()
+        fresh = json.dumps(
+            {
+                "token": "current-api-key",
+                "expires_at": now + 30 * 60,
+                "refresh_in": 25 * 60,
+                "last_refreshed": now - 5 * 60,  # only 5 min old; refresh point is 25 min
+            }
+        )
+
+        with (
+            patch("builtins.open", mock_open(read_data=fresh)),
+            patch.object(authenticator, "_refresh_api_key") as mock_refresh,
+        ):
+            assert authenticator.get_api_key() == "current-api-key"
+            mock_refresh.assert_not_called()
+
+    def test_get_api_key_uses_file_mtime_when_last_refreshed_missing(self, authenticator):
+        """Tokens written by external tools lack last_refreshed; fall back to the
+        file mtime so they still refresh proactively at the refresh_in point."""
+        now = datetime.now().timestamp()
+        external = json.dumps(
+            {
+                "token": "external-api-key",
+                "expires_at": now + 4 * 60,  # still valid
+                "refresh_in": 25 * 60,
+                # no last_refreshed field
+            }
+        )
+        new_data = {"token": "fresh-api-key", "expires_at": now + 30 * 60, "refresh_in": 25 * 60}
+
+        with (
+            patch("builtins.open", mock_open(read_data=external)),
+            patch("os.path.getmtime", return_value=now - 26 * 60),  # obtained 26 min ago
+            patch.object(authenticator, "_refresh_api_key", return_value=new_data) as mock_refresh,
+            patch("json.dump"),
+        ):
+            assert authenticator.get_api_key() == "fresh-api-key"
+            mock_refresh.assert_called_once()
+
+    def test_get_api_key_persists_last_refreshed_on_refresh(self, authenticator):
+        """After refreshing, last_refreshed must be persisted (alongside the
+        upstream fields) so the next read computes the refresh point without
+        relying on the file mtime."""
+        now = datetime.now().timestamp()
+        expired = json.dumps({"token": "old", "expires_at": now - 60})
+        new_data = {"token": "new", "expires_at": now + 30 * 60, "refresh_in": 1500}
+
+        with (
+            patch("builtins.open", mock_open(read_data=expired)),
+            patch.object(authenticator, "_refresh_api_key", return_value=new_data),
+            patch("json.dump") as mock_dump,
+        ):
+            assert authenticator.get_api_key() == "new"
+            written = mock_dump.call_args[0][0]
+            assert "last_refreshed" in written
+            assert written["token"] == "new"
+            assert written["refresh_in"] == 1500  # upstream fields preserved
 
     def test_refresh_api_key(self, authenticator, mock_http_client):
         """Test refreshing an API key."""
@@ -306,4 +400,25 @@ class TestGitHubCopilotAuthenticator:
              patch.object(authenticator, "get_access_token", return_value="access-tok"):
             authenticator._refresh_api_key()
             assert mock_client.get.call_args[0][0] == custom_url
+
+
+class TestShouldRefreshAPIKey:
+    """Unit tests for the proactive-refresh decision, independent of file I/O."""
+
+    def test_refreshes_exactly_at_refresh_in_point(self):
+        # obtained at t=0, refresh_in=1500 -> due at t>=1500, well before expiry at 1800
+        assert _should_refresh_api_key(now=1500, expires_at=1800, refresh_in=1500, obtained_at=0) is True
+
+    def test_no_refresh_one_second_before_refresh_in_point(self):
+        assert _should_refresh_api_key(now=1499, expires_at=1800, refresh_in=1500, obtained_at=0) is False
+
+    def test_fallback_to_expiry_when_no_refresh_in(self):
+        # No refresh_in hint -> lazy expiry-based behaviour is preserved.
+        assert _should_refresh_api_key(now=1799, expires_at=1800, refresh_in=None, obtained_at=0) is False
+        assert _should_refresh_api_key(now=1800, expires_at=1800, refresh_in=None, obtained_at=0) is True
+
+    def test_fallback_to_expiry_when_obtained_at_unknown(self):
+        # refresh_in present but no obtained_at (unreadable mtime) -> expiry-based.
+        assert _should_refresh_api_key(now=1799, expires_at=1800, refresh_in=1500, obtained_at=None) is False
+        assert _should_refresh_api_key(now=1800, expires_at=1800, refresh_in=1500, obtained_at=None) is True
 
